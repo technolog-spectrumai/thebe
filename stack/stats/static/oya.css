@@ -378,11 +378,45 @@ a {
   flex-wrap: wrap;
   justify-content: space-between;
   gap: 0.25rem 1rem;
+}
+
+/* Dimmed per item, so a certificate warning can stand out at full strength. */
+.footer__inner > * {
   opacity: 0.75;
 }
 
 .footer a {
   color: inherit;
+}
+
+/* Connection state (pages.py): HTTPS with the certificate's expiry, or plain HTTP. The footer
+   is dark in every theme and light in none, so status colours are mixed towards --footer-text
+   instead of using the card-oriented --*-text tokens. */
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.conn .icon {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.footer__inner > .conn--caution,
+.footer__inner > .conn--warn {
+  opacity: 1;
+  font-weight: 600;
+}
+
+.conn--caution {
+  color: color-mix(in srgb, var(--caution) 45%, var(--footer-text));
+}
+
+.conn--warn {
+  color: color-mix(in srgb, var(--warn) 45%, var(--footer-text));
 }
 
 /* ---- typography ------------------------------------------------------------------- */

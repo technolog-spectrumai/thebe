@@ -1,13 +1,17 @@
 """Statistics dashboard for the jupyterlab-tailscale stack (FastAPI, served by uvicorn).
 
-Runs in the `stats` container on port 8889, published only on the host's Tailscale
-IPv4. Every path - pages, /theme.css, /api/*, /health and /static/* - requires HTTP
-Basic auth with STATS_USER and the JupyterLab password read from JUPYTER_PASSWORD_FILE.
+Runs in the `stats` container on port 8889 (serve.py starts uvicorn, over HTTPS when a
+certificate is configured), published only on the host's Tailscale IPv4. Every path -
+pages, /theme.css, /api/*, /health and /static/* - requires HTTP Basic auth with
+STATS_USER and the JupyterLab password read from JUPYTER_PASSWORD_FILE.
 
-Environment (set by compose.yaml):
+Environment (set by compose.yaml, and compose.tls.yaml for HTTPS):
   STATS_USER, JUPYTER_PASSWORD_FILE      Basic auth credentials
-  JUPYTER_INTERNAL_URL                   JupyterLab on the Compose network (kernels, health)
+  JUPYTER_INTERNAL_URL                   JupyterLab on the Compose network (kernels, health);
+                                         https://jupyterlab:8888 when JupyterLab serves HTTPS
   JUPYTER_PUBLIC_URL                     link target in the navigation bar
+  JLT_TLS_CERT                           the certificate serve.py loaded; the footer shows its
+                                         name and expiry (unset: plain HTTP)
   DEPS_INTERNAL_URL, DEPS_TOKEN_FILE     deps runner behind the Dependencies page and its token
   HOST_NAME, HOST_PROC, HOST_SYS         host identity and the read-only /proc and /sys mounts
   WORKSPACE_DIR                          filesystem whose usage is reported
@@ -108,6 +112,12 @@ except ConfigError as exc:
 THEME = theme.load_theme(os.environ.get("THEME") or theme.DEFAULT_THEME, BASE_DIR / "theme")
 THEME_CSS = theme.theme_css(THEME).encode("utf-8")
 
+# The HTTPS certificate (serve.py has already checked that it loads). Read once: uvicorn keeps
+# the certificate it started with, so a renewed file only counts after a restart.
+TLS = pages.read_tls_state(os.environ.get("JLT_TLS_CERT") or "")
+if TLS.problem:
+    log.warning("HTTPS certificate: %s", TLS.problem)
+
 # --- data sources --------------------------------------------------------------------
 
 sampler = hoststats.Sampler(interval=2.0)
@@ -202,14 +212,14 @@ renderer = pages.PageRenderer(
     host_name=hoststats.HOST_NAME,
     jupyter_public_url=JUPYTER_PUBLIC_URL,
     theme_color={mode: THEME.tokens(mode)["appbar-bg"] for mode in theme.MODES},
+    tls=TLS,
 )
 
 
 def _page_endpoint(item: pages.NavItem):
-    body = renderer.page(item.key)
-
     async def show_page() -> HTMLResponse:
-        return HTMLResponse(body)
+        # Pre-rendered at start-up; only the certificate state in the footer depends on the date.
+        return HTMLResponse(renderer.page(item.key))
 
     show_page.__name__ = f"page_{item.key}"
     return show_page

@@ -8,10 +8,16 @@ mistake stops the service instead of serving a broken page.
 Adding a page: create templates/<key>.html and add a NavItem to NAV_ITEMS. app.py
 registers a GET route for every entry and the navigation bar lists it, in this order,
 followed by the external JupyterLab link.
+
+The one part rendered per request is the connection state in the footer ({{ connection }}):
+HTTPS with the certificate's expiry, which turns into a warning as the date approaches, or
+plain HTTP.
 """
 
 import html
 import re
+import ssl
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -20,6 +26,13 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 APP_NAME = "JupyterLab over Tailscale"
 
 _PLACEHOLDER = re.compile(r"\{\{\s*([a-z][a-z0-9_]*)\s*\}\}")
+# Stands in for {{ connection }} in the pages rendered at start-up.
+_CONNECTION_SLOT = "<!--thebe:connection-->"
+
+# The footer warns this many days before the certificate expires. The installer's host step
+# renews a certificate with less than 21 days left (tailscaled renews in the last third of the
+# 90 days), so a warning means no update has run for a while.
+CERT_CAUTION_DAYS = 21
 
 
 class Markup(str):
@@ -80,6 +93,8 @@ ICON_PATHS = {
     "save": '<path d="M5 3h11l5 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M7 3v5h8V3M7 21v-7h10v7"/>',
     "file": '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/>',
     "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+    "lock": '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+    "shield": '<path d="M12 3 4.5 6v5.5c0 4.6 3.1 8.2 7.5 9.5 4.4-1.3 7.5-4.9 7.5-9.5V6z"/>',
 }
 
 
@@ -112,10 +127,90 @@ def safe_http_url(url: str) -> str:
     return url.strip() if parts.scheme in ("http", "https") and parts.netloc else ""
 
 
-class PageRenderer:
-    """Renders every NAV_ITEMS page once; they depend only on start-up settings."""
+@dataclass(frozen=True)
+class TlsState:
+    """The dashboard's own HTTPS certificate, read once at start-up (the one uvicorn loaded).
 
-    def __init__(self, *, host_name: str, jupyter_public_url: str, theme_color: dict[str, str]):
+    configured=False means plain HTTP. `problem` is set when HTTPS is configured but the
+    certificate cannot be decoded (serve.py refuses to start then, so it is only a fallback).
+    """
+
+    configured: bool = False
+    name: str = ""  # the DNS name the certificate is for
+    not_after: float = 0.0  # expiry, seconds since the epoch
+    problem: str = ""
+
+
+def read_tls_state(cert_path: str) -> TlsState:
+    """TlsState for the PEM certificate at cert_path ('' = HTTPS is off)."""
+    if not cert_path:
+        return TlsState()
+    try:
+        # A private helper, but the only standard-library parser for a PEM certificate file.
+        decoded = ssl._ssl._test_decode_cert(cert_path)
+        not_after = ssl.cert_time_to_seconds(decoded["notAfter"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:  # ssl.SSLError is an OSError
+        return TlsState(configured=True, problem=f"cannot read the certificate {cert_path}: {exc}")
+    names = [value for kind, value in decoded.get("subjectAltName", ()) if kind == "DNS"]
+    # The installer names the file after the MagicDNS name: prefer that one of the certificate's names.
+    stem = Path(cert_path).name.removesuffix(".crt")
+    name = stem if stem in names else (names[0] if names else "")
+    return TlsState(configured=True, name=name, not_after=float(not_after))
+
+
+def _days(count: int) -> str:
+    return "less than a day" if count <= 0 else ("1 day" if count == 1 else f"{count} days")
+
+
+def connection_state(tls: TlsState, now: float) -> tuple[str, str, str]:
+    """(kind, text, tooltip) of the footer's connection state; kind is plain, ok, caution or warn."""
+    if not tls.configured:
+        return (
+            "plain",
+            "HTTP inside the Tailscale tunnel",
+            "Plain HTTP: Tailscale's WireGuard tunnel encrypts the traffic between your devices.",
+        )
+    if tls.problem:
+        return "warn", "HTTPS · the certificate could not be read", tls.problem
+    name = tls.name or "this machine"
+    expiry = time.gmtime(tls.not_after)
+    date, moment = time.strftime("%Y-%m-%d", expiry), time.strftime("%Y-%m-%d %H:%M UTC", expiry)
+    remaining = tls.not_after - now
+    if remaining <= 0:
+        return (
+            "warn",
+            f"HTTPS · certificate for {name} expired on {date}",
+            f"The certificate expired at {moment}. Run update (or Deploy in the builder) to renew it.",
+        )
+    days = int(remaining // 86400)
+    if days < CERT_CAUTION_DAYS:
+        return (
+            "caution",
+            f"HTTPS · certificate for {name} valid until {date} ({_days(days)} left)",
+            f"The certificate expires at {moment}. Run update (or Deploy in the builder) to renew it.",
+        )
+    return "ok", f"HTTPS · certificate for {name} valid until {date}", f"The certificate is valid until {moment}."
+
+
+_CONNECTION_ICONS = {"plain": "shield", "ok": "lock", "caution": "lock", "warn": "alert"}
+
+
+def connection_markup(tls: TlsState, now: float) -> Markup:
+    kind, text, tooltip = connection_state(tls, now)
+    return Markup(
+        f'<span class="conn conn--{kind}" title="{html.escape(tooltip, quote=True)}">'
+        f"{icon(_CONNECTION_ICONS[kind])}<span>{html.escape(text)}</span></span>"
+    )
+
+
+class PageRenderer:
+    """Renders every NAV_ITEMS page once; only the footer's connection state is filled in per request."""
+
+    def __init__(
+        self, *, host_name: str, jupyter_public_url: str, theme_color: dict[str, str], tls: TlsState = TlsState()
+    ):
+        self._tls = tls
+        connection_markup(tls, time.time())  # fail at start-up, not on the first request
         self._jupyter_url = safe_http_url(jupyter_public_url)
         self._common = {
             "app_name": APP_NAME,
@@ -128,8 +223,9 @@ class PageRenderer:
         }
         self._pages = {item.key: self._render_page(item) for item in NAV_ITEMS}
 
-    def page(self, key: str) -> str:
-        return self._pages[key]
+    def page(self, key: str, now: float | None = None) -> str:
+        before, after = self._pages[key]
+        return before + connection_markup(self._tls, time.time() if now is None else now) + after
 
     def _template(self, name: str) -> str:
         path = TEMPLATES_DIR / name
@@ -138,7 +234,8 @@ class PageRenderer:
         except OSError as exc:
             raise RuntimeError(f"cannot read template {path}: {exc.strerror or exc}") from None
 
-    def _render_page(self, active: NavItem) -> str:
+    def _render_page(self, active: NavItem) -> tuple[str, str]:
+        """The page split around the connection state: (before, after)."""
         content = render(self._template(f"{active.key}.html"), self._common, template=f"{active.key}.html")
         scripts = "\n".join(
             f'<script src="/static/{html.escape(script, quote=True)}"></script>' for script in active.scripts
@@ -148,8 +245,13 @@ class PageRenderer:
             "nav": self._nav(active),
             "content": Markup(content),
             "scripts": Markup(scripts),
+            "connection": Markup(_CONNECTION_SLOT),
         }
-        return render(self._template("base.html"), values, template="base.html")
+        body = render(self._template("base.html"), values, template="base.html")
+        if body.count(_CONNECTION_SLOT) != 1:
+            raise RuntimeError("templates/base.html must contain {{ connection }} exactly once")
+        before, _, after = body.partition(_CONNECTION_SLOT)
+        return before, after
 
     def _nav(self, active: NavItem) -> Markup:
         esc = html.escape
