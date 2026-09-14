@@ -242,6 +242,17 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(self.errors(STATS_USER="Jupyter.user_1-2"), [])
         self.assertTrue(any("THEME" in e for e in self.errors(THEME="nope")))
 
+    def test_https_setting(self):
+        self.assertEqual(builder.DEFAULTS["HTTPS"], "auto")
+        for ok in ("auto", "off"):
+            self.assertEqual(self.errors(HTTPS=ok), [], ok)
+        without = {k: v for k, v in builder.DEFAULTS.items() if k != "HTTPS"}
+        self.assertEqual(builder.validate_settings(without, self.THEMES), [], "a missing key means auto")
+        for bad in ("", "on", "AUTO", "Off", "yes", "0", "auto "):
+            errors = self.errors(HTTPS=bad)
+            self.assertEqual(len(errors), 1, bad)
+            self.assertIn("HTTPS in the settings file must be one of: auto, off", errors[0])
+
 
 class PortOccupancyTests(unittest.TestCase):
     def test_a_listening_socket_is_reported_unless_its_service_holds_it(self):
@@ -290,8 +301,18 @@ class PortOccupancyTests(unittest.TestCase):
 # Parsing command output
 # ---------------------------------------------------------------------------
 
-def tailscale_json(state="Running", ips=("100.82.217.101", "fd7a:115c:a1e0::b801:d9b5")):
-    return json.dumps({"BackendState": state, "Self": {"TailscaleIPs": list(ips)}, "TailscaleIPs": list(ips)})
+def tailscale_json(state="Running", ips=("100.82.217.101", "fd7a:115c:a1e0::b801:d9b5"), dns_name=None,
+                   magicdns=True):
+    data = {"BackendState": state, "Self": {"TailscaleIPs": list(ips)}, "TailscaleIPs": list(ips)}
+    if dns_name is not None:    # the shape of Tailscale 1.102's status: DNSName ends with a dot
+        data["Self"]["DNSName"] = dns_name
+        data["CurrentTailnet"] = {"Name": "someone.github", "MagicDNSSuffix": "lyrebird-hen.ts.net",
+                                  "MagicDNSEnabled": magicdns}
+        data["CertDomains"] = [dns_name.lower().rstrip(".")]
+    return json.dumps(data)
+
+
+TS_NAME = "basilisk-systems.lyrebird-hen.ts.net"
 
 
 class ParsingTests(unittest.TestCase):
@@ -309,6 +330,23 @@ class ParsingTests(unittest.TestCase):
         self.assertIn("no IPv4", no_ipv4.problem)
         self.assertIn("could not be read", parse("not json at all").problem)
         self.assertIn("could not be read", parse("[]").problem)
+
+    def test_magicdns_name(self):
+        parse = builder.parse_tailscale_status
+        status = parse(tailscale_json(dns_name=TS_NAME + "."))
+        self.assertEqual((status.ip, status.name), ("100.82.217.101", TS_NAME))
+        self.assertEqual(parse(tailscale_json(dns_name="Basilisk-Systems.Lyrebird-Hen.TS.net.")).name, TS_NAME)
+        self.assertEqual(parse(tailscale_json(dns_name=TS_NAME)).name, TS_NAME)
+        self.assertEqual(parse(tailscale_json(dns_name=TS_NAME + ".", magicdns=False)).name, "")
+        self.assertEqual(parse(tailscale_json()).name, "", "no DNSName, no CurrentTailnet")
+        for bad in ("basilisk-systems.", "", ".", "under_score.ts.net.", "-bad.ts.net.", "bad-.ts.net.",
+                    "x..ts.net.", "a" * 64 + ".ts.net.", ("a" * 63 + ".") * 4 + "ts.net.", "bäd.ts.net."):
+            self.assertEqual(parse(tailscale_json(dns_name=bad)).name, "", bad)
+        magic_as_text = json.loads(tailscale_json(dns_name=TS_NAME + "."))
+        magic_as_text["CurrentTailnet"]["MagicDNSEnabled"] = "true"
+        self.assertEqual(parse(json.dumps(magic_as_text)).name, "")
+        logged_out = parse(tailscale_json("NeedsLogin", dns_name=TS_NAME + "."))
+        self.assertEqual((logged_out.ip, logged_out.name), ("", ""))
 
     PS_LINES = "\n".join([
         "WARN[0000] some compose warning",
@@ -366,6 +404,79 @@ class ParsingTests(unittest.TestCase):
                     "echo ROOT_STEP_REQUIRED: host-teardown",
                     "ROOT_STEP_REQUIRED:host-teardown", ""):
             self.assertIsNone(step(bad), bad)
+
+    def test_root_step_lines_with_a_certificate(self):
+        step = builder.root_step_from_line
+        prefix = "ROOT_STEP_REQUIRED: host-setup 100.82.217.101 8888 8889"
+        self.assertEqual(step(f"{prefix} --cert {TS_NAME} 1000"),
+                         ["host-setup", "100.82.217.101", "8888", "8889", "--cert", TS_NAME, "1000"])
+        self.assertEqual(step(f"ROOT_STEP_REQUIRED: host-setup 100.82.217.101 8888 --cert {TS_NAME} 1\r\n"),
+                         ["host-setup", "100.82.217.101", "8888", "--cert", TS_NAME, "1"])
+        self.assertEqual(step(f"{prefix} --cert a.b 4294967294")[-2:], ["a.b", "4294967294"])
+        longest = ("a" * 63 + ".") * 3 + "b" * 61
+        self.assertEqual(len(longest), 253)
+        self.assertEqual(step(f"{prefix} --cert {longest} 1000")[-2], longest)
+        for bad in (f"{prefix} --cert basilisk-systems 1000",                  # the short node name
+                    f"{prefix} --cert Basilisk-Systems.lyrebird-hen.ts.net 1000",
+                    f"{prefix} --cert {TS_NAME}. 1000",
+                    f"{prefix} --cert -bad.ts.net 1000",
+                    f"{prefix} --cert bad-.ts.net 1000",
+                    f"{prefix} --cert a..ts.net 1000",
+                    f"{prefix} --cert .a.ts.net 1000",
+                    f"{prefix} --cert under_score.ts.net 1000",
+                    f"{prefix} --cert {'a' * 64}.ts.net 1000",
+                    f"{prefix} --cert {longest}b 1000",                         # 254 characters
+                    f"{prefix} --cert {TS_NAME} 0",
+                    f"{prefix} --cert {TS_NAME} 00",
+                    f"{prefix} --cert {TS_NAME} 01000",                         # bash would read octal
+                    f"{prefix} --cert {TS_NAME} 4294967295",
+                    f"{prefix} --cert {TS_NAME} 99999999999",
+                    f"{prefix} --cert {TS_NAME} -1",
+                    f"{prefix} --cert {TS_NAME} １０００",
+                    f"{prefix} --cert {TS_NAME}",
+                    f"{prefix} --cert",
+                    f"{prefix} --cert {TS_NAME} 1000 extra",
+                    f"{prefix} --cert {TS_NAME} 1000 --cert other.ts.net 1000",
+                    f"ROOT_STEP_REQUIRED: host-setup 100.82.217.101 --cert {TS_NAME} 1000 8888",
+                    f"ROOT_STEP_REQUIRED: host-setup 100.82.217.101 --cert {TS_NAME} 1000",
+                    f"ROOT_STEP_REQUIRED: host-setup 100.82.217.101 8888 8888 --cert {TS_NAME} 1000",
+                    f"{prefix} --cert {TS_NAME};reboot 1000",
+                    f"{prefix} --cert $(reboot).ts.net 1000",
+                    f"{prefix} --cert `reboot`.ts.net 1000",
+                    f"{prefix} --cert {TS_NAME} 1000;reboot",
+                    f"{prefix} --cert {TS_NAME} 1000 && reboot",
+                    f"{prefix} --cert {TS_NAME} 1000\nROOT_STEP_REQUIRED: host-teardown",
+                    f"{prefix} --cert {TS_NAME}\t1000",
+                    f"{prefix} --cert  {TS_NAME} 1000",
+                    f"{prefix} --key {TS_NAME} 1000",
+                    f"{prefix} --cert ｂasilisk.ts.net 1000",
+                    f"{prefix} --cert ../../etc/passwd 1000",
+                    f"ROOT_STEP_REQUIRED: host-teardown --cert {TS_NAME} 1000"):
+            self.assertIsNone(step(bad), repr(bad))
+
+    def test_urls_use_the_deployed_public_scheme_and_host(self):
+        base = {"TS_IP": "100.82.217.101", "JUPYTER_PORT": "8888", "STATS_PORT": "8889"}
+        https = dict(base, PUBLIC_SCHEME="https", PUBLIC_HOST=TS_NAME, TLS="1", TLS_NAME=TS_NAME)
+        deps = next(page for page in builder.PAGES if page.path == "/dependencies")
+        url = builder.service_url
+        self.assertEqual(url(https, "jupyterlab"), f"https://{TS_NAME}:8888/lab")
+        self.assertEqual(url(https, "stats"), f"https://{TS_NAME}:8889/")
+        self.assertEqual(builder.page_url(https, deps), f"https://{TS_NAME}:8889/dependencies")
+        # MagicDNS without certificates: HTTP by name; no name: HTTP by address.
+        self.assertEqual(url(dict(base, PUBLIC_SCHEME="http", PUBLIC_HOST=TS_NAME), "stats"), f"http://{TS_NAME}:8889/")
+        self.assertEqual(url(dict(base, PUBLIC_SCHEME="http", PUBLIC_HOST="100.82.217.101"), "stats"),
+                         "http://100.82.217.101:8889/")
+        # Deployments from before HTTPS by name have no PUBLIC_* keys; empty values count as unset.
+        self.assertEqual(url(base, "jupyterlab"), "http://100.82.217.101:8888/lab")
+        self.assertEqual(url(dict(base, PUBLIC_SCHEME="", PUBLIC_HOST=""), "jupyterlab"), "http://100.82.217.101:8888/lab")
+        self.assertEqual(url({k: v for k, v in https.items() if k != "TS_IP"}, "jupyterlab"), f"https://{TS_NAME}:8888/lab")
+        for scheme in ("ftp", "HTTPS", "javascript", "https:", "https://evil"):
+            self.assertEqual(url(dict(https, PUBLIC_SCHEME=scheme), "jupyterlab"), "", scheme)
+        for host in ("evil host.ts.net", "Basilisk.ts.net", "basilisk-systems", "10.0.0.1", "100.200.1.1", "1.2.3",
+                     "a.0x7f", "100.82.217.101.", "a..ts.net", "x.ts.net/evil", "x.ts.net:1", "user@x.ts.net",
+                     "[fd7a::1]", "ｘ.ts.net", "x.ts.net#", "x.ts.net\n"):
+            self.assertEqual(url(dict(https, PUBLIC_HOST=host), "jupyterlab"), "", repr(host))
+        self.assertEqual(url(dict(https, PUBLIC_HOST=TS_NAME, JUPYTER_PORT="80"), "jupyterlab"), "")
 
     def test_urls_come_from_the_page_table(self):
         runtime = {"TS_IP": "100.82.217.101", "JUPYTER_PORT": "8888", "STATS_PORT": "8889"}
@@ -637,6 +748,9 @@ class WindowTests(unittest.TestCase):
             {record.format(log=f'{state}/pkexec.calls')}
             env -0 >> {state}/pkexec.env
             [ -f {state}/pkexec.sleep ] && sleep 30
+            [ -f {state}/pkexec.output ] && cat {state}/pkexec.output
+            # The step was applied: the installer stops asking for it.
+            [ -f {state}/pkexec.clears ] && rm -f {state}/root-step
             exit "$(cat {state}/pkexec.rc 2>/dev/null || echo 0)"
         """)
         # The installer is deliberately not executable: the builder runs it with bash.
@@ -648,6 +762,8 @@ class WindowTests(unittest.TestCase):
             [ -f {state}/sleep ] && sleep 30
             # A careless installer might print the settings, password included.
             [ "$1" = install ] && cat "$JLT_SETTINGS_FILE"
+            # After a host step, a deploy writes the runtime .env it prepared (e.g. HTTPS by name).
+            [ -f {state}/runtime.next ] && [ -f {state}/pkexec.calls ] && cp {state}/runtime.next "$JLT_APP_DIR/.env"
             [ -f {state}/root-step ] && cat {state}/root-step
             exit "$(cat {state}/installer.rc 2>/dev/null || echo 0)"
         """))
@@ -663,7 +779,7 @@ class WindowTests(unittest.TestCase):
         path_patch.start()
         self.addCleanup(path_patch.stop)
         self.critical = self._patch_box("critical", QMessageBox.StandardButton.Ok)
-        self._patch_box("warning", QMessageBox.StandardButton.Ok)
+        self.warning = self._patch_box("warning", QMessageBox.StandardButton.Ok)
         self._patch_box("information", QMessageBox.StandardButton.Ok)
         self.question = self._patch_box("question", QMessageBox.StandardButton.Yes)
 
@@ -884,6 +1000,190 @@ class WindowTests(unittest.TestCase):
                 self.assertIn("services run", message)
                 self.assertIn(shlex.join(["sudo", str(self.installer), "host-setup", TS_IP, "8888"]), message)
                 self.assertEqual(window.banner.property("kind"), "error")
+
+    CERT_STEP = f"ROOT_STEP_REQUIRED: host-setup {TS_IP} 8888 8889 --cert {TS_NAME} 1000\n"
+    HTTPS_RUNTIME = (f"TS_IP='{TS_IP}'\nJUPYTER_PORT='8888'\nSTATS_PORT='8889'\nCOMPOSE_PROFILES='stats'\n"
+                     f"PUBLIC_SCHEME='https'\nPUBLIC_HOST='{TS_NAME}'\nTLS='1'\nTLS_NAME='{TS_NAME}'\n")
+
+    def reset_calls(self):
+        for name in ("installer.calls", "pkexec.calls", "pkexec.rc"):
+            (self.state / name).unlink(missing_ok=True)
+
+    def test_a_certificate_step_is_followed_by_exactly_one_more_install(self):
+        (self.state / "root-step").write_text(self.CERT_STEP)
+        (self.state / "pkexec.clears").write_text("")
+        (self.state / "runtime.next").write_text(self.HTTPS_RUNTIME)
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 3)
+        wait_until(lambda: False, 400)       # nothing else may follow
+
+        bash, installer = shutil.which("bash"), str(self.installer)
+        step = ["host-setup", TS_IP, "8888", "8889", "--cert", TS_NAME, "1000"]
+        self.assertEqual([list(r.argv) for r in window.results],
+                         [[bash, installer, "install"], ["pkexec", "/bin/bash", installer, *step],
+                          [bash, installer, "install"]])
+        self.assertEqual(self.calls("pkexec"), [["/bin/bash", installer, *step]])
+        log = window.log_view.toPlainText()
+        self.assertIn("# The host step issued the HTTPS certificate. Running install once more: "
+                      "the new certificate switches the services to HTTPS.", log)
+        self.critical.assert_not_called()
+        self.warning.assert_not_called()
+        self.assertEqual(window.banner.property("kind"), "success")
+        self.assertIn(f"https://{TS_NAME}:8888/lab", window.banner.text())
+        self.assertIn(f"https://{TS_NAME}:8889/", window.banner.text())
+        self.assertIn("The host step (sysctl/firewall/HTTPS certificate) was applied.", window.banner.text())
+        self.assert_no_secret_anywhere(window)
+
+    def test_start_with_a_certificate_step_also_reruns_install_once(self):
+        (self.state / "root-step").write_text(self.CERT_STEP)
+        (self.state / "pkexec.clears").write_text("")
+        window = self.window()
+        window.start_or_restart()
+        self.wait_idle(window, 3)
+        wait_until(lambda: False, 400)
+        self.assertEqual([r.argv[-1] for r in window.results], ["start", "1000", "install"])
+        self.assertEqual(window.banner.property("kind"), "success")
+
+    def test_a_certificate_step_that_is_still_needed_is_not_asked_again(self):
+        (self.state / "root-step").write_text(self.CERT_STEP)     # never cleared: no loop
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 3)
+        wait_until(lambda: False, 600)
+        self.assertEqual(len(window.results), 3)
+        self.assertEqual(len(self.calls("pkexec")), 1)
+        self.assertEqual([call[1] for call in self.calls("installer")], ["install", "install"])
+        self.warning.assert_called_once()
+        message = self.warning.call_args.args[2]
+        self.assertIn("still reports the host step (sysctl/firewall/HTTPS certificate) as needed", message)
+        self.assertIn(shlex.join(["sudo", str(self.installer), "host-setup", TS_IP, "8888", "8889",
+                                  "--cert", TS_NAME, "1000"]), message)
+        self.assertEqual(window.banner.property("kind"), "error")
+        self.assertFalse(window._busy)
+
+    def test_a_failed_or_dismissed_certificate_step_does_not_rerun_install(self):
+        (self.state / "root-step").write_text(self.CERT_STEP)
+        for code, reason in ((1, "it failed with exit code 1"), (126, "authorisation dismissed")):
+            with self.subTest(code=code):
+                self.reset_calls()
+                self.critical.reset_mock()
+                (self.state / "pkexec.rc").write_text(str(code))
+                window = self.window()
+                window.deploy()
+                self.wait_idle(window, 2)
+                wait_until(lambda: False, 400)
+                self.assertEqual(len(window.results), 2)
+                self.assertEqual(len(self.calls("installer")), 1)
+                message = self.critical.call_args.args[2]
+                self.assertIn(f"host step (sysctl/firewall/HTTPS certificate) was not applied: {reason}", message)
+                self.assertIn("keep using HTTP", message)
+                self.assertIn("Tailscale admin console", message)
+                self.assertIn(f"--cert {TS_NAME} 1000", message)
+
+    def test_a_certificate_only_failure_says_the_host_settings_were_applied(self):
+        (self.state / "root-step").write_text(self.CERT_STEP)
+        (self.state / "pkexec.rc").write_text("1")
+        (self.state / "pkexec.output").write_text(
+            "sysctl: net.ipv4.ip_nonlocal_bind=1 (persisted in /etc/sysctl.d/60-jupyterlab-tailscale.conf)\n"
+            "WARNING: tailscale cert could not issue a certificate for the name.\n"
+            f"ERROR: host-setup: sysctl and firewall settings applied ({TS_IP}, ports 8888 8889, firewall none), "
+            f"but no certificate for {TS_NAME}; see above.\n")
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 2)
+        wait_until(lambda: False, 400)
+        self.assertEqual(len(window.results), 2)
+        self.assertEqual(len(self.calls("installer")), 1)
+        message = self.critical.call_args.args[2]
+        self.assertIn("applied the sysctl/firewall settings, but the HTTPS certificate could not be issued", message)
+        self.assertNotIn("was not applied", message)
+        self.assertIn("keep using HTTP", message)
+        self.assertIn("Tailscale admin console", message)
+        self.assertIn(f"--cert {TS_NAME} 1000", message)
+        self.assertEqual(window.banner.property("kind"), "error")
+
+    def test_an_install_line_does_not_count_as_a_certificate_only_failure(self):
+        # The marker in the install's own output (before the host step) must not change the message.
+        (self.state / "root-step").write_text(f"note: but no certificate for {TS_NAME}\n" + self.CERT_STEP)
+        (self.state / "pkexec.rc").write_text("1")
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 2)
+        wait_until(lambda: False, 400)
+        message = self.critical.call_args.args[2]
+        self.assertIn("host step (sysctl/firewall/HTTPS certificate) was not applied: it failed with exit code 1",
+                      message)
+
+    def test_a_host_step_without_certificate_does_not_rerun_install(self):
+        (self.state / "root-step").write_text(f"ROOT_STEP_REQUIRED: host-setup {TS_IP} 8888 8889\n")
+        (self.state / "pkexec.clears").write_text("")
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 2)
+        wait_until(lambda: False, 400)
+        self.assertEqual([r.argv[-1] for r in window.results], ["install", "8889"])
+        self.assertIn("The host step (sysctl/firewall) was applied.", window.banner.text())
+
+    def test_open_buttons_use_the_deployed_name_over_https(self):
+        self.runtime.write_text(self.HTTPS_RUNTIME)
+        opened = []
+        window = self.window(open_url=lambda url: opened.append(url.toString()) or True)
+        (self.state / "ps.json").write_text(RUNNING_PS)
+        self.refresh_status(window)
+        self.assertTrue(wait_until(lambda: window.services))
+        window.rows["jupyterlab"].open_button.click()
+        window.rows["stats"].open_button.click()
+        deps = next(page for page in builder.PAGES if page.path == "/dependencies")
+        window.page_buttons[deps].click()
+        self.assertEqual(opened, [f"https://{TS_NAME}:8888/lab", f"https://{TS_NAME}:8889/",
+                                  f"https://{TS_NAME}:8889/dependencies"])
+        self.assertEqual(window.rows["stats"].url.text(), f"https://{TS_NAME}:8889/")
+        self.assertEqual(window.rows["stats"].url.toolTip(), f"https://{TS_NAME}:8889/")
+        page = window.centralWidget().widget()
+        https_width = page.minimumSizeHint().width()
+        # An older runtime .env (no PUBLIC_*) still opens http://<TS_IP>.
+        self.runtime.write_text(f"TS_IP='{TS_IP}'\nJUPYTER_PORT='8888'\nSTATS_PORT='8889'\n")
+        self.refresh_status(window)
+        window.rows["jupyterlab"].open_button.click()
+        self.assertEqual(opened[-1], f"http://{TS_IP}:8888/lab")
+        # The long name is clipped (full URL in the tooltip) instead of widening the page: the scroll
+        # area never scrolls sideways, so a wider page would cut off the Open buttons.
+        self.assertEqual(page.minimumSizeHint().width(), https_width)
+
+    def test_header_shows_the_magicdns_name_next_to_the_address(self):
+        window = self.window()
+        done = builder.RunResult
+        window._on_tailscale_done(done(("tailscale",), "ok", 0, lines=(tailscale_json(dns_name=TS_NAME + "."),)))
+        self.assertEqual(window.tailscale_label.text(), f"Tailscale {TS_IP} · {TS_NAME}")
+        self.assertEqual(window.tailscale_label.property("state"), "ok")
+        window._on_tailscale_done(done(("tailscale",), "ok", 0,
+                                       lines=(tailscale_json(dns_name=TS_NAME + ".", magicdns=False),)))
+        self.assertEqual(window.tailscale_label.text(), f"Tailscale {TS_IP}")
+        (self.state / "tailscale.json").write_text(tailscale_json(dns_name=TS_NAME + "."))
+        window.refresh_tailscale()
+        self.assertTrue(wait_until(lambda: window.ts.name == TS_NAME))
+        self.assertIn(TS_NAME, window.tailscale_label.text())
+
+    def test_the_https_setting_is_kept_defaulted_and_validated(self):
+        self.settings.write_text("JUPYTER_PASSWORD='Loaded-Pass-123'\nHTTPS='off'\n")
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertEqual(builder.parse_settings(self.settings.read_text())["HTTPS"], "off")
+
+        self.settings.write_text("JUPYTER_PASSWORD='Loaded-Pass-123'\n")
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertIn("HTTPS='auto'", self.settings.read_text().split("\n"))
+
+        self.settings.write_text("JUPYTER_PASSWORD='Loaded-Pass-123'\nHTTPS='on'\n")
+        window = self.window()
+        self.assertIn("HTTPS in the settings file must be one of: auto, off", window.error_label.text())
+        window.deploy()
+        self.assertIn("HTTPS", self.wait_refused(window))
+        self.assertIn("HTTPS='on'", self.settings.read_text())
 
     def test_statistics_disabled_is_saved(self):
         window = self.window()

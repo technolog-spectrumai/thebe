@@ -52,7 +52,9 @@ DEFAULTS = {
     "STATS_PORT": "8889",
     "STATS_USER": "jupyter",
     "THEME": "amazing",
+    "HTTPS": "auto",       # auto: HTTPS by MagicDNS name when the tailnet allows it; off: plain HTTP
 }
+HTTPS_MODES = ("auto", "off")
 
 SERVICES = (("jupyterlab", "JupyterLab"), ("stats", "Statistics"))
 
@@ -258,6 +260,27 @@ def available_themes(theme_dir: Path) -> list[str]:
 
 _USER = re.compile(r"[A-Za-z0-9._-]{1,32}")
 _PORT_TEXT = re.compile(r"[1-9][0-9]{0,4}")   # no sign, no leading zero (bash would read octal)
+# A full MagicDNS name as the installer accepts it: two or more lower-case labels.
+_HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+_GID_TEXT = re.compile(r"[1-9][0-9]{0,9}")
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0[xX][0-9a-fA-F]*")
+MAX_GID = 4294967294                          # 4294967295 is (gid_t)-1, "no group"
+
+
+def is_valid_hostname(name: str) -> bool:
+    return len(name) <= 253 and _HOSTNAME.fullmatch(name) is not None
+
+
+def is_public_host(host: str) -> bool:
+    """A Tailscale IPv4 address or a valid DNS name, as the deployed PUBLIC_HOST may be."""
+    if _NUMERIC_LABEL.fullmatch(host.rsplit(".", 1)[-1]):
+        # A browser reads a name ending in a number as an IPv4 address (1.2.3 and 1.0x2 too):
+        # only a real address inside the tailnet range counts then.
+        try:
+            return ipaddress.ip_address(host) in TAILNET
+        except ValueError:
+            return False
+    return is_valid_hostname(host)
 
 
 def password_problems(password: str) -> list[str]:
@@ -316,6 +339,9 @@ def validate_settings(values: Mapping[str, str], themes: Iterable[str] | None = 
     theme_names = list(themes) if themes is not None else None
     if theme_names and values.get("THEME", "") not in theme_names:
         errors.append(f"THEME in the settings file must be one of: {', '.join(theme_names)}.")
+    # A missing key means auto, like the installer; the builder writes HTTPS='auto' on save.
+    if values.get("HTTPS", "auto") not in HTTPS_MODES:
+        errors.append(f"HTTPS in the settings file must be one of: {', '.join(HTTPS_MODES)}.")
     return errors
 
 
@@ -369,6 +395,7 @@ def occupied_port_errors(ip: str, wanted: Iterable[tuple[str, int]],
 class TailscaleStatus:
     ip: str = ""
     problem: str = ""
+    name: str = ""       # full MagicDNS name ('' when MagicDNS is off or the name is unusable)
 
 
 _TAILSCALE_STATES = {
@@ -409,8 +436,18 @@ def parse_tailscale_status(text: str) -> TailscaleStatus:
         except ValueError:
             continue
         if ip.version == 4 and ip in TAILNET:
-            return TailscaleStatus(ip=str(ip))
+            return TailscaleStatus(ip=str(ip), name=magicdns_name(data))
     return TailscaleStatus(problem="Tailscale runs but has no IPv4 address in 100.64.0.0/10")
+
+
+def magicdns_name(data: Mapping) -> str:
+    """This machine's MagicDNS name from `tailscale status --json`, the way the installer reads it."""
+    tailnet = data.get("CurrentTailnet") if isinstance(data.get("CurrentTailnet"), dict) else {}
+    node = data.get("Self") if isinstance(data.get("Self"), dict) else {}
+    if tailnet.get("MagicDNSEnabled") is not True or not isinstance(node.get("DNSName"), str):
+        return ""
+    name = node["DNSName"].lower().removesuffix(".")
+    return name if is_valid_hostname(name) else ""
 
 
 def parse_compose_ps(text: str, project: str = PROJECT) -> dict[str, dict]:
@@ -468,8 +505,11 @@ def service_state(entry: Mapping | None, *, disabled: bool = False) -> tuple[str
     return "Stopped", "muted"
 
 
+# host-setup <ts-ip> <port> [<port>] [--cert <fqdn> <gid>] | host-teardown. The pattern only
+# admits the characters; root_step_from_line applies the installer's exact rules.
 _ROOT_STEP = re.compile(
-    r"ROOT_STEP_REQUIRED: (host-setup 100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?: [1-9][0-9]{3,4}){1,2}|host-teardown)")
+    r"ROOT_STEP_REQUIRED: (host-setup 100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?: [1-9][0-9]{3,4}){1,2}"
+    r"(?: --cert [a-z0-9.-]{1,253} [1-9][0-9]{0,9})?|host-teardown)")
 
 
 def root_step_from_line(line: str) -> list[str] | None:
@@ -485,22 +525,31 @@ def root_step_from_line(line: str) -> list[str] | None:
         except ValueError:
             return None
         ports = args[2:]
+        if "--cert" in ports:
+            # The certificate for the full MagicDNS name, readable by the group of the desktop user.
+            ports, (name, gid) = ports[:ports.index("--cert")], ports[ports.index("--cert") + 1:]
+            if not is_valid_hostname(name) or not _GID_TEXT.fullmatch(gid) or not 1 <= int(gid) <= MAX_GID:
+                return None
         if not all(1024 <= int(port) <= 65535 for port in ports) or len(set(ports)) != len(ports):
             return None
     return args
 
 
 def page_url(runtime: Mapping[str, str], page: Page) -> str:
-    """URL of a page from the deployed runtime .env, or '' when it is not usable."""
-    ip, port = runtime.get("TS_IP", ""), runtime.get(page.port_key, "")
-    try:
-        if ipaddress.ip_address(ip) not in TAILNET:
-            return ""
-    except ValueError:
+    """URL of a page from the deployed runtime .env, or '' when it is not usable.
+
+    PUBLIC_SCHEME and PUBLIC_HOST say how the stack is reached (https with the MagicDNS name
+    when a certificate is in use). Older runtime files have neither and mean http://<TS_IP>;
+    an empty value counts as unset, like ${PUBLIC_HOST:-...} in Compose.
+    """
+    scheme = runtime.get("PUBLIC_SCHEME") or "http"
+    host = runtime.get("PUBLIC_HOST") or runtime.get("TS_IP", "")
+    port = runtime.get(page.port_key, "")
+    if scheme not in ("http", "https") or not is_public_host(host):
         return ""
     if check_port(port, page.label)[1]:
         return ""
-    return f"http://{ip}:{int(port)}{page.path}"
+    return f"{scheme}://{host}:{int(port)}{page.path}"
 
 
 def service_url(runtime: Mapping[str, str], service: str) -> str:
@@ -1055,6 +1104,15 @@ BUSY_TEXT = {
     "stop": "Stopping containers…",
 }
 JOB_TITLES = {"install": "Deploy", "start": "Start", "restart": "Restart", "stop": "Stop"}
+BUSY_TEXT_HTTPS = "Switching to HTTPS: deploying again with the new certificate…"
+# Part of the installer's host-setup error when sysctl/firewall were applied and only the
+# certificate could not be issued.
+CERT_ONLY_FAILURE = "but no certificate for"
+
+
+def host_step_label(args: Iterable[str]) -> str:
+    """What a host-setup step changes, for messages."""
+    return "sysctl/firewall/HTTPS certificate" if "--cert" in args else "sysctl/firewall"
 
 
 class MainWindow(QMainWindow):
@@ -1079,6 +1137,8 @@ class MainWindow(QMainWindow):
         self._job = ""               # install | start | restart | stop | pkexec
         self._command = ""           # the installer command a pkexec step belongs to
         self._root_step: list[str] | None = None
+        self._after_certificate = False    # this install follows a host step that issued a certificate
+        self._success_note = ""
         self._tail: list[str] = []   # last output lines, for failure messages
         self._after_tailscale: Callable[[], None] | None = None
         self._after_status: Callable[[], None] | None = None
@@ -1293,6 +1353,10 @@ class MainWindow(QMainWindow):
                              self._button("Open", "smallButton", partial(self.open_page, service),
                                           f"Open {name} in the browser"))
             row.dot.setFixedSize(10, 10)
+            # An https://<machine>.<tailnet>.ts.net URL is long: clip it (tooltip: the full URL)
+            # rather than widening the card beyond the window.
+            row.url.setMinimumWidth(40)
+            row.url.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             text = QVBoxLayout()
             text.setSpacing(2)
             text.addWidget(self._label(name, "serviceName"))
@@ -1320,7 +1384,8 @@ class MainWindow(QMainWindow):
                 layout.addLayout(links)
         layout.addStretch(1)
         self.services_hint = self._label(
-            "State refreshes every 4 seconds. Open uses the deployed Tailscale address.", "hint", wrap=True)
+            "State refreshes every 4 seconds. Open uses the deployed address: the Tailscale name over HTTPS "
+            "when a certificate is in use, otherwise HTTP.", "hint", wrap=True)
         layout.addWidget(self.services_hint)
         return card
 
@@ -1454,7 +1519,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_header(self) -> None:
         if self.ts.ip:
-            ts = ("ok", f"Tailscale {self.ts.ip}")
+            ts = ("ok", f"Tailscale {self.ts.ip}" + (f" · {self.ts.name}" if self.ts.name else ""))
         else:
             ts = ("problem", self.ts.problem) if self.ts.problem else ("pending", "Checking Tailscale…")
         if self.docker_problem is None:
@@ -1484,6 +1549,7 @@ class MainWindow(QMainWindow):
                 url_kind = "muted"
             row.badge.setText(label)
             row.url.setText(url_text)
+            row.url.setToolTip(url if url_kind == "link" else "")
             for widget, value in ((row.dot, kind), (row.badge, kind), (row.url, url_kind)):
                 if widget.property("kind") != value:
                     _repolish(widget, kind=value)
@@ -1766,11 +1832,13 @@ class MainWindow(QMainWindow):
         self._fail(f"The installer was not found at {self.paths.installer}.")
         return False
 
-    def _run_installer(self, command: str) -> None:
+    def _run_installer(self, command: str, *, after_certificate: bool = False, note: str = "") -> None:
         self._job = self._command = command
         self._root_step = None
+        self._after_certificate = after_certificate
+        self._success_note = note
         self._tail = []
-        self._set_busy(True, BUSY_TEXT[command])
+        self._set_busy(True, BUSY_TEXT_HTTPS if after_certificate else BUSY_TEXT[command])
         self.job_runner.start([self._bash, str(self.paths.installer), command],
                               cwd=str(self.paths.installer.parent), env=self._child_env())
 
@@ -1793,20 +1861,33 @@ class MainWindow(QMainWindow):
         command = self._job
         if result.outcome != "ok":
             self._job_failed(command, result)
+        elif self._root_step is not None and self._after_certificate:
+            # Asking again right after the step was applied could go round in circles.
+            self._root_step_repeated(command, self._root_step)
         elif self._root_step is not None:
             # sudo could not prompt without a terminal; polkit asks graphically.
             self.log(f"# The host step needs root: {shlex.join(self._root_step)} (asking through polkit)")
             self._job = "pkexec"
-            self._banner("busy", "Waiting for authorisation of the host step (sysctl/firewall)…")
+            self._tail = []     # only the host step's own lines count for its result message
+            self._banner("busy", f"Waiting for authorisation of the host step ({host_step_label(self._root_step)})…")
             self.job_runner.start(["pkexec", "/bin/bash", str(self.paths.installer), *self._root_step],
                                   cwd=str(self.paths.installer.parent), env=self._child_env())
         else:
-            self._job_succeeded(command)
+            self._job_succeeded(command, self._success_note)
 
     def _on_root_step_done(self, result: RunResult) -> None:
         command, args = self._command, self._root_step or []
+        label = host_step_label(args)
         if result.outcome == "ok":
-            self._job_succeeded(command, "The host step (sysctl/firewall) was applied.")
+            note = f"The host step ({label}) was applied."
+            if "--cert" in args and not self._after_certificate:
+                # The install that asked for the step ran without the certificate; only a new
+                # deploy switches the containers to HTTPS. Once: that run never asks for pkexec.
+                self.log("# The host step issued the HTTPS certificate. Running install once more: "
+                         "the new certificate switches the services to HTTPS.")
+                self._run_installer("install", after_certificate=True, note=note)
+                return
+            self._job_succeeded(command, note)
             return
         if result.outcome == "failed":
             reason = "pkexec is not available"
@@ -1819,12 +1900,35 @@ class MainWindow(QMainWindow):
         else:
             reason = f"it failed with exit code {result.code}"
         terminal = shlex.join(["sudo", str(self.paths.installer), *args])
-        message = (f"{JOB_TITLES[command]} finished and the services run, but the host step "
-                   f"(sysctl/firewall) was not applied: {reason}.")
+        if ("--cert" in args and result.outcome == "exit"
+                and any(CERT_ONLY_FAILURE in line for line in self._tail)):
+            # host-setup still applies sysctl/firewall when only 'tailscale cert' fails.
+            message = (f"{JOB_TITLES[command]} finished and the services run. The host step applied the "
+                       "sysctl/firewall settings, but the HTTPS certificate could not be issued, so the services "
+                       "keep using HTTP. The Output panel shows why; HTTPS certificates must be enabled in the "
+                       "Tailscale admin console (DNS page).")
+        else:
+            message = (f"{JOB_TITLES[command]} finished and the services run, but the host step "
+                       f"({label}) was not applied: {reason}.")
+            if "--cert" in args:
+                message += (" The services keep using HTTP until the certificate is issued. If issuing it failed, "
+                            "the Output panel shows why; HTTPS certificates must be enabled in the Tailscale admin "
+                            "console (DNS page).")
         self.log(f"# {message}", f"# Run it in a terminal: {terminal}")
         self._set_busy(False)
         self._banner("error", f"{message} Run in a terminal: {terminal}")
         QMessageBox.critical(self, APP_NAME, f"{message}\n\nRun it in a terminal:\n\n    {terminal}")
+        self.refresh_status()
+
+    def _root_step_repeated(self, command: str, args: list[str]) -> None:
+        terminal = shlex.join(["sudo", str(self.paths.installer), *args])
+        message = (f"{JOB_TITLES[command]} finished and the services run, but the installer still reports the host "
+                   f"step ({host_step_label(args)}) as needed right after it was applied, so the builder does not "
+                   "ask again.")
+        self.log(f"# {message}", f"# Run it in a terminal to see why: {terminal}")
+        self._set_busy(False)
+        self._banner("error", f"{message} Run in a terminal: {terminal}")
+        QMessageBox.warning(self, APP_NAME, f"{message}\n\nRun it in a terminal to see why:\n\n    {terminal}")
         self.refresh_status()
 
     def _job_succeeded(self, command: str, note: str = "") -> None:
