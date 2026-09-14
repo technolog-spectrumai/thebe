@@ -25,6 +25,7 @@ optional PyQt6 builder window keeps its own dependencies in a project-local `.ve
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Opening it on the tablet](#opening-it-on-the-tablet)
+- [Connecting by name over HTTPS](#connecting-by-name-over-https)
 - [Credentials and settings](#credentials-and-settings)
 - [Graphical builder](#graphical-builder)
 - [Commands](#commands)
@@ -49,10 +50,11 @@ Compose there.
 | Piece | Location | Notes |
 | --- | --- | --- |
 | Settings (password, ports, stats on/off) | `<repo>/.env` | Created with defaults on first install, mode `0600`, gitignored. |
-| Stack sources | `<repo>/stack/` | `Dockerfile`, `compose.yaml`, `compose.gpu.yaml`, `jupyter/`, `stats/`, `theme/`. |
+| Stack sources | `<repo>/stack/` | `Dockerfile`, `compose.yaml`, `compose.gpu.yaml`, `compose.tls.yaml`, `jupyter/`, `stats/`, `theme/`. |
 | Deployed stack (app dir) | `~/.local/share/jupyterlab-tailscale/` | A copy of `stack/` plus generated files; Compose project directory. |
-| Runtime variables | `~/.local/share/jupyterlab-tailscale/.env` | Generated on every deploy: Tailscale IP, ports, profiles, uid/gid. **No secrets.** |
+| Runtime variables | `~/.local/share/jupyterlab-tailscale/.env` | Generated on every deploy: Tailscale IP and name, URL scheme, TLS state, ports, profiles, uid/gid. **No secrets.** |
 | Secrets | `~/.local/share/jupyterlab-tailscale/secrets/` | The password, its argon2 hash and a random package-runner token, each mode `0600`, mounted as Compose secrets. |
+| HTTPS certificate | `/var/lib/jupyterlab-tailscale/tls/` | `<name>.crt` and `<name>.key` from `tailscale cert`, owned by root and readable by your group; mounted read-only through `compose.tls.yaml` when valid. |
 | Notebooks | `~/jupyter-workspace` | Bind-mounted at `/workspace`. Never deleted by default. |
 
 Compose project `jupyterlab-tailscale` runs three services on the default bridge network (so notebooks
@@ -116,39 +118,83 @@ It is safe to run again at any time. `install`:
    service, `~/.local/bin/jupyterlab-tailscale`, `~/.local/share/jupyterlab-tailscale/venv` and
    `~/.config/jupyterlab-tailscale`.
 5. Refuses to continue if a port is already used by something else.
-6. Copies `stack/` to the app dir, detects a usable NVIDIA GPU, writes the runtime `.env`.
+6. Copies `stack/` to the app dir and detects a usable NVIDIA GPU.
 7. Builds the images (cached layers make repeated runs fast and do not recreate containers).
-8. Hashes the password with argon2 **inside the image** — only when it changed — writes the secrets
-   and creates the package-runner token once.
-9. Starts the containers and waits until all of them report healthy.
-10. Runs the [host step](#host-settings-and-firewall-behaviour) through `sudo` when it is needed.
-11. Prints the URLs.
+8. Reads the Tailscale name and checks the HTTPS certificate
+   ([details](#connecting-by-name-over-https)), then writes the runtime `.env`.
+9. Runs the [host step](#host-settings-and-firewall-behaviour) through `sudo` when it is needed — in a
+   terminal before the containers start, so a new certificate is used right away.
+10. Hashes the password with argon2 **inside the image** — only when it changed — writes the secrets
+    and creates the package-runner token once.
+11. Starts the containers and waits until all of them report healthy.
+12. Prints the URLs.
 
 When the host step is needed and there is no terminal to ask for the `sudo` password, the script
 prints the command to run instead, for example:
 
 ```text
-ROOT_STEP_REQUIRED: host-setup 100.82.217.101 8888 8889
-Run in a terminal: sudo /path/to/setup-jupyterlab-tailscale.sh host-setup 100.82.217.101 8888 8889
+ROOT_STEP_REQUIRED: host-setup 100.82.217.101 8888 8889 --cert basilisk-systems.lyrebird-hen.ts.net 1000
+Run in a terminal: sudo /path/to/setup-jupyterlab-tailscale.sh host-setup 100.82.217.101 8888 8889 --cert basilisk-systems.lyrebird-hen.ts.net 1000
 ```
 
-The containers are already running at that point; the host step only makes them survive reboots
-reliably and restricts the ports when a firewall is active.
+The containers are already running at that point, over HTTP. The host step makes them survive reboots
+reliably, restricts the ports when a firewall is active and issues the HTTPS certificate; run
+`./setup-jupyterlab-tailscale.sh start` afterwards to switch to HTTPS (the builder does that by
+itself).
 
 ## Opening it on the tablet
 
-With the tablet connected to the same tailnet, open:
+With the tablet connected to the same tailnet, open the laptop by its Tailscale name (MagicDNS),
+for example `basilisk-systems.lyrebird-hen.ts.net`:
 
 | Page | URL | Login |
 | --- | --- | --- |
-| JupyterLab | `http://<tailscale-ip>:8888/lab` | password only |
-| Statistics | `http://<tailscale-ip>:8889/` | username `jupyter` + the same password |
-| Dependencies | `http://<tailscale-ip>:8889/dependencies` | as Statistics |
+| JupyterLab | `https://<machine>.<tailnet>.ts.net:8888/lab` | password only |
+| Statistics | `https://<machine>.<tailnet>.ts.net:8889/` | username `jupyter` + the same password |
+| Dependencies | `https://<machine>.<tailnet>.ts.net:8889/dependencies` | as Statistics |
 
-The dashboard's navigation bar links Statistics, Dependencies and JupyterLab, so only one address has
-to be typed (or none, with the builder's Open buttons). `./setup-jupyterlab-tailscale.sh status`
-prints the URLs with the real address. The addresses use plain HTTP; the traffic between Tailscale
-devices is encrypted by Tailscale's WireGuard tunnel.
+`./setup-jupyterlab-tailscale.sh status` prints the exact URLs. They use HTTPS with a real certificate
+when the tailnet allows it (see [Connecting by name over HTTPS](#connecting-by-name-over-https));
+otherwise they fall back to `http://` by name, or to `http://<tailscale-ip>:8888/lab` when MagicDNS is
+off. The dashboard's navigation bar links Statistics, Dependencies and JupyterLab, so only one address
+has to be typed (or none, with the builder's Open buttons). Traffic between Tailscale devices is always
+encrypted by the WireGuard tunnel; HTTPS adds a certificate the browser can verify.
+
+## Connecting by name over HTTPS
+
+Tailscale gives every device a MagicDNS name such as `basilisk-systems.lyrebird-hen.ts.net`, and it
+can issue a real certificate for that name. The script uses both, the way zenobia does:
+
+- **Detection.** With `HTTPS='auto'` (the default) every `install`, `update` and `start` reads
+  `tailscale status --json` (parsed inside the JupyterLab image, so the host needs no Python or
+  `jq`). When MagicDNS is on, all URLs use the name. When the tailnet can also issue a certificate
+  for it, JupyterLab and the dashboard serve **HTTPS on the same ports**.
+- **Certificate.** It comes from `tailscale cert`, which needs root, so it is part of the
+  [host step](#host-settings-and-firewall-behaviour):
+  `host-setup <tailscale-ip> <port> [<port>] --cert <name> <gid>`. The files are written to
+  `/var/lib/jupyterlab-tailscale/tls/<name>.crt` and `.key`, owned by root and readable by your group,
+  so the non-root containers can read them. In a terminal the step runs before the containers start,
+  so the first install already uses HTTPS. From the builder, polkit asks for the password and the
+  builder then deploys once more to switch to HTTPS.
+- **Renewal.** Certificates last 90 days. When fewer than 21 days remain, the next `install`,
+  `update` or `start` (or the builder's Deploy/Start) fetches a fresh one through the host step and
+  recreates JupyterLab and the dashboard so they serve it. `status` and the dashboard footer show the
+  expiry date, highlighted during the last 21 days.
+- **Fallbacks.** With `HTTPS='off'`, with MagicDNS or HTTPS certificates disabled for the tailnet,
+  or before the host step has run, the services use HTTP: by name when MagicDNS works, by IP otherwise.
+  Nothing fails because of it. A stack deployed before this feature keeps HTTP until the next
+  `update`.
+- **Addresses.** The Tailscale IP keeps working, but under HTTPS the browser warns about the
+  certificate, because it names the MagicDNS name and not the address.
+
+Both prerequisites are switched on in the Tailscale admin console under **DNS**: *MagicDNS* and
+*HTTPS Certificates*.
+
+Inside the stack, `compose.tls.yaml` mounts the certificate read-only into `jupyterlab` and `stats`
+whenever a valid one exists. The dashboard's own call to JupyterLab also uses HTTPS; it does not verify
+the certificate, because the call stays on the private Compose network and the certificate cannot name
+the service `jupyterlab`. The package runner stays internal plain HTTP. No HSTS header is sent, so the
+HTTP fallback keeps working in browsers.
 
 ## Credentials and settings
 
@@ -170,6 +216,7 @@ STATS_ENABLED='1'
 STATS_PORT='8889'
 STATS_USER='jupyter'
 THEME='amazing'
+HTTPS='auto'
 ```
 
 To change something, edit the file (or use the [builder](#graphical-builder)) and apply it:
@@ -188,6 +235,8 @@ To change something, edit the file (or use the [builder](#graphical-builder)) an
   Dependencies page stay installed and keep working in notebooks.
 - **`THEME`:** one of the files in `stack/theme/` without `.json` (default `amazing`); see
   [Themes](#themes). Changing it recreates only the `stats` container.
+- **`HTTPS`:** `auto` (default) serves HTTPS by the Tailscale name when the tailnet allows it, `off`
+  keeps plain HTTP; see [Connecting by name over HTTPS](#connecting-by-name-over-https).
 
 The script parses this file itself; it is never executed as shell code. JupyterLab only ever sees
 the argon2 hash. The plain password reaches the `stats` container as a mounted secret file, never
@@ -236,8 +285,8 @@ The window follows the desktop's light or dark mode, using the same oya palette 
 | **Stop** | `stop` (`docker compose stop`). |
 | Output | Read-only log of every command and its output. |
 
-The header shows the detected Tailscale IPv4 address (from `tailscale status --json`; Tailscale must be
-connected) and whether Docker answers. Buttons are disabled while a command runs; the window stays
+The header shows the detected Tailscale IPv4 address and MagicDNS name (from `tailscale status
+--json`; Tailscale must be connected) and whether Docker answers. Buttons are disabled while a command runs; the window stays
 responsive throughout. The package runner has no row of its own; its state is shown on the
 Dependencies page.
 
@@ -253,9 +302,14 @@ Deploy is refused, with the reasons listed under the form, when:
 
 When the script reports that the [host step](#host-settings-and-firewall-behaviour) is needed, the
 builder asks through polkit (`pkexec /bin/bash setup-jupyterlab-tailscale.sh host-setup <ip>
-<ports>`), which shows the desktop's own password dialog. If the dialog is dismissed, the services
-still run; the builder shows the equivalent `sudo` command, and it asks again on the next Deploy,
-Start or Restart until the step has been applied once.
+<ports> [--cert <name> <gid>]`), which shows the desktop's own password dialog. If the dialog is
+dismissed, the services still run; the builder shows the equivalent `sudo` command, and it asks again
+on the next Deploy, Start or Restart until the step has been applied once.
+
+When the step included `--cert` and succeeded, the builder deploys once more by itself, so JupyterLab
+and the dashboard switch to HTTPS and the Open buttons follow. It never loops: if a step is still
+reported as needed afterwards, it shows a warning instead of asking again. If only the certificate
+could not be issued, it says so; the services keep using HTTP by name.
 
 ### Configuration and security notes
 
@@ -292,13 +346,13 @@ The builder's offscreen test suite runs with
 | --- | --- |
 | `install` | Build and start everything; creates the settings file when missing. Idempotent. |
 | `update` | Same as `install`, but also pulls a newer base image (`docker compose build --pull`). Use it after editing `.env` or pulling a new version of this repository. |
-| `start` | Start the containers. If the Tailscale IPv4 changed, the ports follow the new address. |
+| `start` | Start the containers. If the Tailscale IPv4, the MagicDNS name or the certificate changed, the services follow; a certificate due for renewal triggers the host step. |
 | `stop` | Stop the containers (they stay stopped across reboots until `start`). A running package install is interrupted. |
 | `restart` | `stop`, then `start`. |
-| `status` | Settings, deployed ports, live vs. deployed Tailscale IP, state and health of `jupyterlab`, `stats` and `deps (package runner)`, URLs, host step and firewall state. Exit code 3 when not installed. |
+| `status` | Settings, deployed ports, live vs. deployed Tailscale IP, the MagicDNS name and HTTPS state (certificate valid until / days left / renewal due / why HTTPS is not used), state and health of `jupyterlab`, `stats` and `deps (package runner)`, URLs, host step and firewall state. Exit code 3 when not installed. |
 | `logs [--no-follow] [SERVICE...]` | Last 100 log lines of `jupyterlab`, `stats` and/or `deps`, following unless `--no-follow`. |
 | `uninstall [--yes] [--delete-workspace]` | See [Uninstalling](#uninstalling). |
-| `host-setup <ip> <port> [<port>]`, `host-teardown` | Root-only helpers, normally run for you through `sudo`. |
+| `host-setup <ip> <port> [<port>] [--cert <name> <gid>]`, `host-teardown` | Root-only helpers, normally run for you through `sudo` (or polkit from the builder). |
 
 Environment overrides: `JLT_SETTINGS_FILE` (settings file), `JLT_APP_DIR` (app dir),
 `JLT_WORKSPACE_DIR` (notebook workspace), `JLT_GPU=auto|on|off`.
@@ -346,9 +400,12 @@ remembered by the browser). It works on phone, tablet and desktop widths and ref
 read-only; the Docker socket is not mounted. Kernel information comes from JupyterLab's REST API,
 which the dashboard logs into with the same password (once, not on every refresh).
 
+The page footer shows how the dashboard is reached: `HTTPS · certificate for <name> valid until <date>`
+(highlighted during the last 21 days, a warning once expired) or `HTTP inside the Tailscale tunnel`.
+
 ## Dependencies page
 
-`http://<tailscale-ip>:8889/dependencies` adds Python packages to the notebook kernels — for example
+`https://<machine>.<tailnet>.ts.net:8889/dependencies` (or the address `status` prints) adds Python packages to the notebook kernels — for example
 PyTorch — without rebuilding images.
 
 | Part of the page | What it does |
@@ -485,7 +542,12 @@ container, so the password is never handled by the script.
   the package runner is not published at all. Compose refuses to start if that address is missing, so
   an empty value can never turn into "all interfaces". Nothing listens on loopback, the
   Wi-Fi/Ethernet address or `0.0.0.0`.
-- **Transport.** Tailscale encrypts traffic between devices; the services themselves speak HTTP.
+- **Transport.** Tailscale encrypts traffic between devices (WireGuard). When the tailnet allows it,
+  JupyterLab and the dashboard also serve HTTPS with a publicly trusted certificate for the MagicDNS
+  name, so browsers can verify the server; otherwise they speak HTTP inside the tunnel. The
+  certificate's private key is readable only by root and your primary group. The dashboard's call to
+  JupyterLab on the internal Compose network does not verify the certificate (it names the public
+  host), and no HSTS header is sent, so the HTTP fallback keeps working.
 - **Authentication.** JupyterLab requires the password (argon2 hash, token login disabled, the server
   refuses to start without a valid hash). The dashboard requires HTTP Basic auth on every route. The
   package runner accepts only a random token shared with the dashboard.
@@ -537,6 +599,15 @@ needs root. `install`, `update` and `start` run it when something is missing or 
    binding remains the control.
 4. **No active firewall.** No rules are created; `status` says so. The Tailscale-only binding is what
    keeps the services off other networks.
+5. **HTTPS certificate (with `--cert <name> <gid>`).** Runs
+   `tailscale cert --cert-file … --key-file … --min-validity 528h <name>` (always the full MagicDNS name,
+   never writing into the current directory), then installs the pair as
+   `/var/lib/jupyterlab-tailscale/tls/<name>.crt` (0644) and `<name>.key` (0640), both `root:<gid>`, in a
+   `0750` directory, and removes certificates for other names. The group is your primary group, so the
+   non-root containers can read the key; `host-setup` warns if that group is shared with other accounts.
+   If `tailscale cert` fails (for example because HTTPS certificates are disabled for the tailnet), the
+   sysctl and firewall parts are still applied, the previous certificate is kept, and the helper exits
+   with an error saying that no certificate was issued.
 
 Ports that are no longer wanted (a changed port, statistics disabled) are removed from the rules on
 the next run. The applied state is recorded in `/var/lib/jupyterlab-tailscale/state`.
@@ -585,6 +656,19 @@ are disabled, the page does not exist.
 the log on the page shows why — a `ResolutionImpossible` error means the package needs a different
 version of something the image already pins.
 
+**The browser warns about the certificate.** Open the pages by name
+(`https://<machine>.<tailnet>.ts.net:8888/lab`), not by IP: the certificate names the MagicDNS name.
+
+**HTTPS is not used although `HTTPS='auto'`.** The `Name:` and `HTTPS:` lines of `status` say why:
+MagicDNS or HTTPS Certificates are disabled in the Tailscale admin console (DNS page), the host step has
+not been applied yet (`Root step needed: yes -> sudo …`), or the stack was deployed before this feature
+(run `update` once). If `host-setup` ends by saying that no certificate was issued, `tailscale cert`
+failed; check the admin console and `tailscale status`.
+
+**The certificate is about to expire.** Run `start` or `update` (or Deploy/Start in the builder): with
+fewer than 21 days left the host step renews it, and JupyterLab and the dashboard are recreated with
+the new one.
+
 **The dashboard shows "No NVIDIA GPU visible".** Check `nvidia-smi` on the host and
 `docker info | grep -i runtime`; then `JLT_GPU=on ./setup-jupyterlab-tailscale.sh update` to see
 why the GPU test fails.
@@ -601,7 +685,7 @@ projects).
 
 You must type `uninstall` to confirm (or pass `--yes`; without a terminal, `--yes` is required). It
 removes the containers, both images, the Docker volumes (JupyterLab settings, installed packages and
-caches), the app dir, and — through `sudo` — the host step (sysctl file, firewall rules, state).
+caches), the app dir, and — through `sudo` — the host step (sysctl file, firewall rules, HTTPS certificate, state).
 
 It **keeps** `~/jupyter-workspace` and `<repo>/.env`. To delete the workspace as well, add
 `--delete-workspace` and type `delete` when asked.
@@ -613,8 +697,9 @@ setup-jupyterlab-tailscale.sh      the CLI (install, start, stop, restart, statu
 stack/Dockerfile                   base → jupyterlab and stats images
 stack/compose.yaml                 services, ports, secrets, volumes, health checks
 stack/compose.gpu.yaml             GPU override, used when a GPU is detected
-stack/jupyter/                     JupyterLab config, kernel launcher, package runner, requirements and lock file
-stack/stats/                       FastAPI dashboard and Dependencies page: app, theme loader, templates, static assets, requirements and lock file
+stack/compose.tls.yaml             HTTPS override, used when a valid certificate exists
+stack/jupyter/                     JupyterLab config and health check, kernel launcher, package runner, requirements and lock file
+stack/stats/                       FastAPI dashboard and Dependencies page: app, TLS-aware launcher (serve.py), theme loader, templates, static assets, requirements and lock file
 stack/theme/                       zenobia's oya theme files (palette of the dashboard and the builder)
 builder.py                         optional PyQt6 builder (thin frontend over the script)
 run-builder.sh                     creates .venv with the pinned PyQt6 and starts the builder
