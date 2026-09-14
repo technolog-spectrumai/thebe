@@ -1,0 +1,44 @@
+{
+  "name": "Market Appetite",
+  "font": "Nunito Sans",
+  "colors": {
+    "primary-bg-light": "#fffdf8",
+    "header-bg-light": "#2f5d3a",
+    "appbar-bg-light": "#3f7a4c",
+    "appbar-text-light": "#fff8ec",
+    "bubble-bg-light": "#f7efe2",
+    "footer-bg-light": "#2f5d3a",
+    "footer-text-light": "#fff8ec",
+    "text-main-light": "#2a1f16",
+    "accent-light": "#ff7a2f",
+    "warn-light": "#d63f2e",
+    "success-light": "#4f8f3a",
+    "sunken-light": "#f2eadf",
+    "link-light": "#c65a19",
+    "primary-bg-dark": "#15120d",
+    "header-bg-dark": "#1f3f2a",
+    "appbar-bg-dark": "#274f34",
+    "appbar-text-dark": "#fff3d8",
+    "bubble-bg-dark": "#241c13",
+    "footer-bg-dark": "#1f3f2a",
+    "footer-text-dark": "#fff3d8",
+    "text-main-dark": "#f6e6c8",
+    "accent-dark": "#ff9b45",
+    "warn-dark": "#ff5a4f",
+    "caution-light": "#9a7200",
+    "caution-dark": "#f0b030",
+    "success-dark": "#7fbd5a",
+    "sunken-dark": "#1b160f",
+    "link-dark": "#ffb66b",
+    "accent-1": "#ff7a2f",
+    "accent-2": "#4f8f3a"
+  },
+  "header": {
+    "light": "bg-[#2f5d3a] text-[#fff8ec] shadow-md",
+    "dark": "bg-[#1f3f2a] text-[#fff3d8] shadow-md"
+  },
+  "footer": {
+    "light": "bg-[#2f5d3a] text-[#fff8ec] py-4",
+    "dark": "bg-[#1f3f2a] text-[#fff3d8] py-4"
+  }
+}

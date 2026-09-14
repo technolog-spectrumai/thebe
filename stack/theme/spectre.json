@@ -1,0 +1,44 @@
+{
+  "name": "Elegant Spectrum",
+  "font": "Orbitron",
+  "colors": {
+    "primary-bg-light": "#f8f9fa",
+    "header-bg-light": "#1b1f23",
+    "appbar-bg-light": "#2a2f35",
+    "appbar-text-light": "#e2e6ea",
+    "bubble-bg-light": "#e5e7eb",
+    "footer-bg-light": "#1b1f23",
+    "footer-text-light": "#e2e6ea",
+    "text-main-light": "#0f1113",
+    "accent-light": "#3a4c5c",
+    "warn-light": "#ff0033",
+    "success-light": "#3b8f7a",
+    "sunken-light": "#dfe2e5",
+    "link-light": "#3a6fb0",
+    "primary-bg-dark": "#0a0c0e",
+    "header-bg-dark": "#121416",
+    "appbar-bg-dark": "#1b1f23",
+    "appbar-text-dark": "#d6dce1",
+    "bubble-bg-dark": "#1f2327",
+    "footer-bg-dark": "#121416",
+    "footer-text-dark": "#d6dce1",
+    "text-main-dark": "#d6dce1",
+    "accent-dark": "#7aa2ff",
+    "warn-dark": "#ff0033",
+    "caution-light": "#a07800",
+    "caution-dark": "#f0a820",
+    "success-dark": "#4fa38c",
+    "sunken-dark": "#14171a",
+    "link-dark": "#6f9df5",
+    "accent-1": "#7aa2ff",
+    "accent-2": "#3a4c5c"
+  },
+  "header": {
+    "light": "bg-[#1b1f23] text-[#e2e6ea] shadow-md",
+    "dark": "bg-[#121416] text-[#d6dce1] shadow-md"
+  },
+  "footer": {
+    "light": "bg-[#1b1f23] text-[#e2e6ea] py-4",
+    "dark": "bg-[#121416] text-[#d6dce1] py-4"
+  }
+}

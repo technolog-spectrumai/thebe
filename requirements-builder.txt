@@ -1,0 +1,6 @@
+# Dependencies of builder.py only. run-builder.sh installs them into ./.venv
+# (never globally) with --only-binary=:all:.
+# PyQt6 6.11.0 requires PyQt6-Qt6 >=6.11.0,<6.12.0 and PyQt6-sip >=13.8,<14.
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2
+PyQt6-sip==13.12.0

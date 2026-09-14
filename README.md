@@ -24,6 +24,7 @@ used.
 - [Installation](#installation)
 - [Opening it on the tablet](#opening-it-on-the-tablet)
 - [Credentials and settings](#credentials-and-settings)
+- [Graphical builder](#graphical-builder)
 - [Commands](#commands)
 - [Persistence](#persistence)
 - [Statistics dashboard](#statistics-dashboard)
@@ -177,6 +178,93 @@ The script parses this file itself; it is never executed as shell code. JupyterL
 the argon2 hash. The plain password reaches the `stats` container as a mounted secret file, never
 through environment variables, `compose.yaml` or `docker inspect`. JupyterLab's token login is
 disabled, and changing the password from the JupyterLab UI is turned off.
+
+## Graphical builder
+
+`builder.py` is an optional PyQt6 window over the same script and the same settings file. It is a
+thin frontend: every action it takes is `setup-jupyterlab-tailscale.sh install | start | restart |
+stop`, plus a read-only `docker compose ps` for the status badges. The command line keeps working
+exactly as before, and both can be used side by side.
+
+### Installing and launching
+
+```bash
+./run-builder.sh
+```
+
+- The first start creates `.venv` in the repository with `/usr/bin/python3` and installs the pinned
+  wheels from `requirements-builder.txt` (PyQt6 6.11.0, PyQt6-Qt6 6.11.2, PyQt6-sip 13.12.0; about
+  95 MB to download). Nothing is installed globally — `rm -rf .venv` removes every builder
+  dependency.
+- Later starts reuse the venv. It is rebuilt only when the pins or the Python version change.
+  Another interpreter can be chosen with `PYTHON=/path/to/python3 ./run-builder.sh`.
+- Ubuntu/Debian need `python3-venv`, and X11 sessions need `libxcb-cursor0` for Qt
+  (`sudo apt install python3-venv libxcb-cursor0`); the launcher names whichever is missing.
+
+The window follows the desktop's light or dark mode, using the same oya palette as the dashboard.
+
+### Fields and buttons
+
+| Control | Meaning |
+| --- | --- |
+| Password + Show/Hide | `JUPYTER_PASSWORD` — the JupyterLab password and the statistics password. |
+| JupyterLab port | `JUPYTER_PORT`, default 8888. |
+| Enable FastAPI statistics | `STATS_ENABLED`. Unticking it and deploying stops and removes the statistics container and closes its firewall port. |
+| Statistics port | `STATS_PORT`, default 8889 (disabled while statistics are off). |
+| Username: jupyter | The fixed statistics username (`STATS_USER`), shown read-only. |
+| Services | A state dot and badge for JupyterLab and Statistics (Running, Starting, Unhealthy, Restarting, Stopped, Not deployed, Disabled), refreshed every 4 seconds, with the deployed URL and an **Open** button that starts the browser. |
+| **Deploy / Update** | Validates, saves the settings, then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
+| **Start / Restart** | `start` when nothing is running, otherwise `restart`. |
+| **Stop** | `stop` (`docker compose stop`). |
+| Output | Read-only log of every command and its output. |
+
+The header shows the detected Tailscale IPv4 address (from `tailscale status --json`; Tailscale must be
+connected) and whether Docker answers. Buttons are disabled while a command runs; the window stays
+responsive throughout.
+
+Deploy is refused, with the reasons listed under the form, when:
+
+- the password breaks the [password rules](#credentials-and-settings);
+- a port is not a whole number from 1024 to 65535, or both ports are equal;
+- a port is already in use on the Tailscale address by another program (ports held by this stack's own
+  containers are fine; to swap ports between the two services, press Stop first);
+- Tailscale is not connected or Docker does not answer.
+
+### The host step from the builder
+
+When the script reports that the [host step](#host-settings-and-firewall-behaviour) is needed, the
+builder asks through polkit (`pkexec /bin/bash setup-jupyterlab-tailscale.sh host-setup <ip>
+<ports>`), which shows the desktop's own password dialog. If the dialog is dismissed, the services
+still run; the builder shows the equivalent `sudo` command, and it asks again on the next Deploy,
+Start or Restart until the step has been applied once.
+
+### Configuration and security notes
+
+- The builder edits `<repo>/.env` — the same file the script reads. It writes it atomically with mode
+  `0600`, keeps comments and unknown lines, and honours `JLT_SETTINGS_FILE` and `JLT_APP_DIR`. It
+  also writes `THEME='amazing'`, the name of the palette in `stack/theme/`.
+- It reads the deployed `~/.local/share/jupyterlab-tailscale/.env` only to build the Open URLs, so
+  they always point at what is actually running.
+- Commands run through Qt's `QProcess` with argument lists; no shell is involved. The password never
+  appears on a command line, in a child process environment, in `compose.yaml` or in the Output
+  panel.
+- Services stay published on the Tailscale address only; the builder has no way to choose another
+  address.
+- The builder has no uninstall button and never deletes `~/jupyter-workspace`.
+
+### Equivalent CLI commands
+
+| Builder | Command line |
+| --- | --- |
+| Edit fields + **Deploy / Update** | edit `.env`, then `./setup-jupyterlab-tailscale.sh install` (or `update` to also refresh the base image) |
+| **Start / Restart** | `./setup-jupyterlab-tailscale.sh start` / `restart` |
+| **Stop** | `./setup-jupyterlab-tailscale.sh stop` |
+| Services badges | `./setup-jupyterlab-tailscale.sh status` |
+| **Open** | the URLs printed by `status` |
+| polkit dialog | `sudo ./setup-jupyterlab-tailscale.sh host-setup <tailscale-ip> <port> [<port>]` |
+
+The builder's offscreen test suite runs with
+`QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests`.
 
 ## Commands
 
@@ -363,6 +451,12 @@ stack/compose.yaml                 services, ports, secrets, volumes, health che
 stack/compose.gpu.yaml             GPU override, used when a GPU is detected
 stack/jupyter/                     JupyterLab config, requirements and lock file
 stack/stats/                       FastAPI dashboard: app, templates, static assets, requirements and lock file
+stack/theme/                       oya theme files shared with zenobia (palette of the builder window)
+builder.py                         optional PyQt6 builder (thin frontend over the script)
+run-builder.sh                     creates .venv with the pinned PyQt6 and starts the builder
+requirements-builder.txt           PyQt6 pins for the builder venv
+tests/test_builder.py              offscreen tests for the builder
 plan.md                            implementation plan and progress
-.env                               your settings (created by install, not committed)
+.env                               your settings (created by install or the builder, not committed)
+.venv/                             builder virtualenv (created by run-builder.sh, not committed)
 ```

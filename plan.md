@@ -27,11 +27,12 @@ merely written.
 - [x] Commit
 
 **Stage 2 — PyQt6 builder**
-- [ ] `builder.py`, `run-builder.sh`, `requirements-builder.txt`, `tests/test_builder.py`
-- [ ] Adversarial review against the spec + fixes, offscreen tests green
-- [ ] Real Deploy → Stop → Start round trip against the stack
-- [ ] README (builder section)
-- [ ] Commit
+- [x] `builder.py`, `run-builder.sh`, `requirements-builder.txt`, `tests/test_builder.py`
+- [x] Adversarial review against the spec + fixes, offscreen tests green (68 tests)
+- [x] Real Deploy → Stop → Start → Restart round trip against the live stack (driven offscreen from a clean export of the Stage 1 commit; pkexec stubbed; no container recreated by an unchanged Deploy; validation refusals for equal and occupied ports)
+- [x] Port fields accept the whole range so a typed privileged port is rejected with a message instead of silently reverting
+- [x] README (builder section: install/launch, fields, validation, polkit host step, configuration, security, CLI equivalents)
+- [x] Commit
 
 **Stage 3 — Dependencies page**
 - [ ] `/dependencies` page + API: pip into the shared volume with constraints, single job, live log
@@ -84,7 +85,7 @@ Proposed (see §8 for the questions still open):
 | Secrets | Password → `$APP_DIR/secrets/jupyter_password` (0600); argon2 hash → `$APP_DIR/secrets/jupyter_hashed_password` (0600). Both are Compose `secrets:` (file) mounts. | The hash contains `$…$`; Compose interpolation would mangle it. Secrets never appear in `compose.yaml`, in `docker inspect`, or in the environment. |
 | Hash generation | Inside the built image: `docker run --rm -i <image> python -c '…passwd(sys.stdin.read())'`. Re-hash **only when the password changed** (`passwd_check` against the stored hash). | No host Python. Re-hashing the same password changes Jupyter's cookie secret and logs every browser out. |
 | Container user | Both images create user `jupyter` with the host's uid/gid (build args). | The workspace bind mount must stay writable by the desktop user. |
-| Stage 3 packages | pip installs run in the **stats** container into a shared named volume (`custom_packages` → `/opt/custom/site-packages`), constrained by a `constraints.txt` frozen from the JupyterLab image; kernels see it through `PYTHONPATH`/`PATH` in the `python3` kernelspec. | No Docker socket, no image rebuild per package, the Jupyter server itself is never shadowed by a user package. |
+| Stage 3 packages | pip jobs run in a separate internal `deps` container (JupyterLab image, no host mounts, no published port) into a persistent venv with system site packages (`custom_packages` → `/opt/custom/venv`), constrained by `constraints.txt` frozen from the JupyterLab image; kernels add it with `site.addsitedir` in a small launcher. The stats app only proxies the page and API. | No Docker socket, no image rebuild per package, pip never runs next to the host `/proc`/`/sys` mounts, image packages cannot be shadowed or re-versioned, the Jupyter server itself never imports user packages. |
 
 ## 2. Stage 1 — Docker stack
 
@@ -262,23 +263,39 @@ ports through a router, Funnel or a public proxy.
 
 ## 4. Stage 3 — Dependencies page (`/dependencies`)
 
-- Page + API in the stats container: a textarea holding `requirements.custom.txt` (one
-  requirement per line, e.g. `torch --index-url https://download.pytorch.org/whl/cu128`),
-  buttons **Install / update** (`pip install --target /opt/custom/site-packages --upgrade
-  --constraint /opt/constraints.txt -r …`) and **Reset & reinstall** (wipe the target, then
-  install), a live log (polled), a status pill, the installed package table (parsed from
-  `*.dist-info/METADATA`), the Python version check, and the note "restart the kernel to
-  pick up new packages".
-- One job at a time (`asyncio.create_subprocess_exec`, no shell), log persisted to the
-  volume, pip cache on the `pip_cache` volume so a failed 900 MB torch download is not
-  repeated.
-- JupyterLab side: the `python3` kernelspec gets `env: {PYTHONPATH: /opt/custom/site-packages,
-  PATH: /opt/custom/site-packages/bin:…}` at image build; `constraints.txt` is
-  `pip freeze` of the JupyterLab image copied into the stats image, so shared dependencies
-  (numpy…) resolve to the exact versions the notebooks already have.
-- GPU: torch's CUDA wheels bundle the runtime; with `gpus: all` `torch.cuda.is_available()`
-  is true in notebooks. Same trust level as JupyterLab itself (arbitrary code), behind the
-  same password — stated in the README.
+Revised during implementation: pip must not run in the `stats` container, which has the host's
+`/proc` and `/sys` mounted — a malicious package would gain a view of the host it does not get in
+JupyterLab.
+
+- **`deps` runner service** (profile `stats`): runs the *JupyterLab image* with
+  `python /srv/jupyter/deps_runner.py`, so pip sees exactly the packages notebooks already have.
+  No published port, no host mounts, no workspace; read-only root filesystem; volumes
+  `custom_packages:/opt/custom` and `pip_cache:/var/cache/pip`; Basic auth (same user and
+  password secret) on every route of its small stdlib HTTP API on the Compose network.
+- **Environment:** `/opt/custom/venv` created with `python -m venv --system-site-packages
+  --without-pip`; jobs run `venv/bin/python -m pip install -c /opt/constraints.txt -r
+  /opt/custom/requirements.txt`, so already-present packages are not duplicated and cannot be
+  up- or downgraded. **Install / update** is additive; **Reset & reinstall** deletes the venv
+  first. One job at a time, cancellable (process group SIGTERM → SIGKILL), log and job state
+  persisted in the volume, an interrupted job is reported after a restart. Requirement lines
+  that would escape the venv or pull in other files (`-r`, `-c`, `-e`, `--target`, `--prefix`,
+  `--root`, `--user`, `--src`) are refused. **Clear download cache** empties the pip cache.
+- **Kernels:** the `python3` kernelspec starts `/srv/jupyter/kernel_launcher.py`, which calls
+  `site.addsitedir(<venv site-packages>)` (appended after the image's own packages, `.pth`
+  files honoured) and then ipykernel; `PATH` starts with `/opt/custom/venv/bin`. The Jupyter
+  server itself never imports custom packages. `jupyterlab` mounts `custom_packages` read-only.
+- **Page** in the stats app (proxied to the runner): requirements editor with Save, job status
+  pill, Install / update, Reset & reinstall (confirm), Cancel, Clear download cache, live log,
+  installed packages table, sizes of the venv and cache, free disk (warning below 5 GB), the
+  "restart the kernel" note, and examples (`torch --index-url https://download.pytorch.org/whl/cpu`,
+  CUDA builds from PyPI ≈ 3 GB). Non-GET API calls require JSON, an `X-Requested-With: thebe`
+  header and a same-origin `Origin`/`Sec-Fetch-Site`, because browsers resend Basic credentials
+  on cross-site requests.
+- The `stats` container loses the `custom_packages`/`pip_cache` mounts it no longer needs; the
+  installer removes `deps` together with `stats` when statistics are disabled.
+- GPU: PyPI's CUDA builds of torch bundle the CUDA runtime; with `gpus: all` on `jupyterlab`,
+  `torch.cuda.is_available()` is true in notebooks. Same trust level as JupyterLab itself
+  (arbitrary code) behind the same password — stated in the README.
 
 ## 5. Stage 4 — Ops links in the builder
 
