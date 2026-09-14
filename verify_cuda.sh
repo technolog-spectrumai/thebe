@@ -59,10 +59,19 @@ usage() {
 
 # Runs in the stats container: talks to the Dependencies page on its own loopback address,
 # with the Basic credentials from the mounted secret and the headers its CSRF guard requires.
+# With HTTPS on (JLT_TLS_CERT in the container's environment) the dashboard speaks TLS on the
+# same port; the certificate names the public MagicDNS host, not 127.0.0.1, so it is not verified.
 read -r -d '' DEPS_API_PY <<'PY' || true
-import base64, json, os, sys, time, urllib.error, urllib.request
+import base64, json, os, ssl, sys, time, urllib.error, urllib.request
 
-BASE = "http://127.0.0.1:8889"
+if os.environ.get("JLT_TLS_CERT"):
+    BASE = "https://127.0.0.1:8889"
+    TLS = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    TLS.check_hostname = False
+    TLS.verify_mode = ssl.CERT_NONE
+else:
+    BASE = "http://127.0.0.1:8889"
+    TLS = None
 user = os.environ.get("STATS_USER", "jupyter")
 with open(os.environ.get("JUPYTER_PASSWORD_FILE", "/run/secrets/jupyter_password"), encoding="utf-8") as fh:
     password = fh.read().rstrip("\n")
@@ -78,7 +87,7 @@ def call(method, path, body=None, timeout=30):
         headers.update({"Content-Type": "application/json", "X-Requested-With": "thebe"})
     request = urllib.request.Request(BASE + path, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=TLS) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as exc:
         try:
