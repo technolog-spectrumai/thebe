@@ -1,20 +1,22 @@
 # JupyterLab over Tailscale
 
-A single-user tool that runs JupyterLab and a small statistics dashboard on a Linux laptop and
-makes both reachable from a tablet (or any other device) through Tailscale — and from nowhere
-else.
+A single-user tool that runs JupyterLab, a statistics dashboard and a package manager page on a
+Linux laptop and makes them reachable from a tablet (or any other device) through Tailscale — and
+from nowhere else.
 
 Everything runs in Docker. The only host dependencies are **Docker Engine**, the **Docker Compose
-v2 plugin** and **Tailscale**. Python, JupyterLab, FastAPI and every library live inside two
-locally built images; nothing is installed on the host with `pip`, and no systemd user service is
-used.
+v2 plugin** and **Tailscale**. Python, JupyterLab, FastAPI and every library live inside locally
+built images; nothing is installed on the host with `pip`, and no systemd user service is used. An
+optional PyQt6 builder window keeps its own dependencies in a project-local `.venv`.
 
 ```text
  tablet ──(Tailscale, WireGuard)──► 100.x.y.z:8888  ──► container "jupyterlab"  (JupyterLab)
-                                    100.x.y.z:8889  ──► container "stats"       (FastAPI dashboard)
-                                        │                     │
-                    published only on the Tailscale IPv4      ├─ ~/jupyter-workspace  (notebooks)
-                    never on 0.0.0.0, loopback or the LAN     └─ /proc, /sys          (read-only)
+                                    100.x.y.z:8889  ──► container "stats"       (dashboard + Dependencies page)
+                                        │                     │         │
+                    published only on the Tailscale IPv4      │         └─► container "deps" (pip runner,
+                    never on 0.0.0.0, loopback or the LAN     │             internal only, no published port)
+                                                              ├─ ~/jupyter-workspace  (notebooks)
+                                                              └─ /proc, /sys          (read-only, stats only)
 ```
 
 ## Contents
@@ -28,6 +30,7 @@ used.
 - [Commands](#commands)
 - [Persistence](#persistence)
 - [Statistics dashboard](#statistics-dashboard)
+- [Dependencies page](#dependencies-page)
 - [GPU support](#gpu-support)
 - [Security model](#security-model)
 - [Host settings and firewall behaviour](#host-settings-and-firewall-behaviour)
@@ -45,25 +48,28 @@ Compose there.
 | Piece | Location | Notes |
 | --- | --- | --- |
 | Settings (password, ports, stats on/off) | `<repo>/.env` | Created with defaults on first install, mode `0600`, gitignored. |
-| Stack sources | `<repo>/stack/` | `Dockerfile`, `compose.yaml`, `compose.gpu.yaml`, `jupyter/`, `stats/`. |
+| Stack sources | `<repo>/stack/` | `Dockerfile`, `compose.yaml`, `compose.gpu.yaml`, `jupyter/`, `stats/`, `theme/`. |
 | Deployed stack (app dir) | `~/.local/share/jupyterlab-tailscale/` | A copy of `stack/` plus generated files; Compose project directory. |
 | Runtime variables | `~/.local/share/jupyterlab-tailscale/.env` | Generated on every deploy: Tailscale IP, ports, profiles, uid/gid. **No secrets.** |
-| Secrets | `~/.local/share/jupyterlab-tailscale/secrets/` | The password and its argon2 hash, mode `0600`, mounted as Compose secrets. |
+| Secrets | `~/.local/share/jupyterlab-tailscale/secrets/` | The password, its argon2 hash and a random package-runner token, each mode `0600`, mounted as Compose secrets. |
 | Notebooks | `~/jupyter-workspace` | Bind-mounted at `/workspace`. Never deleted by default. |
 
-Compose project `jupyterlab-tailscale` runs two services on the default bridge network (so notebooks
+Compose project `jupyterlab-tailscale` runs three services on the default bridge network (so notebooks
 and `pip` have outbound internet access):
 
 | Service | Image (built locally) | Published on | Contents |
 | --- | --- | --- | --- |
 | `jupyterlab` | `jupyterlab-tailscale/jupyterlab:local` (~1 GB) | `<tailscale-ip>:8888` | JupyterLab 4.6.3, jupyter_server 2.21.0, ipykernel 7.3.0, ipywidgets 8.1.9, numpy 2.5.3, pandas 3.0.5, matplotlib 3.11.2, scipy 1.18.1 |
-| `stats` | `jupyterlab-tailscale/stats:local` (~210 MB) | `<tailscale-ip>:8889` | FastAPI 0.141.1, uvicorn 0.53.0, nvidia-ml-py 13.610.43 |
+| `stats` | `jupyterlab-tailscale/stats:local` (~210 MB) | `<tailscale-ip>:8889` | FastAPI 0.141.1, uvicorn 0.53.0, nvidia-ml-py 13.610.43: the dashboard and the Dependencies page |
+| `deps` | reuses `jupyterlab-tailscale/jupyterlab:local` | nothing (internal) | A small pip runner used by the Dependencies page |
+
+`stats` and `deps` belong to the `stats` profile and are only created while statistics are enabled.
 
 Both images start from `python:3.13-slim-trixie` and install exactly the versions in
-`stack/*/requirements.lock.txt` (every transitive package pinned, wheels only). Both containers run
+`stack/*/requirements.lock.txt` (every transitive package pinned, wheels only). All containers run
 as a non-root user whose uid/gid match yours, with all Linux capabilities dropped,
 `no-new-privileges`, an init process, health checks, `restart: unless-stopped` and rotated JSON
-logs (3 × 10 MB). The `stats` container additionally has a read-only root filesystem.
+logs (3 × 10 MB). `stats` and `deps` additionally have a read-only root filesystem.
 
 Inside its container each server listens on all of the *container's* interfaces — that is how
 Docker forwards traffic to it. What decides who can connect is the host side of the port mapping,
@@ -76,7 +82,8 @@ which is always the Tailscale IPv4 address.
 - Tailscale installed, logged in and connected on the laptop **and** on the tablet, both in the same
   tailnet.
 - `sudo` rights for the one-time host step (see [below](#host-settings-and-firewall-behaviour)).
-- About 2 GB of free disk space for images and build cache.
+- About 2 GB of free disk space for images and build cache, plus whatever the packages you add on the
+  Dependencies page need (PyTorch with CUDA: several GB).
 - Optional: an NVIDIA GPU with the NVIDIA Container Toolkit, for GPU statistics and GPU access in
   notebooks.
 
@@ -109,10 +116,10 @@ It is safe to run again at any time. `install`:
    `~/.config/jupyterlab-tailscale`.
 5. Refuses to continue if a port is already used by something else.
 6. Copies `stack/` to the app dir, detects a usable NVIDIA GPU, writes the runtime `.env`.
-7. Builds both images (cached layers make repeated runs fast and do not recreate containers).
-8. Hashes the password with argon2 **inside the image** — only when it changed — and writes the
-   secrets.
-9. Starts the containers and waits until both report healthy.
+7. Builds the images (cached layers make repeated runs fast and do not recreate containers).
+8. Hashes the password with argon2 **inside the image** — only when it changed — writes the secrets
+   and creates the package-runner token once.
+9. Starts the containers and waits until all of them report healthy.
 10. Runs the [host step](#host-settings-and-firewall-behaviour) through `sudo` when it is needed.
 11. Prints the URLs.
 
@@ -131,13 +138,16 @@ reliably and restricts the ports when a firewall is active.
 
 With the tablet connected to the same tailnet, open:
 
-| Service | URL | Login |
+| Page | URL | Login |
 | --- | --- | --- |
 | JupyterLab | `http://<tailscale-ip>:8888/lab` | password only |
 | Statistics | `http://<tailscale-ip>:8889/` | username `jupyter` + the same password |
+| Dependencies | `http://<tailscale-ip>:8889/dependencies` | as Statistics |
 
-`./setup-jupyterlab-tailscale.sh status` prints both URLs with the real address. The addresses use
-plain HTTP; the traffic between Tailscale devices is encrypted by Tailscale's WireGuard tunnel.
+The dashboard's navigation bar links Statistics, Dependencies and JupyterLab, so only one address has
+to be typed (or none, with the builder's Open buttons). `./setup-jupyterlab-tailscale.sh status`
+prints the URLs with the real address. The addresses use plain HTTP; the traffic between Tailscale
+devices is encrypted by Tailscale's WireGuard tunnel.
 
 ## Credentials and settings
 
@@ -148,7 +158,7 @@ TailLab-7mK9-vQ2x-N4pR!
 ```
 
 It is used for the JupyterLab login and, together with the fixed username `jupyter`, for the
-statistics dashboard. `install` warns while the default is in use.
+statistics dashboard and the Dependencies page. `install` warns while the default is in use.
 
 Settings live in `<repo>/.env`:
 
@@ -160,24 +170,27 @@ STATS_PORT='8889'
 STATS_USER='jupyter'
 ```
 
-To change something, edit the file and apply it:
+To change something, edit the file (or use the [builder](#graphical-builder)) and apply it:
 
 ```bash
 ./setup-jupyterlab-tailscale.sh update
 ```
 
 - **Password:** 8–128 characters; no single quote, backslash, control characters or leading/trailing
-  spaces. A new password is re-hashed and both containers are recreated, which logs every browser
+  spaces. A new password is re-hashed and the containers are recreated, which logs every browser
   out. An unchanged password keeps its hash, so sessions survive redeploys.
 - **Ports:** 1024–65535 and different from each other. A changed port recreates only the affected
   container.
-- **`STATS_ENABLED='0'`** stops and removes the `stats` container (and, with an active firewall,
-  closes its port); `'1'` brings it back.
+- **`STATS_ENABLED='0'`** stops and removes the `stats` and `deps` containers (and, with an active
+  firewall, closes the statistics port); `'1'` brings them back. Packages installed from the
+  Dependencies page stay installed and keep working in notebooks.
 
 The script parses this file itself; it is never executed as shell code. JupyterLab only ever sees
 the argon2 hash. The plain password reaches the `stats` container as a mounted secret file, never
-through environment variables, `compose.yaml` or `docker inspect`. JupyterLab's token login is
-disabled, and changing the password from the JupyterLab UI is turned off.
+through environment variables, `compose.yaml` or `docker inspect`. The `deps` container never gets
+the password at all — it accepts only the random token in `secrets/deps_token`, which the dashboard
+uses to talk to it. JupyterLab's token login is disabled, and changing the password from the
+JupyterLab UI is turned off.
 
 ## Graphical builder
 
@@ -209,10 +222,11 @@ The window follows the desktop's light or dark mode, using the same oya palette 
 | --- | --- |
 | Password + Show/Hide | `JUPYTER_PASSWORD` — the JupyterLab password and the statistics password. |
 | JupyterLab port | `JUPYTER_PORT`, default 8888. |
-| Enable FastAPI statistics | `STATS_ENABLED`. Unticking it and deploying stops and removes the statistics container and closes its firewall port. |
+| Enable FastAPI statistics | `STATS_ENABLED`. Unticking it and deploying stops and removes the statistics and package-runner containers and closes the statistics firewall port. |
 | Statistics port | `STATS_PORT`, default 8889 (disabled while statistics are off). |
 | Username: jupyter | The fixed statistics username (`STATS_USER`), shown read-only. |
 | Services | A state dot and badge for JupyterLab and Statistics (Running, Starting, Unhealthy, Restarting, Stopped, Not deployed, Disabled), refreshed every 4 seconds, with the deployed URL and an **Open** button that starts the browser. |
+| Page links | Under Statistics: **Dependencies**, **Stats API** and **Health** open those pages directly, so no address has to be typed. Like Open, they are enabled while the container runs and always use the deployed address and port. |
 | **Deploy / Update** | Validates, saves the settings, then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
 | **Start / Restart** | `start` when nothing is running, otherwise `restart`. |
 | **Stop** | `stop` (`docker compose stop`). |
@@ -220,7 +234,8 @@ The window follows the desktop's light or dark mode, using the same oya palette 
 
 The header shows the detected Tailscale IPv4 address (from `tailscale status --json`; Tailscale must be
 connected) and whether Docker answers. Buttons are disabled while a command runs; the window stays
-responsive throughout.
+responsive throughout. The package runner has no row of its own; its state is shown on the
+Dependencies page.
 
 Deploy is refused, with the reasons listed under the form, when:
 
@@ -260,7 +275,7 @@ Start or Restart until the step has been applied once.
 | **Start / Restart** | `./setup-jupyterlab-tailscale.sh start` / `restart` |
 | **Stop** | `./setup-jupyterlab-tailscale.sh stop` |
 | Services badges | `./setup-jupyterlab-tailscale.sh status` |
-| **Open** | the URLs printed by `status` |
+| **Open** and page links | the URLs printed by `status` |
 | polkit dialog | `sudo ./setup-jupyterlab-tailscale.sh host-setup <tailscale-ip> <port> [<port>]` |
 
 The builder's offscreen test suite runs with
@@ -273,10 +288,10 @@ The builder's offscreen test suite runs with
 | `install` | Build and start everything; creates the settings file when missing. Idempotent. |
 | `update` | Same as `install`, but also pulls a newer base image (`docker compose build --pull`). Use it after editing `.env` or pulling a new version of this repository. |
 | `start` | Start the containers. If the Tailscale IPv4 changed, the ports follow the new address. |
-| `stop` | Stop the containers (they stay stopped across reboots until `start`). |
+| `stop` | Stop the containers (they stay stopped across reboots until `start`). A running package install is interrupted. |
 | `restart` | `stop`, then `start`. |
-| `status` | Settings, deployed ports, live vs. deployed Tailscale IP, container state and health, URLs, host step and firewall state. Exit code 3 when not installed. |
-| `logs [--no-follow] [SERVICE...]` | Last 100 log lines of `jupyterlab` and/or `stats`, following unless `--no-follow`. |
+| `status` | Settings, deployed ports, live vs. deployed Tailscale IP, state and health of `jupyterlab`, `stats` and `deps (package runner)`, URLs, host step and firewall state. Exit code 3 when not installed. |
+| `logs [--no-follow] [SERVICE...]` | Last 100 log lines of `jupyterlab`, `stats` and/or `deps`, following unless `--no-follow`. |
 | `uninstall [--yes] [--delete-workspace]` | See [Uninstalling](#uninstalling). |
 | `host-setup <ip> <port> [<port>]`, `host-teardown` | Root-only helpers, normally run for you through `sudo`. |
 
@@ -298,57 +313,132 @@ docker compose logs -f jupyterlab
 | --- | --- | --- | --- |
 | Notebooks and files | `~/jupyter-workspace` (bind mount at `/workspace`) | yes | no (only with `--delete-workspace`) |
 | JupyterLab settings, workspace layouts, IPython history, login cookie secret | Docker volume `jupyterlab-tailscale_jupyter_state` (`/state`) | yes | yes |
-| Reserved for custom packages | Docker volume `jupyterlab-tailscale_custom_packages` (`/opt/custom`) | yes | yes |
-| pip download cache | Docker volume `jupyterlab-tailscale_pip_cache` | yes | yes |
+| Packages from the Dependencies page (the venv, its requirements file and the last job log) | Docker volume `jupyterlab-tailscale_custom_packages` (`/opt/custom`, read-only in `jupyterlab`) | yes | yes |
+| pip download cache of the package runner | Docker volume `jupyterlab-tailscale_pip_cache` | yes | yes |
 | Settings | `<repo>/.env` | yes | no |
-| Anything else inside a container (e.g. `pip install --user` from a notebook) | container filesystem | **no** | yes |
+| Anything else inside a container (e.g. `%pip install` from a notebook) | container filesystem | **no** | yes |
 
-Save everything you want to keep inside `/workspace` — that is the directory JupyterLab opens.
+Save everything you want to keep inside `/workspace` — that is the directory JupyterLab opens — and
+add packages through the Dependencies page rather than with `pip` inside a notebook.
 
 ## Statistics dashboard
 
 The `stats` service is a small FastAPI application styled after zenobia's *oya* design language
 (theme "Amazing Moon", Orbitron headings, light and dark mode following the device, with a toggle
 remembered by the browser). It works on phone, tablet and desktop widths and refreshes every
-3 seconds.
+3 seconds. Its navigation bar links Statistics, Dependencies and JupyterLab.
 
 | Route | Content |
 | --- | --- |
 | `/` | Dashboard: CPU (usage, per core, load, temperature), memory and swap, disk (the filesystem holding the workspace), uptime, network totals and rates (physical interfaces, with `tailscale0` shown separately), active Jupyter kernels (name, state, connections), NVIDIA GPU (utilisation, memory, temperature, power). |
 | `/api/stats` | The same data as JSON. |
 | `/health` | `{"status": "ok", "jupyter": "reachable"}` — used by the container health check. |
+| `/dependencies` | The [Dependencies page](#dependencies-page). |
 
 **Every** route, including `/health` and static files, requires HTTP Basic authentication (user
 `jupyter`, the JupyterLab password). Host metrics come from the host's `/proc` and `/sys`, mounted
 read-only; the Docker socket is not mounted. Kernel information comes from JupyterLab's REST API,
 which the dashboard logs into with the same password (once, not on every refresh).
 
+## Dependencies page
+
+`http://<tailscale-ip>:8889/dependencies` adds Python packages to the notebook kernels — for example
+PyTorch — without rebuilding images.
+
+| Part of the page | What it does |
+| --- | --- |
+| Requirements | An editor for a pip requirements file (one requirement per line, `#` comments). **Save** stores it. |
+| **Install / update** | Saves unsaved edits, creates the package environment on first use and runs `pip install` for the file. Packages already installed stay; changed version pins are applied. |
+| **Reset & reinstall** | Deletes the package environment and installs the file from scratch — use it after removing lines. Asks for confirmation. |
+| **Cancel** | Stops a running job. The environment keeps what was installed before. |
+| **Clear download cache** | Frees the space used by pip's download cache. |
+| Job, log, installed packages | Status of the last job (Succeeded, Failed, Cancelled, Interrupted), its live pip output, and the packages installed on top of the image. |
+| Storage | Size of the installed packages, of the download cache, and the free disk space (with a warning when it gets low). |
+
+**Restart the kernel** (*Kernel → Restart Kernel*) to use newly installed packages.
+
+How it works:
+
+- Installs run in the internal `deps` container, which uses the same image as JupyterLab. The packages
+  go into a virtual environment in the `custom_packages` volume that sees the image's own packages.
+- The image's packages (numpy, pandas, matplotlib, scipy, ipywidgets, jupyter…) keep their pinned
+  versions: pip runs with the image's `pip freeze` as constraints, so they are not installed twice and
+  cannot be replaced. A requirement that needs a different version of one of them fails with a
+  resolution error instead.
+- Kernels add the environment after the image's packages; the JupyterLab server itself never loads
+  them, so a broken package cannot take JupyterLab down.
+- One job runs at a time. A job cut off by a restart is shown as Interrupted.
+
+Examples:
+
+```text
+# PyTorch for CPU only (about 200 MB). The index line applies to the whole file.
+--index-url https://download.pytorch.org/whl/cpu
+torch
+```
+
+```text
+# PyTorch for CPU mixed with packages from PyPI: pin the +cpu build.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+rich
+```
+
+```text
+# PyTorch with CUDA from PyPI (about 3 GB). With GPU support enabled,
+# torch.cuda.is_available() is True in notebooks.
+torch
+```
+
+Lines are refused, with the line number and reason shown under the editor, when pip would misread
+them or when they would reach outside the package environment:
+
+- options that pip silently ignores next to a package, such as `torch --index-url …` (put the option
+  on a line of its own);
+- `-r`/`--requirement`, `-c`/`--constraint`, `-e`/`--editable`, `--target`, `--prefix`, `--root`,
+  `--user`, `--src`;
+- `${VARIABLES}`, encoding declarations, and control or bidirectional-text characters.
+
+The page and the runner exist only while statistics are enabled. Installed packages stay in their
+volume when statistics are switched off and notebooks keep using them.
+
 ## GPU support
 
 With `JLT_GPU=auto` (the default) the installer enables GPU access when `nvidia-smi -L` works on the
 host and Docker has the NVIDIA runtime or a CDI specification, and it verifies that with a test
-container. When enabled, `compose.gpu.yaml` gives both containers `gpus: all`:
+container. When enabled, `compose.gpu.yaml` gives `jupyterlab` and `stats` `gpus: all`:
 
-- `jupyterlab` gets the `compute,utility` driver capabilities, so CUDA libraries you install into a
-  notebook environment can use the GPU.
+- `jupyterlab` gets the `compute,utility` driver capabilities, so CUDA libraries installed from the
+  Dependencies page (e.g. PyTorch with CUDA) can use the GPU.
 - `stats` gets `utility` only, which is enough for the GPU statistics.
+- `deps` gets no GPU; installing packages does not need one.
 
 Force it with `JLT_GPU=on ./setup-jupyterlab-tailscale.sh update` or disable it with `JLT_GPU=off`.
 
 ## Security model
 
-- **Reachability.** Both ports are published only on the Tailscale IPv4 address. Compose refuses to
-  start if that address is missing, so an empty value can never turn into "all interfaces". Nothing
-  listens on loopback, the Wi-Fi/Ethernet address or `0.0.0.0`.
+- **Reachability.** JupyterLab and the dashboard are published only on the Tailscale IPv4 address;
+  the package runner is not published at all. Compose refuses to start if that address is missing, so
+  an empty value can never turn into "all interfaces". Nothing listens on loopback, the
+  Wi-Fi/Ethernet address or `0.0.0.0`.
 - **Transport.** Tailscale encrypts traffic between devices; the services themselves speak HTTP.
 - **Authentication.** JupyterLab requires the password (argon2 hash, token login disabled, the server
-  refuses to start without a valid hash). The dashboard requires HTTP Basic auth on every route.
+  refuses to start without a valid hash). The dashboard requires HTTP Basic auth on every route. The
+  package runner accepts only a random token shared with the dashboard.
+- **Cross-site requests.** Browsers resend Basic credentials automatically, so every request that
+  changes something on the Dependencies page must be a same-origin JSON request carrying an
+  `X-Requested-With` header; other sites cannot trigger installs. (A consequence: an HTTPS proxy put in
+  front of the dashboard under a different address would have its write requests refused.)
 - **Tailnet members.** Every device in your tailnet that can reach the laptop can reach the login
   pages. To restrict that, add a Tailscale ACL that allows TCP 8888/8889 on the laptop only from
   the tablet.
 - **Containers.** Non-root user, all capabilities dropped, `no-new-privileges`, no Docker socket,
-  host `/proc` and `/sys` read-only, secrets as `0600` files.
-- **Notebooks run arbitrary code** as that container user, with internet access and write access to
+  host `/proc` and `/sys` read-only and only in `stats`, secrets as `0600` files.
+- **Packages.** pip, and the build scripts of the packages it installs, run in `deps`: no host mounts,
+  no workspace, no published port, read-only root filesystem, and no access to the password.
+  Installed packages later run inside notebook kernels with the kernels' rights, so install only
+  packages you trust.
+- **Notebooks run arbitrary code** as the container user, with internet access and write access to
   `~/jupyter-workspace` — which is the point of JupyterLab. Anyone with the password can do the same.
 - **Residual LAN risk.** Docker publishes by destination address, not by interface. A device on the
   same local network that deliberately routes packets for the laptop's Tailscale address to it can
@@ -391,18 +481,19 @@ the next run. The applied state is recorded in `/var/lib/jupyterlab-tailscale/st
 
 - **Settings changes:** edit `<repo>/.env`, then `./setup-jupyterlab-tailscale.sh update`.
 - **New base image (security fixes in Debian/Python):** `./setup-jupyterlab-tailscale.sh update`.
-- **New package versions:** edit `stack/jupyter/requirements.txt` or `stack/stats/requirements.txt`,
-  regenerate the matching `requirements.lock.txt` with the command in that file's header, then run
-  `update`.
+- **New package versions in the images:** edit `stack/jupyter/requirements.txt` or
+  `stack/stats/requirements.txt`, regenerate the matching `requirements.lock.txt` with the command in
+  that file's header, then run `update`. Afterwards run **Install / update** on the Dependencies page,
+  so the added packages are resolved against the new image.
 - **New version of this tool:** update the repository (e.g. `git pull`), then `update`.
 
 Containers are recreated only when their configuration or image actually changed. Recreating
-JupyterLab stops running kernels; notebooks and settings are kept.
+JupyterLab stops running kernels; notebooks, settings and installed packages are kept.
 
 ## Troubleshooting
 
 **The tablet cannot connect.** Check `tailscale status` on both devices, `tailscale ping
-<laptop>` from another device, and `./setup-jupyterlab-tailscale.sh status` on the laptop (both
+<laptop>` from another device, and `./setup-jupyterlab-tailscale.sh status` on the laptop (all
 containers should be `running`/`healthy`, and the live Tailscale IP should match the deployed one).
 
 **Containers are stopped after a reboot.** `status` shows the container error (typically
@@ -419,15 +510,24 @@ ports move to the new address.
 (`sudo usermod -aG docker "$USER"`) and log in again.
 
 **A container is unhealthy or restarting.** `./setup-jupyterlab-tailscale.sh logs --no-follow
-jupyterlab` (or `stats`). A JupyterLab container that exits immediately with a message about the
-password hash means the secret is missing or damaged; run `update`.
+jupyterlab` (or `stats`, `deps`). A JupyterLab container that exits immediately with a message about
+the password hash means the secret is missing or damaged; run `update`.
+
+**The Dependencies page says the package runner is unavailable.** Check `status` (the
+`deps (package runner)` row) and `logs --no-follow deps`; `restart` usually fixes it. If statistics
+are disabled, the page does not exist.
+
+**An installed package cannot be imported in a notebook.** Restart the kernel. If the job failed,
+the log on the page shows why — a `ResolutionImpossible` error means the package needs a different
+version of something the image already pins.
 
 **The dashboard shows "No NVIDIA GPU visible".** Check `nvidia-smi` on the host and
 `docker info | grep -i runtime`; then `JLT_GPU=on ./setup-jupyterlab-tailscale.sh update` to see
 why the GPU test fails.
 
-**The build fails with "no space left on device".** Free disk space; `docker builder prune` removes
-Docker's build cache (for all projects).
+**"No space left on device".** Use **Clear download cache** on the Dependencies page, or **Reset &
+reinstall** with fewer packages; `docker builder prune` removes Docker's build cache (for all
+projects).
 
 ## Uninstalling
 
@@ -436,8 +536,8 @@ Docker's build cache (for all projects).
 ```
 
 You must type `uninstall` to confirm (or pass `--yes`; without a terminal, `--yes` is required). It
-removes the containers, both images, the Docker volumes (JupyterLab settings and caches), the app
-dir, and — through `sudo` — the host step (sysctl file, firewall rules, state).
+removes the containers, both images, the Docker volumes (JupyterLab settings, installed packages and
+caches), the app dir, and — through `sudo` — the host step (sysctl file, firewall rules, state).
 
 It **keeps** `~/jupyter-workspace` and `<repo>/.env`. To delete the workspace as well, add
 `--delete-workspace` and type `delete` when asked.
@@ -449,8 +549,8 @@ setup-jupyterlab-tailscale.sh      the CLI (install, start, stop, restart, statu
 stack/Dockerfile                   base → jupyterlab and stats images
 stack/compose.yaml                 services, ports, secrets, volumes, health checks
 stack/compose.gpu.yaml             GPU override, used when a GPU is detected
-stack/jupyter/                     JupyterLab config, requirements and lock file
-stack/stats/                       FastAPI dashboard: app, templates, static assets, requirements and lock file
+stack/jupyter/                     JupyterLab config, kernel launcher, package runner, requirements and lock file
+stack/stats/                       FastAPI dashboard and Dependencies page: app, templates, static assets, requirements and lock file
 stack/theme/                       oya theme files shared with zenobia (palette of the builder window)
 builder.py                         optional PyQt6 builder (thin frontend over the script)
 run-builder.sh                     creates .venv with the pinned PyQt6 and starts the builder

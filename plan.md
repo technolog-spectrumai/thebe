@@ -37,9 +37,9 @@ merely written.
 **Stage 3 — Dependencies page**
 - [x] Internal `deps` runner (JupyterLab image, no host mounts, no published port, its own random token) + `/dependencies` page and proxied API in stats (Basic auth, CSRF guard, validated requirements, one cancellable job, live log, sizes, cache clear); adversarial review + fixes; sandbox run incl. torch CPU install, cancel and interruption
 - [x] Live deploy (24 checks): three healthy containers, page/API/CSRF/validation, `rich` installed from the page and imported by a real kernel from the custom venv while numpy stays the image's, GPU visible to kernels (`cuInit` 0, 1 device), reset + cache clear, idempotent re-install
-- [ ] CUDA build of torch installed and `torch.cuda.is_available()` checked on this laptop (≈3 GB download; waiting for your go — the disk has ~9 GB free)
+- [ ] `verify_cuda.sh`: user-run end-to-end check (GPU in the containers, libcuda from a real kernel, optional CUDA torch install through the Dependencies page, `torch.cuda.is_available()` + a GPU matmul, optional cleanup) — your choice instead of me downloading ≈3 GB
 - [x] Commit (code)
-- [ ] README (Dependencies section, runner token, torch examples) + commit
+- [x] README (Dependencies section, runner token, torch examples, persistence/security/troubleshooting updates) + commit
 
 **Stage 4 — Ops links**
 - [x] Builder: every page in one `PAGES` table; Open per service plus links for Dependencies, Stats API and Health (enabled while the container runs, deployed address); 70 offscreen tests
