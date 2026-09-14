@@ -244,8 +244,10 @@ def read_text(path: Path) -> str:
 
 
 def available_themes(theme_dir: Path) -> list[str]:
+    """Theme names the installer accepts: regular files (not symlinks) with a valid name."""
     try:
-        return sorted(p.stem for p in theme_dir.glob("*.json"))
+        return sorted(p.stem for p in theme_dir.glob("*.json")
+                      if _THEME_NAME.fullmatch(p.stem) and p.is_file() and not p.is_symlink())
     except OSError:
         return []
 
@@ -566,17 +568,43 @@ def contrast(a: str, b: str) -> float:
     return (high + 0.05) / (low + 0.05)
 
 
-def load_theme_colors(theme_dir: Path, name: str) -> dict[str, str]:
-    colors = dict(BUILTIN_COLORS)
+# The colours a theme file must define: the same list as stack/stats/theme.py (caution is optional).
+_THEME_MODE_KEYS = ("primary-bg", "bubble-bg", "sunken", "header-bg", "appbar-bg", "appbar-text",
+                    "footer-bg", "footer-text", "text-main", "accent", "link", "warn", "success")
+REQUIRED_COLORS = tuple(f"{key}-{mode}" for mode in ("light", "dark") for key in _THEME_MODE_KEYS) + ("accent-1", "accent-2")
+_FONT_NAME = re.compile(r"[A-Za-z0-9 _-]{1,64}")
+MAX_THEME_BYTES = 256 * 1024
+
+
+def load_theme(theme_dir: Path, name: str) -> tuple[dict[str, str], str]:
+    """(colours, heading font) of <theme_dir>/<name>.json, or Amazing Moon's when it is not usable.
+
+    The dashboard's rules (stack/stats/theme.py): the whole file or nothing. A partly valid file
+    is not merged with the built-in colours, so the GUI and the dashboard never disagree. Like
+    the installer, a symlinked theme is refused.
+    """
+    fallback = (dict(BUILTIN_COLORS), "Orbitron")
     if not _THEME_NAME.fullmatch(name or ""):
-        return colors
+        return fallback
+    path = theme_dir / f"{name}.json"
     try:
-        data = json.loads((theme_dir / f"{name}.json").read_text(encoding="utf-8"))
-        loaded = data.get("colors", {})
-        colors.update({k: v for k, v in loaded.items() if isinstance(v, str) and _HEX.fullmatch(v)})
-    except (OSError, ValueError, AttributeError):
-        pass
-    return colors
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_THEME_BYTES:
+            return fallback
+        data = json.loads(path.read_bytes().decode("utf-8"))    # strict UTF-8: a BOM is refused
+    except (OSError, ValueError, RecursionError):
+        return fallback
+    colors = data.get("colors") if isinstance(data, dict) else None
+    if (not isinstance(colors, dict)
+            or not all(isinstance(value, str) and _HEX.fullmatch(value) for value in colors.values())
+            or any(key not in colors for key in REQUIRED_COLORS)):
+        return fallback
+    font = data.get("font", "")
+    font = font.strip() if isinstance(font, str) else ""
+    return dict(colors), font if _FONT_NAME.fullmatch(font) else ""
+
+
+def load_theme_colors(theme_dir: Path, name: str) -> dict[str, str]:
+    return load_theme(theme_dir, name)[0]
 
 
 def theme_tokens(colors: Mapping[str, str], mode: str) -> dict[str, str]:
@@ -597,7 +625,10 @@ def theme_tokens(colors: Mapping[str, str], mode: str) -> dict[str, str]:
     return {
         "window_bg": window_bg, "card_bg": card_bg, "card_border": card_border,
         "input_bg": window_bg, "text": text, "muted": mix(text, window_bg, 0.40),
-        "accent": accent, "on_accent": best((window_bg, "#ffffff"), accent),
+        # Text on accent buttons: in light mode the same choice as the dashboard's --on-accent
+        # (a light accent such as market's orange needs the dark text colour); dark mode may use white.
+        "accent": accent,
+        "on_accent": best((window_bg, text), accent) if m == "light" else best((window_bg, "#ffffff"), accent),
         "header_bg": header_bg, "header_text": header_text,
         "success": success, "caution": caution, "warn": warn,
         "log_bg": c[f"sunken-{m}"], "link": link,
@@ -1336,7 +1367,7 @@ class MainWindow(QMainWindow):
             dark = QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
             mode = "dark" if dark else "light"
         self.mode = mode
-        colors = load_theme_colors(self.paths.theme_dir, self.settings_values.get("THEME", "amazing"))
+        colors, font = load_theme(self.paths.theme_dir, self.settings_values.get("THEME", "amazing"))
         self.tokens = theme_tokens(colors, mode)
         palette = build_palette(self.tokens)
         app = QApplication.instance()
@@ -1344,7 +1375,10 @@ class MainWindow(QMainWindow):
             app.setPalette(palette)
         self.setPalette(palette)
         mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont).family()
-        self.setStyleSheet(build_stylesheet(self.tokens, self._display_family, mono))
+        # Headings like the dashboard: the bundled Orbitron for Orbitron themes, any other theme
+        # font only when it is installed (Qt falls back otherwise), the default font for none.
+        display = self._display_family if font == "Orbitron" else font
+        self.setStyleSheet(build_stylesheet(self.tokens, display, mono))
 
     def _on_color_scheme_changed(self, _scheme: object) -> None:
         if not self._closing:

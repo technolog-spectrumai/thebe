@@ -22,7 +22,8 @@ readonly DEFAULT_JUPYTER_PORT='8888'
 readonly DEFAULT_STATS_PORT='8889'
 readonly DEFAULT_STATS_ENABLED='1'
 readonly DEFAULT_STATS_USER='jupyter'
-readonly -a SETTINGS_KEYS=(JUPYTER_PASSWORD JUPYTER_PORT STATS_ENABLED STATS_PORT STATS_USER)
+readonly DEFAULT_THEME='amazing'
+readonly -a SETTINGS_KEYS=(JUPYTER_PASSWORD JUPYTER_PORT STATS_ENABLED STATS_PORT STATS_USER THEME)
 readonly JUPYTER_IMAGE="${PROJECT}/jupyterlab:local"
 readonly STATS_IMAGE="${PROJECT}/stats:local"
 readonly SYSCTL_FILE='/etc/sysctl.d/60-jupyterlab-tailscale.conf'
@@ -94,6 +95,8 @@ absolute_path() {
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="${SCRIPT_PATH%/*}"
 STACK_DIR="${SCRIPT_DIR}/stack"
+# zenobia's theme files (THEME setting), copied into the stats image.
+THEME_DIR="${STACK_DIR}/theme"
 ACCOUNT_HOME="$(account_home)"
 SETTINGS_FILE="$(absolute_path "${JLT_SETTINGS_FILE:-${SCRIPT_DIR}/.env}")"
 APP_DIR="$(absolute_path "${JLT_APP_DIR:-${ACCOUNT_HOME}/.local/share/${PROJECT}}")"
@@ -148,6 +151,31 @@ is_valid_port() {
 
 is_valid_stats_user() {
   [[ "$1" =~ ^[A-Za-z0-9._-]{1,32}$ ]]
+}
+
+is_valid_theme_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{1,64}$ ]]
+}
+
+# A regular file, not a symlink: sync_stack copies only regular files, so a linked theme
+# would pass here and then be missing from the deployed copy.
+is_theme_file() {
+  [[ -f "$1" && ! -L "$1" ]]
+}
+
+# The theme names in stack/theme, space separated. Only file names are checked here (no host
+# Python to parse JSON); the dashboard validates the colours and falls back to Amazing Moon
+# with a warning in its log.
+available_themes() {
+  local path name names=()
+  for path in "$THEME_DIR"/*.json; do
+    name="${path##*/}"
+    name="${name%.json}"
+    if is_theme_file "$path" && is_valid_theme_name "$name"; then
+      names+=("$name")
+    fi
+  done
+  printf '%s\n' "${names[*]}"
 }
 
 # True for a canonical dotted quad inside Tailscale's CGNAT range 100.64.0.0/10.
@@ -220,11 +248,13 @@ default_settings_content() {
     '# JupyterLab over Tailscale settings. Read by setup-jupyterlab-tailscale.sh (never sourced).' \
     '# Values are literal. The password needs 8-128 characters without quote or backslash.' \
     '# After editing, apply with: ./setup-jupyterlab-tailscale.sh update' \
+    '# THEME colours the dashboard and the builder: a file name from stack/theme without .json.' \
     "JUPYTER_PASSWORD='${DEFAULT_PASSWORD}'" \
     "JUPYTER_PORT='${DEFAULT_JUPYTER_PORT}'" \
     "STATS_ENABLED='${DEFAULT_STATS_ENABLED}'" \
     "STATS_PORT='${DEFAULT_STATS_PORT}'" \
-    "STATS_USER='${DEFAULT_STATS_USER}'"
+    "STATS_USER='${DEFAULT_STATS_USER}'" \
+    "THEME='${DEFAULT_THEME}'"
 }
 
 ensure_settings_file() {
@@ -252,10 +282,10 @@ normalize_bool() {
 }
 
 # Loads the settings into JUPYTER_PASSWORD, JUPYTER_PORT, STATS_ENABLED, STATS_PORT,
-# STATS_USER. Missing keys (or a missing file) fall back to the defaults. Problems are
+# STATS_USER, THEME. Missing keys (or a missing file) fall back to the defaults. Problems are
 # collected in SETTINGS_PROBLEMS; callers decide whether they are fatal.
 load_settings() {
-  local key known entry bool
+  local key known entry bool themes
   declare -gA SETTINGS_RAW=()
   SETTINGS_PROBLEMS=()
   if [[ -e "$SETTINGS_FILE" ]]; then
@@ -280,6 +310,7 @@ load_settings() {
   STATS_ENABLED="${SETTINGS_RAW[STATS_ENABLED]-$DEFAULT_STATS_ENABLED}"
   STATS_PORT="${SETTINGS_RAW[STATS_PORT]-$DEFAULT_STATS_PORT}"
   STATS_USER="${SETTINGS_RAW[STATS_USER]-$DEFAULT_STATS_USER}"
+  THEME="${SETTINGS_RAW[THEME]-$DEFAULT_THEME}"
 
   local length="${#JUPYTER_PASSWORD}"
   if ((length < 8 || length > 128)); then
@@ -315,6 +346,15 @@ load_settings() {
 
   if ! is_valid_stats_user "$STATS_USER"; then
     SETTINGS_PROBLEMS+=("STATS_USER must be 1-32 characters from A-Z a-z 0-9 . _ - (got $(printf '%q' "$STATS_USER"))")
+  fi
+
+  if ! is_valid_theme_name "$THEME" || ! is_theme_file "$THEME_DIR/$THEME.json"; then
+    themes="$(available_themes)"
+    if [[ -n "$themes" ]]; then
+      SETTINGS_PROBLEMS+=("THEME must be one of: ${themes// /, } (files in ${THEME_DIR}; got $(printf '%q' "$THEME"))")
+    else
+      SETTINGS_PROBLEMS+=("THEME: no theme files found in ${THEME_DIR}; is the repository complete?")
+    fi
   fi
 }
 
@@ -423,7 +463,7 @@ compose() {
   [[ -t 1 ]] || progress=(--progress plain)
   (
     unset COMPOSE_PROJECT_NAME COMPOSE_FILE COMPOSE_PROFILES COMPOSE_ENV_FILES COMPOSE_PATH_SEPARATOR \
-      TS_IP JUPYTER_PORT STATS_PORT STATS_USER WORKSPACE_DIR HOST_NAME JLT_UID JLT_GID
+      TS_IP JUPYTER_PORT STATS_PORT STATS_USER THEME WORKSPACE_DIR HOST_NAME JLT_UID JLT_GID
     # BuildKit attaches a timestamped provenance attestation by default, so even a fully cached
     # rebuild gets a new image ID and 'up' recreates both containers (killing running kernels).
     # These images are never pushed; without the attestation the ID only changes with the content.
@@ -446,7 +486,7 @@ require_stack() {
   for name in Dockerfile compose.yaml compose.gpu.yaml; do
     [[ -f "$STACK_DIR/$name" ]] || die "Missing $STACK_DIR/$name; is the repository complete?"
   done
-  for name in jupyter stats; do
+  for name in jupyter stats theme; do
     [[ -d "$STACK_DIR/$name" ]] || die "Missing $STACK_DIR/$name/; is the repository complete?"
   done
 }
@@ -634,7 +674,7 @@ sync_stack() {
   for name in Dockerfile compose.yaml compose.gpu.yaml; do
     install -m 644 -- "$STACK_DIR/$name" "$APP_DIR/$name"
   done
-  for name in jupyter stats; do
+  for name in jupyter stats theme; do
     # Build the new tree next to the old one and swap, so a failed copy never leaves half a tree.
     tmp="$(mktemp -d "$APP_DIR/.sync-${name}.XXXXXX")"
     if ! copy_tree "$STACK_DIR/$name" "$tmp"; then
@@ -680,6 +720,7 @@ runtime_env_content() {
     "JUPYTER_PORT='${JUPYTER_PORT}'" \
     "STATS_PORT='${STATS_PORT}'" \
     "STATS_USER='${STATS_USER}'" \
+    "THEME='${THEME}'" \
     "WORKSPACE_DIR='${WORKSPACE_DIR}'" \
     "HOST_NAME='$(sanitized_hostname)'" \
     "JLT_UID='$(id -u)'" \
@@ -690,6 +731,7 @@ write_runtime_env() {
   is_safe_workspace_path "$WORKSPACE_DIR" ||
     die "Refusing workspace path with a quote, backslash or control character: $(printf '%q' "$WORKSPACE_DIR")"
   is_tailscale_ipv4 "$TS_IP" || die "Refusing to write an invalid Tailscale IPv4: $(printf '%q' "$TS_IP")"
+  is_valid_theme_name "$THEME" || die "Refusing to write an invalid theme name: $(printf '%q' "$THEME")"
   write_file_atomic "$APP_DIR/.env" 600 "$(runtime_env_content "$1")"$'\n'
 }
 
@@ -780,6 +822,7 @@ print_summary() {
   fi
   printf '  Workspace:   %s\n' "$WORKSPACE_DIR"
   printf '  Settings:    %s\n' "$SETTINGS_FILE"
+  printf '  Theme:       %s\n' "$THEME"
   printf '  GPU:         %s\n' "$([[ "$gpu" == 1 ]] && printf 'enabled' || printf 'not used')"
   if [[ "$JUPYTER_PASSWORD" == "$DEFAULT_PASSWORD" ]]; then
     printf '\n'
@@ -882,6 +925,8 @@ load_runtime_env() {
   DEPLOYED_JUPYTER_PORT="${RUNTIME_ENV[JUPYTER_PORT]:-}"
   DEPLOYED_STATS_PORT="${RUNTIME_ENV[STATS_PORT]:-}"
   DEPLOYED_STATS_USER="${RUNTIME_ENV[STATS_USER]:-}"
+  # A runtime .env from before the THEME setting: compose.yaml's default applies.
+  DEPLOYED_THEME="${RUNTIME_ENV[THEME]:-$DEFAULT_THEME}"
   DEPLOYED_WORKSPACE_DIR="${RUNTIME_ENV[WORKSPACE_DIR]:-}"
   DEPLOYED_STATS_ENABLED=0
   if [[ ",${RUNTIME_ENV[COMPOSE_PROFILES]:-}," == *,stats,* ]]; then
@@ -937,6 +982,8 @@ settings_drift_warning() {
     differences+=("STATS_PORT ${DEPLOYED_STATS_PORT} -> ${STATS_PORT}")
   [[ "$STATS_USER" == "$DEPLOYED_STATS_USER" ]] ||
     differences+=("STATS_USER ${DEPLOYED_STATS_USER} -> ${STATS_USER}")
+  [[ "$THEME" == "$DEPLOYED_THEME" ]] ||
+    differences+=("THEME ${DEPLOYED_THEME} -> ${THEME}")
   if [[ -r "$APP_DIR/secrets/jupyter_password" ]]; then
     current="$(<"$APP_DIR/secrets/jupyter_password")"
   fi
@@ -1482,6 +1529,7 @@ cmd_status() {
     "$([[ "$DEPLOYED_STATS_ENABLED" == 1 ]] && printf 'on (port %s, user %s)' "$DEPLOYED_STATS_PORT" "$DEPLOYED_STATS_USER" || printf 'off')" \
     "$([[ "$DEPLOYED_GPU" == 1 ]] && printf 'on' || printf 'off')"
   printf 'Workspace:         %s\n' "$DEPLOYED_WORKSPACE_DIR"
+  printf 'Theme:             %s\n' "$DEPLOYED_THEME"
 
   if probe_tailscale_ipv4; then
     live_ip="$TS_PROBE_IP"
@@ -1686,7 +1734,8 @@ Root-only helpers (run through sudo by the commands above, or pkexec by the buil
   host-teardown                      Undo host-setup.
 
 Settings file: $SETTINGS_FILE
-  JUPYTER_PASSWORD, JUPYTER_PORT (8888), STATS_ENABLED (1), STATS_PORT (8889), STATS_USER (jupyter)
+  JUPYTER_PASSWORD, JUPYTER_PORT (8888), STATS_ENABLED (1), STATS_PORT (8889), STATS_USER (jupyter),
+  THEME (amazing; a file name from stack/theme without .json)
 
 Pages:
   http://<tailscale-ip>:<JUPYTER_PORT>/lab           JupyterLab

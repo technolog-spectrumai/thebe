@@ -22,8 +22,13 @@
     return value === null ? !!(media && media.matches) : value === "true";
   }
 
+  // <meta name="theme-color">: the browser's own bar (on phones) follows the app bar of the mode.
+  var themeColor = document.querySelector('meta[name="theme-color"]');
+
   function apply(dark) {
     root.setAttribute("data-theme", dark ? "dark" : "light");
+    var color = themeColor && themeColor.getAttribute(dark ? "data-dark" : "data-light");
+    if (color) themeColor.setAttribute("content", color);
   }
 
   apply(preferredDark());

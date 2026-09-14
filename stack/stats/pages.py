@@ -115,12 +115,15 @@ def safe_http_url(url: str) -> str:
 class PageRenderer:
     """Renders every NAV_ITEMS page once; they depend only on start-up settings."""
 
-    def __init__(self, *, host_name: str, jupyter_public_url: str):
+    def __init__(self, *, host_name: str, jupyter_public_url: str, theme_color: dict[str, str]):
         self._jupyter_url = safe_http_url(jupyter_public_url)
         self._common = {
             "app_name": APP_NAME,
             "host_name": host_name,
             "jupyter_url": self._jupyter_url,
+            # <meta name="theme-color"> per mode (the theme's app bar colour); theme.js switches it.
+            "theme_color_light": theme_color["light"],
+            "theme_color_dark": theme_color["dark"],
             **{f"icon_{name}": icon(name) for name in ICON_PATHS},
         }
         self._pages = {item.key: self._render_page(item) for item in NAV_ITEMS}

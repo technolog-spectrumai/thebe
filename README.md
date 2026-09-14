@@ -31,6 +31,7 @@ optional PyQt6 builder window keeps its own dependencies in a project-local `.ve
 - [Persistence](#persistence)
 - [Statistics dashboard](#statistics-dashboard)
 - [Dependencies page](#dependencies-page)
+- [Themes](#themes)
 - [GPU support](#gpu-support)
 - [Security model](#security-model)
 - [Host settings and firewall behaviour](#host-settings-and-firewall-behaviour)
@@ -168,6 +169,7 @@ JUPYTER_PORT='8888'
 STATS_ENABLED='1'
 STATS_PORT='8889'
 STATS_USER='jupyter'
+THEME='amazing'
 ```
 
 To change something, edit the file (or use the [builder](#graphical-builder)) and apply it:
@@ -184,6 +186,8 @@ To change something, edit the file (or use the [builder](#graphical-builder)) an
 - **`STATS_ENABLED='0'`** stops and removes the `stats` and `deps` containers (and, with an active
   firewall, closes the statistics port); `'1'` brings them back. Packages installed from the
   Dependencies page stay installed and keep working in notebooks.
+- **`THEME`:** one of the files in `stack/theme/` without `.json` (default `amazing`); see
+  [Themes](#themes). Changing it recreates only the `stats` container.
 
 The script parses this file itself; it is never executed as shell code. JupyterLab only ever sees
 the argon2 hash. The plain password reaches the `stats` container as a mounted secret file, never
@@ -257,7 +261,8 @@ Start or Restart until the step has been applied once.
 
 - The builder edits `<repo>/.env` — the same file the script reads. It writes it atomically with mode
   `0600`, keeps comments and unknown lines, and honours `JLT_SETTINGS_FILE` and `JLT_APP_DIR`. It
-  also writes `THEME='amazing'`, the name of the palette in `stack/theme/`.
+  keeps the `THEME` setting ([Themes](#themes)) and writes `THEME='amazing'` when none is set; its
+  window uses that theme's colours and heading font.
 - It reads the deployed `~/.local/share/jupyterlab-tailscale/.env` only to build the Open URLs, so
   they always point at what is actually running.
 - Commands run through Qt's `QProcess` with argument lists; no shell is involved. The password never
@@ -334,6 +339,7 @@ remembered by the browser). It works on phone, tablet and desktop widths and ref
 | `/api/stats` | The same data as JSON. |
 | `/health` | `{"status": "ok", "jupyter": "reachable"}` — used by the container health check. |
 | `/dependencies` | The [Dependencies page](#dependencies-page). |
+| `/theme.css` | The colour variables of the selected [theme](#themes). |
 
 **Every** route, including `/health` and static files, requires HTTP Basic authentication (user
 `jupyter`, the JupyterLab password). Host metrics come from the host's `/proc` and `/sys`, mounted
@@ -401,6 +407,45 @@ them or when they would reach outside the package environment:
 
 The page and the runner exist only while statistics are enabled. Installed packages stay in their
 volume when statistics are switched off and notebooks keep using them.
+
+## Themes
+
+The dashboard, the Dependencies page and the builder window share one palette, taken from
+zenobia's theme files. They are copied verbatim into `stack/theme/` (same format, same colour keys);
+no zenobia or toto code or package is imported.
+
+| `THEME` | Theme | Heading font |
+| --- | --- | --- |
+| `amazing` (default) | Amazing Moon | Orbitron |
+| `bitter` | Bitter Orange | Orbitron |
+| `market` | Market Appetite | Nunito Sans |
+| `spectre` | Elegant Spectrum | Orbitron |
+
+To switch, set `THEME='market'` (for example) in `<repo>/.env` and run
+`./setup-jupyterlab-tailscale.sh update`. Only the `stats` container is recreated; nothing is
+rebuilt and running kernels are not affected. Restart the builder to recolour its window.
+
+How it works:
+
+- At start-up the stats app reads `theme/<THEME>.json` and serves `/theme.css`: the light and dark
+  colour variables (behind the same Basic auth as every other route). `oya.css` only uses those
+  variables, so every page follows the theme; light/dark still follows the device or the toggle.
+- The builder maps the same colours to its Qt palette with the same rules: cards bordered with
+  `accent-2` in light mode and `accent-1` in dark mode, and a fallback for themes without `caution`
+  colours.
+- In light mode, small accent text and the text on accent buttons use whichever of two theme
+  colours reads better (accent or link, background or text). With the orange `bitter` and `market`
+  themes they therefore differ slightly from zenobia's raw accent.
+- Orbitron ships with the dashboard (SIL Open Font Licence). Any other heading font is used only
+  when it is installed on the viewing device; nothing is downloaded.
+
+Adding a theme: put a zenobia theme file at `stack/theme/<name>.json` (a regular UTF-8 file without
+a byte-order mark; the name made of letters, digits, `_` or `-`; every colour `#rgb` or `#rrggbb`;
+all colour keys present, `caution-*` optional), set `THEME='<name>'` and run `update`, which
+rebuilds the stats image to include it. The script refuses an unknown name and lists the available
+ones. A file that cannot be used never stops anything: the dashboard and the builder fall back to
+Amazing Moon, and the dashboard logs one warning (`./setup-jupyterlab-tailscale.sh logs --no-follow
+stats`).
 
 ## GPU support
 
@@ -569,8 +614,8 @@ stack/Dockerfile                   base → jupyterlab and stats images
 stack/compose.yaml                 services, ports, secrets, volumes, health checks
 stack/compose.gpu.yaml             GPU override, used when a GPU is detected
 stack/jupyter/                     JupyterLab config, kernel launcher, package runner, requirements and lock file
-stack/stats/                       FastAPI dashboard and Dependencies page: app, templates, static assets, requirements and lock file
-stack/theme/                       oya theme files shared with zenobia (palette of the builder window)
+stack/stats/                       FastAPI dashboard and Dependencies page: app, theme loader, templates, static assets, requirements and lock file
+stack/theme/                       zenobia's oya theme files (palette of the dashboard and the builder)
 builder.py                         optional PyQt6 builder (thin frontend over the script)
 run-builder.sh                     creates .venv with the pinned PyQt6 and starts the builder
 requirements-builder.txt           PyQt6 pins for the builder venv

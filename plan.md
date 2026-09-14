@@ -50,10 +50,11 @@ merely written.
 
 **Stage 5 — Harmonization with zenobia (no imports)**
 - [x] zenobia theme files copied to `stack/theme/{amazing,bitter,market,spectre}.json`
-- [ ] `THEME` setting validated by the script and the builder
-- [ ] Stats app generates `theme.css` from the theme JSON
-- [x] Builder QSS generated from the same JSON (`load_theme_colors` + `theme_tokens`, all four theme files tested in light and dark)
-- [ ] README + commit
+- [x] `THEME` setting validated by the script (name rule, regular file in `stack/theme`, names listed on error) and the builder; runtime `.env`, status, summary and drift warning show it; an exported `THEME` is ignored
+- [x] Stats app generates `/theme.css` from the theme JSON (`stack/stats/theme.py`, whole-file fallback to Amazing Moon with one warning); `oya.css` has no hardcoded palette any more; readable light-mode accent text and button text for the orange themes; adversarial review + fixes; sandbox run with all four themes and screenshots
+- [x] Builder QSS generated from the same JSON with the same rules: whole-file fallback, symlinks and invalid names refused, theme heading font honoured, light-mode button text like the dashboard
+- [x] Live deploy: `/theme.css` behind auth, switch to `market` and back recreated only `stats`, unknown theme refused, idempotent re-install
+- [x] README (Themes section, `THEME` setting, `/theme.css`) + commit
 
 ## 0. Goal
 
@@ -336,7 +337,7 @@ Recommendation: **no to both**; reuse the *design tokens and conventions*, not t
   - `stack/theme/{amazing,bitter,market,spectre}.json` — zenobia's theme files copied
     verbatim (same format, same token names).
   - `THEME='amazing'` in the settings `.env` selects one; the script and the builder validate it.
-  - The stats app generates `/static/theme.css` (the `:root` light/dark custom properties)
+  - The stats app generates `/theme.css` (the `:root` light/dark custom properties)
     from that JSON at startup; `oya.css` only consumes the variables.
   - `builder.py` builds its QSS from the same JSON with the same oya → Qt token mapping, so
     the GUI and the dashboard always show one palette.

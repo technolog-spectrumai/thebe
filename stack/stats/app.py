@@ -1,8 +1,8 @@
 """Statistics dashboard for the jupyterlab-tailscale stack (FastAPI, served by uvicorn).
 
 Runs in the `stats` container on port 8889, published only on the host's Tailscale
-IPv4. Every path - pages, /api/*, /health and /static/* - requires HTTP Basic auth with
-STATS_USER and the JupyterLab password read from JUPYTER_PASSWORD_FILE.
+IPv4. Every path - pages, /theme.css, /api/*, /health and /static/* - requires HTTP
+Basic auth with STATS_USER and the JupyterLab password read from JUPYTER_PASSWORD_FILE.
 
 Environment (set by compose.yaml):
   STATS_USER, JUPYTER_PASSWORD_FILE      Basic auth credentials
@@ -11,6 +11,7 @@ Environment (set by compose.yaml):
   DEPS_INTERNAL_URL, DEPS_TOKEN_FILE     deps runner behind the Dependencies page and its token
   HOST_NAME, HOST_PROC, HOST_SYS         host identity and the read-only /proc and /sys mounts
   WORKSPACE_DIR                          filesystem whose usage is reported
+  THEME                                  theme file under theme/ without .json (default amazing)
 """
 
 import asyncio
@@ -24,11 +25,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import hoststats
 import pages
+import theme
 from cache import RefreshingValue
 from depsapi import DepsClient
 from gpustats import GpuReader
@@ -100,6 +102,11 @@ try:
 except ConfigError as exc:
     DEPS_TOKEN, _deps_problem = b"", f"runner token: {exc}"
     log.warning("Dependencies page disabled: %s", _deps_problem)
+
+# Colours of every page, generated once from theme/<THEME>.json. An unknown or broken theme
+# logs one warning and falls back to Amazing Moon: the dashboard always starts.
+THEME = theme.load_theme(os.environ.get("THEME") or theme.DEFAULT_THEME, BASE_DIR / "theme")
+THEME_CSS = theme.theme_css(THEME).encode("utf-8")
 
 # --- data sources --------------------------------------------------------------------
 
@@ -181,9 +188,21 @@ api = FastAPI(
     openapi_url=None,
     lifespan=lifespan,
 )
+
+
+async def theme_stylesheet() -> Response:
+    return Response(THEME_CSS, media_type="text/css")
+
+
+# Registered before the /static mount, so no file under static/ can ever answer in its place.
+api.add_api_route("/theme.css", theme_stylesheet, methods=["GET"], response_class=Response, include_in_schema=False)
 api.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
-renderer = pages.PageRenderer(host_name=hoststats.HOST_NAME, jupyter_public_url=JUPYTER_PUBLIC_URL)
+renderer = pages.PageRenderer(
+    host_name=hoststats.HOST_NAME,
+    jupyter_public_url=JUPYTER_PUBLIC_URL,
+    theme_color={mode: THEME.tokens(mode)["appbar-bg"] for mode in theme.MODES},
+)
 
 
 def _page_endpoint(item: pages.NavItem):

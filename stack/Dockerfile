@@ -98,7 +98,16 @@ COPY stats/static/ /srv/stats/static/
 # executable).
 RUN chmod -R u=rwX,go=rX /srv/stats
 
+# zenobia's theme files. THEME in compose.yaml picks one at start-up, so switching themes only
+# recreates the container. Symbolic mode for the same reason as for /srv/jupyter above.
+COPY --chmod=u=rwX,go=rX theme/ /srv/stats/theme/
+
 USER jupyter
+# The app reads its templates and the theme once at start-up, and an unreadable theme file only
+# shows up as the fallback colours. Fail the build instead.
+RUN test -r /srv/stats/app.py && test -r /srv/stats/theme.py && test -r /srv/stats/templates/base.html \
+ && test -r /srv/stats/static/oya.css && test -r /srv/stats/theme/amazing.json \
+ && for file in /srv/stats/theme/*.json; do test -r "$file" || exit 1; done
 WORKDIR /srv/stats
 EXPOSE 8889
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8889", "--no-server-header"]

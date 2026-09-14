@@ -446,10 +446,39 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(dark["card_border"], colors["accent-1"])
         self.assertEqual(dark["header_bg"], colors["appbar-bg-dark"])
         self.assertEqual(light["log_bg"], colors["sunken-light"])
-        for tokens in (light, dark):
-            options = (tokens["window_bg"], "#ffffff")
+        # Light mode picks like the dashboard's --on-accent; dark mode may use white.
+        for tokens, options in ((light, (light["window_bg"], light["text"])), (dark, (dark["window_bg"], "#ffffff"))):
             best = max(options, key=lambda c: builder.contrast(c, tokens["accent"]))
             self.assertEqual(tokens["on_accent"], best)
+
+    def test_a_light_accent_gets_readable_button_text(self):
+        colors = builder.load_theme_colors(REPO / "stack" / "theme", "market")
+        self.assertEqual(builder.theme_tokens(colors, "light")["on_accent"], colors["text-main-light"])
+
+    def test_theme_files_are_used_whole_or_not_at_all(self):
+        # The dashboard's theme.py rules: a partly valid file falls back entirely, never merged.
+        market = json.loads((REPO / "stack" / "theme" / "market.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "good.json").write_text(json.dumps(market), encoding="utf-8")
+            self.assertEqual(builder.load_theme(root, "good"), (market["colors"], "Nunito Sans"))
+            broken = {
+                "missing": {**market, "colors": {k: v for k, v in market["colors"].items() if k != "accent-1"}},
+                "alpha": {**market, "colors": {**market["colors"], "accent-light": "#ff7a2fcc"}},
+                "extra": {**market, "colors": {**market["colors"], "note": "orange"}},
+            }
+            for name, data in broken.items():
+                (root / f"{name}.json").write_text(json.dumps(data), encoding="utf-8")
+            (root / "bom.json").write_bytes(b"\xef\xbb\xbf" + json.dumps(market).encode())
+            (root / "linked.json").symlink_to(root / "good.json")
+            (root / "my theme.json").write_text(json.dumps(market), encoding="utf-8")
+            for name in (*broken, "bom", "linked", "nope"):
+                with self.subTest(name=name):
+                    self.assertEqual(builder.load_theme(root, name), (builder.BUILTIN_COLORS, "Orbitron"))
+            self.assertEqual(builder.available_themes(root), ["alpha", "bom", "extra", "good", "missing"])
+            bad_font = {**market, "font": 'Fira"; x'}
+            (root / "font.json").write_text(json.dumps(bad_font), encoding="utf-8")
+            self.assertEqual(builder.load_theme(root, "font"), (market["colors"], ""))
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +753,16 @@ class WindowTests(unittest.TestCase):
         self.assertEqual((window.jupyter_port.value(), window.stats_port.value()), (9200, 9201))
         self.assertFalse(window.stats_check.isChecked())
         self.assertEqual(window.banner.property("kind"), "info")
+
+    def test_heading_font_follows_the_theme(self):
+        self.settings.write_text("THEME='market'\n")
+        self.assertIn('font-family: "Nunito Sans";', self.window().styleSheet())
+        self.settings.write_text("THEME='amazing'\n")
+        window = self.window()
+        self.assertNotIn("Nunito Sans", window.styleSheet())
+        family = builder.load_display_family(window.paths.display_font)
+        if family:      # the bundled Orbitron, when Qt can read the woff2
+            self.assertIn(f'font-family: "{family}";', window.styleSheet())
 
     def test_statistics_switch_loads_the_installer_spellings(self):
         for raw, checked in (("false", False), ("No", False), ("off", False), ("On", True), ("yes", True)):

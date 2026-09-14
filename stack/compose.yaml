@@ -159,6 +159,9 @@ services:
       DEPS_INTERNAL_URL: http://deps:8890
       DEPS_TOKEN_FILE: /run/secrets/deps_token
       HOST_NAME: "${HOST_NAME:-}"
+      # zenobia theme file under /srv/stats/theme (stack/theme), without .json. Environment
+      # only: switching themes recreates this container, nothing is rebuilt.
+      THEME: "${THEME:-amazing}"
       # Host /proc and /sys, read-only, for host-wide CPU, memory, network and sensors.
       HOST_PROC: /host/proc
       HOST_SYS: /host/sys

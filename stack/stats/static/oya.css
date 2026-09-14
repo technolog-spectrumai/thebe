@@ -1,16 +1,27 @@
-/* oya design language, theme "Amazing Moon", as plain CSS.
+/* oya design language as plain CSS.
  *
- * Token values are verbatim from zenobia data/themes/amazing.json. Component recipes
+ * The colours come from zenobia's theme files: the stats app turns theme/<THEME>.json into
+ * /theme.css (theme.py), which base.html links before this file. It defines color-scheme,
+ * --font-display and the palette (--primary-bg, --bubble-bg, --sunken, --header-bg,
+ * --appbar-bg, --appbar-text, --footer-bg, --footer-text, --text-main, --accent, --link,
+ * --warn, --success, --caution, --accent-1, --accent-2, --border) for :root and
+ * :root[data-theme="dark"], plus the light-mode --accent-text and --on-accent (the better
+ * reading of two palette colours, which CSS cannot pick). Nothing below hardcodes a theme
+ * colour. Component recipes
  * reproduce the Tailwind 3.4 utilities the oya templates use (rounded-2xl cards with
  * shadow-md, stat tiles, tracking-widest eyebrows, meters, pills). No Tailwind runtime,
  * no icon font, nothing loaded from a CDN.
  *
  * Marked deviations from oya, for readability:
- *  - --accent-text: small accent text uses --link in dark mode (oya's accent is 2.7:1 there);
+ *  - --accent-text: small accent text uses --link in dark mode (oya's accent is 2.7:1 there),
+ *    and in light mode whichever of --accent and --link reads better on cards (theme.css);
+ *  - --on-accent: text on accent fills is --primary-bg, or --text-main in light mode when the
+ *    theme's accent is light (theme.css);
  *  - --*-text: status colours are mixed with --text-main in light mode (raw ~3.3:1 on cards);
  *  - an unset darkMode follows prefers-color-scheme (see theme.js).
  */
 
+/* Used when the theme's font is "Orbitron" (--font-display in /theme.css). */
 @font-face {
   font-family: "Orbitron";
   font-style: normal;
@@ -19,31 +30,10 @@
   src: url("orbitron-latin.woff2") format("woff2");
 }
 
-/* ---- tokens ----------------------------------------------------------------------- */
+/* ---- tokens derived from the theme palette ---------------------------------------- */
 
+/* --accent-text and --on-accent for light mode come from /theme.css. */
 :root {
-  color-scheme: light;
-
-  --primary-bg: #f2f3f5;
-  --bubble-bg: #e8e9ec;
-  --sunken: #e1e2e5;
-  --header-bg: #1d2333;
-  --appbar-bg: #252c3e;
-  --appbar-text: #e4e7ef;
-  --footer-bg: #1d2333;
-  --footer-text: #e4e7ef;
-  --text-main: #0f1114;
-  --accent: #2f3d63;
-  --link: #2a4b8f;
-  --warn: #d94a4a;
-  --success: #4a8f7a;
-  --caution: #a07800;
-  --accent-1: #4f5fa1;
-  --accent-2: #2f3d63;
-  /* oya's card rule: light cards use accent-2 borders, dark cards accent-1. */
-  --border: var(--accent-2);
-
-  --accent-text: var(--accent);
   --success-text: color-mix(in srgb, var(--success) 65%, var(--text-main));
   --caution-text: color-mix(in srgb, var(--caution) 65%, var(--text-main));
   --warn-text: color-mix(in srgb, var(--warn) 65%, var(--text-main));
@@ -56,7 +46,6 @@
   --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
 
-  --font-display: "Orbitron", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Noto Sans",
     "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
@@ -64,27 +53,8 @@
 }
 
 :root[data-theme="dark"] {
-  color-scheme: dark;
-
-  --primary-bg: #0a0c11;
-  --bubble-bg: #191f2d;
-  --sunken: #141821;
-  --header-bg: #0f1420;
-  --appbar-bg: #151b29;
-  --appbar-text: #cfd4df;
-  --footer-bg: #0f1420;
-  --footer-text: #cfd4df;
-  --text-main: #d3d7e0;
-  --accent: #4f5fa1;
-  --link: #5f7fc9;
-  --warn: #ff4455;
-  --success: #5fa38c;
-  --caution: #f0a820;
-  --accent-1: #4f5fa1;
-  --accent-2: #2f3d63;
-  --border: var(--accent-1);
-
   --accent-text: color-mix(in srgb, var(--link) 75%, var(--text-main));
+  --on-accent: var(--primary-bg);
   --success-text: color-mix(in srgb, var(--success) 75%, var(--text-main));
   --caution-text: var(--caution);
   --warn-text: color-mix(in srgb, var(--warn) 70%, var(--text-main));
@@ -203,7 +173,7 @@ a {
   padding: 0.5rem 1rem;
   border-radius: 0.5rem;
   background: var(--accent);
-  color: var(--primary-bg);
+  color: var(--on-accent);
   font-weight: 600;
   text-decoration: none;
 }
@@ -1147,7 +1117,7 @@ a {
 .btn--primary {
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: var(--primary-bg);
+  color: var(--on-accent);
 }
 
 .btn--primary:hover {
