@@ -5,7 +5,9 @@ The server listens on every interface of its own container; Compose publishes th
 on the Tailscale IPv4 only.
 """
 
+import os
 import re
+import ssl
 from pathlib import Path
 
 c = get_config()  # noqa: F821 - provided by traitlets when it runs this file
@@ -47,6 +49,43 @@ def read_hashed_password(path):
     return value
 
 
+def tls_files(cert, key):
+    """Return (cert, key) for HTTPS, None for plain HTTP, or stop with a clear message.
+
+    compose.tls.yaml sets both variables to the certificate for the MagicDNS name. A
+    missing or unreadable file must stop the server: otherwise Tornado fails later with a
+    traceback, or JupyterLab would silently come up without the HTTPS it was asked for.
+    """
+    if not cert and not key:
+        return None
+    if not cert or not key:
+        raise SystemExit(
+            "jupyter_server_config: JLT_TLS_CERT and JLT_TLS_KEY must be set together "
+            f"(JLT_TLS_CERT={cert!r}, JLT_TLS_KEY={key!r})."
+        )
+    for label, path in (("certificate", cert), ("key", key)):
+        try:
+            with open(path, "rb"):
+                pass
+        except FileNotFoundError:
+            raise SystemExit(
+                f"jupyter_server_config: TLS {label} {path} does not exist; "
+                "run setup-jupyterlab-tailscale.sh update."
+            ) from None
+        except OSError as exc:
+            raise SystemExit(
+                f"jupyter_server_config: TLS {label} {path} cannot be read: {exc.strerror or exc}"
+            ) from None
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert, key)
+    except (ssl.SSLError, OSError) as exc:
+        raise SystemExit(
+            f"jupyter_server_config: TLS key {key} does not match certificate {cert} "
+            f"(or a file is not PEM): {exc}"
+        ) from None
+    return cert, key
+
+
 # --- network ---------------------------------------------------------------
 c.ServerApp.ip = "0.0.0.0"
 c.ServerApp.port = 8888
@@ -59,6 +98,12 @@ c.ServerApp.open_browser = False
 c.ServerApp.allow_remote_access = True
 c.ServerApp.allow_root = False
 c.ServerApp.root_dir = "/workspace"
+
+# --- HTTPS (compose.tls.yaml) -------------------------------------------------
+# The certificate from 'tailscale cert' for the MagicDNS name, on the same port 8888.
+TLS = tls_files(os.environ.get("JLT_TLS_CERT", ""), os.environ.get("JLT_TLS_KEY", ""))
+if TLS is not None:
+    c.ServerApp.certfile, c.ServerApp.keyfile = TLS
 
 # --- authentication: hashed password only, no token ---------------------------
 c.PasswordIdentityProvider.hashed_password = read_hashed_password(HASHED_PASSWORD_FILE)
