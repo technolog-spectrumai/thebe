@@ -23,7 +23,8 @@ readonly DEFAULT_STATS_PORT='8889'
 readonly DEFAULT_STATS_ENABLED='1'
 readonly DEFAULT_STATS_USER='jupyter'
 readonly DEFAULT_THEME='amazing'
-readonly -a SETTINGS_KEYS=(JUPYTER_PASSWORD JUPYTER_PORT STATS_ENABLED STATS_PORT STATS_USER THEME)
+readonly DEFAULT_HTTPS='auto'
+readonly -a SETTINGS_KEYS=(JUPYTER_PASSWORD JUPYTER_PORT STATS_ENABLED STATS_PORT STATS_USER THEME HTTPS)
 readonly JUPYTER_IMAGE="${PROJECT}/jupyterlab:local"
 readonly STATS_IMAGE="${PROJECT}/stats:local"
 readonly SYSCTL_FILE='/etc/sysctl.d/60-jupyterlab-tailscale.conf'
@@ -36,6 +37,14 @@ readonly UFW_BLOCK_BEGIN="# BEGIN ${PROJECT}"
 readonly UFW_BLOCK_END="# END ${PROJECT}"
 readonly FIREWALLD_ZONE='jupyter-tailnet'
 readonly TAILSCALE_IFACE='tailscale0'
+# Certificates from 'tailscale cert' for the MagicDNS name, written by host-setup --cert.
+readonly DEFAULT_TLS_DIR="${ROOT_STATE_DIR}/tls"
+# Renew (root step) when fewer days are left. host-setup asks 'tailscale cert' for at least one
+# day more (--min-validity): without it tailscaled hands back its cached certificate until its own
+# background renewal has finished, and the root step would be asked for again. With it a
+# successful step always leaves more than CERT_RENEW_DAYS, so the need ends.
+readonly CERT_RENEW_DAYS=21
+readonly CERT_MIN_VALIDITY="$(((CERT_RENEW_DAYS + 1) * 24))h"
 
 # ---------------------------------------------------------------------------------------------
 # Output helpers (colour only when the stream is a terminal)
@@ -101,6 +110,13 @@ ACCOUNT_HOME="$(account_home)"
 SETTINGS_FILE="$(absolute_path "${JLT_SETTINGS_FILE:-${SCRIPT_DIR}/.env}")"
 APP_DIR="$(absolute_path "${JLT_APP_DIR:-${ACCOUNT_HOME}/.local/share/${PROJECT}}")"
 WORKSPACE_DIR="$(absolute_path "${JLT_WORKSPACE_DIR:-${ACCOUNT_HOME}/jupyter-workspace}")"
+# JLT_TLS_DIR is for tests only. The root helpers never take paths from the caller's
+# environment, so they always use the default.
+if [[ "$EUID" -eq 0 ]]; then
+  TLS_DIR="$DEFAULT_TLS_DIR"
+else
+  TLS_DIR="$(absolute_path "${JLT_TLS_DIR:-$DEFAULT_TLS_DIR}")"
+fi
 LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/${PROJECT}-${EUID}.lock"
 
 # How to invoke this script in hints: short when run from the repo directory.
@@ -193,6 +209,27 @@ is_safe_workspace_path() {
   [[ "$1" == /* && "$1" != *\'* && "$1" != *\\* && "$1" != *[[:cntrl:]]* ]]
 }
 
+# The certificate directory also goes into 'docker run --mount source=...', where a comma would
+# start another option: plain characters only.
+is_safe_tls_dir() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ && "$1" != *//* && "/$1/" != */../* ]]
+}
+
+# A MagicDNS name as 'tailscale cert' accepts it: lower-case dot-separated labels (at least two),
+# 253 characters at most. The letters are spelled out because a range such as [a-z] can match
+# other characters in some locales, and the name ends up in root's argv and in file names.
+is_valid_fqdn() {
+  local chars='abcdefghijklmnopqrstuvwxyz0123456789'
+  local label="[${chars}]([${chars}-]{0,61}[${chars}])?"
+  local re="^${label}(\\.${label})+\$"
+  ((${#1} <= 253)) && [[ "$1" =~ $re ]]
+}
+
+# A group id for the certificate files: decimal, not root's group, below the reserved -1.
+is_valid_gid() {
+  [[ "$1" =~ ^[1-9][0-9]{0,9}$ ]] && ((10#$1 <= 4294967294))
+}
+
 # Refuses to recursively delete "/", the home directory or an empty path.
 is_safe_to_delete() {
   local target home
@@ -249,12 +286,15 @@ default_settings_content() {
     '# Values are literal. The password needs 8-128 characters without quote or backslash.' \
     '# After editing, apply with: ./setup-jupyterlab-tailscale.sh update' \
     '# THEME colours the dashboard and the builder: a file name from stack/theme without .json.' \
+    "# HTTPS: auto serves HTTPS on the Tailscale name when MagicDNS and HTTPS certificates are" \
+    "# enabled in the tailnet (certificate from 'tailscale cert'); off keeps plain HTTP." \
     "JUPYTER_PASSWORD='${DEFAULT_PASSWORD}'" \
     "JUPYTER_PORT='${DEFAULT_JUPYTER_PORT}'" \
     "STATS_ENABLED='${DEFAULT_STATS_ENABLED}'" \
     "STATS_PORT='${DEFAULT_STATS_PORT}'" \
     "STATS_USER='${DEFAULT_STATS_USER}'" \
-    "THEME='${DEFAULT_THEME}'"
+    "THEME='${DEFAULT_THEME}'" \
+    "HTTPS='${DEFAULT_HTTPS}'"
 }
 
 ensure_settings_file() {
@@ -282,7 +322,7 @@ normalize_bool() {
 }
 
 # Loads the settings into JUPYTER_PASSWORD, JUPYTER_PORT, STATS_ENABLED, STATS_PORT,
-# STATS_USER, THEME. Missing keys (or a missing file) fall back to the defaults. Problems are
+# STATS_USER, THEME, HTTPS. Missing keys (or a missing file) fall back to the defaults. Problems are
 # collected in SETTINGS_PROBLEMS; callers decide whether they are fatal.
 load_settings() {
   local key known entry bool themes
@@ -311,6 +351,7 @@ load_settings() {
   STATS_PORT="${SETTINGS_RAW[STATS_PORT]-$DEFAULT_STATS_PORT}"
   STATS_USER="${SETTINGS_RAW[STATS_USER]-$DEFAULT_STATS_USER}"
   THEME="${SETTINGS_RAW[THEME]-$DEFAULT_THEME}"
+  HTTPS="${SETTINGS_RAW[HTTPS]-$DEFAULT_HTTPS}"
 
   local length="${#JUPYTER_PASSWORD}"
   if ((length < 8 || length > 128)); then
@@ -356,6 +397,11 @@ load_settings() {
       SETTINGS_PROBLEMS+=("THEME: no theme files found in ${THEME_DIR}; is the repository complete?")
     fi
   fi
+
+  case "$HTTPS" in
+    auto | off) ;;
+    *) SETTINGS_PROBLEMS+=("HTTPS must be one of: auto, off (got $(printf '%q' "$HTTPS"))") ;;
+  esac
 }
 
 require_valid_settings() {
@@ -463,7 +509,8 @@ compose() {
   [[ -t 1 ]] || progress=(--progress plain)
   (
     unset COMPOSE_PROJECT_NAME COMPOSE_FILE COMPOSE_PROFILES COMPOSE_ENV_FILES COMPOSE_PATH_SEPARATOR \
-      TS_IP JUPYTER_PORT STATS_PORT STATS_USER THEME WORKSPACE_DIR HOST_NAME JLT_UID JLT_GID
+      TS_IP JUPYTER_PORT STATS_PORT STATS_USER THEME WORKSPACE_DIR HOST_NAME JLT_UID JLT_GID \
+      HTTPS_MODE PUBLIC_HOST PUBLIC_SCHEME TLS TLS_NAME TLS_NOT_AFTER TLS_DIR
     # BuildKit attaches a timestamped provenance attestation by default, so even a fully cached
     # rebuild gets a new image ID and 'up' recreates both containers (killing running kernels).
     # These images are never pushed; without the attestation the ID only changes with the content.
@@ -483,7 +530,7 @@ require_installed() {
 
 require_stack() {
   local name
-  for name in Dockerfile compose.yaml compose.gpu.yaml; do
+  for name in Dockerfile compose.yaml compose.gpu.yaml compose.tls.yaml; do
     [[ -f "$STACK_DIR/$name" ]] || die "Missing $STACK_DIR/$name; is the repository complete?"
   done
   for name in jupyter stats theme; do
@@ -504,6 +551,394 @@ refuse_root() {
   if [[ "$EUID" -eq 0 ]]; then
     die "Run this as your normal desktop user (in the docker group), not as root or with sudo. It asks for sudo itself when a host change is needed."
   fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# HTTPS by Tailscale name (MagicDNS + 'tailscale cert')
+# ---------------------------------------------------------------------------------------------
+
+# Reads 'tailscale status --json' on stdin inside the JupyterLab image (no host Python or jq).
+# Prints name=<MagicDNS name>, cert_ok=1 when 'tailscale cert' can issue a certificate for it,
+# and reason=<text> when either is missing; probe_error=1 when the answer says nothing definite
+# (no usable output, tailscaled not Running at the moment). Characters outside a host name become
+# "?", so a hostile DNSName can neither add lines nor pass the installer's own name check.
+readonly TS_STATUS_PARSER='
+import json, re, sys
+try:
+    status = json.load(sys.stdin)
+except ValueError:
+    status = None
+if not isinstance(status, dict):
+    print("reason=tailscale status --json gave no usable output")
+    print("probe_error=1")
+    sys.exit(0)
+state = status.get("BackendState")
+state = re.sub(r"[^A-Za-z]", "", state)[:24] if isinstance(state, str) else ""
+tailnet = status.get("CurrentTailnet")
+node = status.get("Self")
+dns_name = node.get("DNSName") if isinstance(node, dict) else None
+if state != "Running":
+    print("reason=Tailscale is not running (state " + (state or "unknown") + ")")
+    print("probe_error=1")
+elif not isinstance(tailnet, dict) or tailnet.get("MagicDNSEnabled") is not True:
+    print("reason=MagicDNS is disabled in the tailnet (Tailscale admin console, DNS page)")
+elif not isinstance(dns_name, str) or not dns_name.strip("."):
+    print("reason=Tailscale reports no MagicDNS name for this machine")
+else:
+    name = dns_name.lower().removesuffix(".")
+    print("name=" + re.sub(r"[^a-z0-9.-]", "?", name)[:300])
+    domains = status.get("CertDomains")
+    domains = domains if isinstance(domains, list) else []
+    if name in [d.lower().removesuffix(".") for d in domains if isinstance(d, str)]:
+        print("cert_ok=1")
+    else:
+        print("reason=HTTPS certificates are disabled in the tailnet (Tailscale admin console, DNS page)")
+'
+
+# Checks <TLS_DIR>/<name>.crt and .key as the container user (argv[1]: the name). Prints valid=1|0,
+# days_left, not_after (UTC, ISO 8601) and problem. load_cert_chain proves both files are
+# readable and belong together, exactly as JupyterLab and uvicorn will load them.
+readonly CERT_INSPECTOR='
+import os, re, ssl, sys, time
+name = sys.argv[1]
+crt, key = "/run/tls/" + name + ".crt", "/run/tls/" + name + ".key"
+def done(valid=0, days="", not_after="", problem=""):
+    print("valid=%s\ndays_left=%s\nnot_after=%s\nproblem=%s" % (valid, days, not_after, problem))
+    sys.exit(0)
+if not os.access("/run/tls", os.R_OK | os.X_OK):
+    done(problem="the certificate directory is not readable by the container user")
+if not os.path.lexists(crt) or not os.path.lexists(key):
+    done(problem="missing")
+try:
+    ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(crt, key)
+    info = ssl._ssl._test_decode_cert(crt)
+    expires = ssl.cert_time_to_seconds(info["notAfter"])
+except FileNotFoundError:
+    done(problem="missing")
+except PermissionError:
+    done(problem="not readable by the container user")
+except ssl.SSLError:
+    done(problem="the key does not match the certificate (or a file is not PEM)")
+except (OSError, KeyError, ValueError) as exc:
+    done(problem="unreadable (" + type(exc).__name__ + ")")
+days = int((expires - time.time()) // 86400)
+not_after = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires))
+names = [v.lower() for k, v in info.get("subjectAltName", ()) if k == "DNS"]
+if name not in names:
+    shown = re.sub(r"[^a-z0-9.*,-]", "?", ",".join(names))[:120] or "no DNS names"
+    done(days=days, not_after=not_after, problem="issued for " + shown + ", not for " + name)
+if expires <= time.time():
+    done(days=days, not_after=not_after, problem="expired")
+done(1, days, not_after)
+'
+
+# Defaults until resolve_https_state runs: plain HTTP on the Tailscale IP.
+HTTPS_MODE="$DEFAULT_HTTPS"
+TS_NAME=''
+TS_CERT_OK=0
+TS_NAME_REASON=''
+CERT_VALID=0
+CERT_DAYS_LEFT=''
+CERT_NOT_AFTER=''
+CERT_PROBLEM=''
+CERT_NEEDED=0
+USE_TLS=''
+PUBLIC_HOST=''
+PUBLIC_SCHEME='http'
+# 1 when the name probe or the certificate check could not answer (see https_check_failed).
+TS_PROBE_FAILED=0
+CERT_CHECK_FAILED=0
+# 1 when such a failure kept the deployed HTTPS values (keep_https_state_on_check_error).
+HTTPS_KEPT=0
+KEPT_OK=0
+
+# Only printable text from a probe, at most 200 characters.
+clean_text() {
+  local text="${1//[^[:print:]]/}"
+  printf '%s\n' "${text:0:200}"
+}
+
+# Sets TS_NAME (a valid MagicDNS name or ''), TS_CERT_OK and TS_NAME_REASON. Never fails: without
+# a name the pages are simply published by IP. TS_PROBE_FAILED=1 when there was no definite answer
+# (nothing from tailscale, the image could not run, tailscaled not Running at the moment), unlike
+# a tailnet without MagicDNS. Needs the JupyterLab image. Not meant for $(...).
+probe_tailscale_name() {
+  local output line value name='' cert_ok=0 reason='' probe_error=0 runner=()
+  TS_NAME=''
+  TS_CERT_OK=0
+  TS_NAME_REASON=''
+  TS_PROBE_FAILED=0
+  if ! command -v tailscale >/dev/null 2>&1; then
+    TS_NAME_REASON='Tailscale CLI not found'
+    return 0
+  fi
+  command -v timeout >/dev/null 2>&1 && runner=(timeout 20)
+  # tailscale's exit status is ignored: the parser explains empty or partial output itself.
+  if ! output="$({ "${runner[@]}" tailscale status --json 2>/dev/null || true; } |
+    docker run --rm -i --network none --entrypoint python "$JUPYTER_IMAGE" -c "$TS_STATUS_PARSER" 2>/dev/null)"; then
+    TS_NAME_REASON="could not parse 'tailscale status --json' with ${JUPYTER_IMAGE}"
+    TS_PROBE_FAILED=1
+    return 0
+  fi
+  while IFS= read -r line; do
+    value="${line#*=}"
+    case "$line" in
+      name=*)
+        if [[ -z "$name" ]]; then
+          name="$value"
+        fi
+        ;;
+      cert_ok=1) cert_ok=1 ;;
+      probe_error=1) probe_error=1 ;;
+      reason=*)
+        if [[ -z "$reason" ]]; then
+          reason="$(clean_text "$value")"
+        fi
+        ;;
+    esac
+  done <<<"$output"
+  if [[ -n "$name" ]] && ! is_valid_fqdn "$name"; then
+    warn "Ignoring the MagicDNS name $(printf '%q' "${name:0:80}") from 'tailscale status': not a valid host name. The pages are published by IP."
+    name=''
+    cert_ok=0
+    reason='the MagicDNS name reported by Tailscale is not a valid host name'
+  fi
+  if [[ -z "$name" && -z "$reason" ]]; then
+    reason="no usable answer from 'tailscale status --json'"
+    probe_error=1
+  fi
+  TS_NAME="$name"
+  TS_CERT_OK="$cert_ok"
+  TS_NAME_REASON="$reason"
+  TS_PROBE_FAILED="$probe_error"
+}
+
+# Sets CERT_VALID (1: readable by the container user, key and certificate match, issued for $1,
+# not expired), CERT_DAYS_LEFT, CERT_NOT_AFTER and CERT_PROBLEM for <TLS_DIR>/$1.crt/.key.
+# Checked inside the JupyterLab image as JLT_UID:JLT_GID, so group permissions count exactly as
+# they do for the services. CERT_CHECK_FAILED=1 when the check itself could not run, which says
+# nothing about the files. Not meant for $(...).
+inspect_certificate() {
+  local name="$1" output line value
+  CERT_VALID=0
+  CERT_DAYS_LEFT=''
+  CERT_NOT_AFTER=''
+  CERT_PROBLEM=''
+  CERT_CHECK_FAILED=0
+  if ! is_valid_fqdn "$name"; then
+    CERT_PROBLEM='no valid name'
+    return 0
+  fi
+  if ! is_safe_tls_dir "$TLS_DIR"; then
+    CERT_PROBLEM="unusable certificate directory $(printf '%q' "$TLS_DIR")"
+    return 0
+  fi
+  if [[ ! -d "$TLS_DIR" ]]; then
+    CERT_PROBLEM='missing'
+    return 0
+  fi
+  # --mount, not -v: a missing source must fail instead of being created by the daemon.
+  if ! output="$(docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --user "$(id -u):$(id -g)" \
+    --mount "type=bind,source=${TLS_DIR},target=/run/tls,readonly" \
+    --entrypoint python "$JUPYTER_IMAGE" -c "$CERT_INSPECTOR" "$name" 2>/dev/null)"; then
+    CERT_PROBLEM="could not be checked (docker run ${JUPYTER_IMAGE} failed)"
+    CERT_CHECK_FAILED=1
+    return 0
+  fi
+  while IFS= read -r line; do
+    value="${line#*=}"
+    case "$line" in
+      valid=1) CERT_VALID=1 ;;
+      days_left=*) [[ ! "$value" =~ ^-?[0-9]{1,6}$ ]] || CERT_DAYS_LEFT="$value" ;;
+      not_after=*) [[ ! "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || CERT_NOT_AFTER="$value" ;;
+      problem=*) CERT_PROBLEM="$(clean_text "$value")" ;;
+    esac
+  done <<<"$output"
+  if [[ "$CERT_VALID" == 1 && (-z "$CERT_DAYS_LEFT" || -z "$CERT_NOT_AFTER") ]]; then
+    CERT_VALID=0
+    CERT_PROBLEM='unexpected output from the certificate check'
+    CERT_CHECK_FAILED=1
+  fi
+  if [[ "$CERT_VALID" != 1 && -z "$CERT_PROBLEM" ]]; then
+    CERT_PROBLEM='unusable'
+  fi
+}
+
+# Decides from the probe and the certificate: USE_TLS ('1' or ''), CERT_NEEDED (1 when
+# host-setup --cert should issue or renew the certificate; never after a check that could not
+# run), PUBLIC_HOST (the name when there is one, else TS_IP) and PUBLIC_SCHEME. Uses HTTPS_MODE,
+# TS_NAME, TS_CERT_OK and TS_IP.
+refresh_certificate_state() {
+  USE_TLS=''
+  CERT_NEEDED=0
+  CERT_VALID=0
+  CERT_DAYS_LEFT=''
+  CERT_NOT_AFTER=''
+  CERT_PROBLEM=''
+  CERT_CHECK_FAILED=0
+  if [[ "$HTTPS_MODE" == auto && -n "$TS_NAME" ]]; then
+    inspect_certificate "$TS_NAME"
+    if [[ "$CERT_VALID" == 1 ]] && ((CERT_DAYS_LEFT > 0)) && [[ -f "$APP_DIR/compose.tls.yaml" ]]; then
+      USE_TLS=1
+    fi
+    if [[ "$TS_CERT_OK" == 1 && "$CERT_CHECK_FAILED" != 1 ]] && is_valid_gid "$(id -g)" &&
+      { [[ "$CERT_VALID" != 1 ]] || ((CERT_DAYS_LEFT < CERT_RENEW_DAYS)); }; then
+      CERT_NEEDED=1
+    fi
+  fi
+  PUBLIC_HOST="${TS_NAME:-$TS_IP}"
+  PUBLIC_SCHEME='http'
+  if [[ "$USE_TLS" == 1 ]]; then
+    PUBLIC_SCHEME='https'
+  fi
+}
+
+# $1: HTTPS mode (auto|off). Probes the name, then checks the certificate.
+resolve_https_state() {
+  HTTPS_MODE="$1"
+  HTTPS_KEPT=0
+  probe_tailscale_name
+  refresh_certificate_state
+}
+
+# True when the name probe or the certificate check could not answer (tailscale status timed out,
+# docker run failed, tailscaled not Running at the moment), unlike a definite state such as
+# MagicDNS being off or the certificate missing.
+https_check_failed() {
+  [[ "$TS_PROBE_FAILED" == 1 || "$CERT_CHECK_FAILED" == 1 ]]
+}
+
+https_check_error() {
+  if [[ "$TS_PROBE_FAILED" == 1 ]]; then
+    printf '%s\n' "${TS_NAME_REASON:-no answer from tailscale status}"
+  else
+    printf 'certificate %s\n' "${CERT_PROBLEM:-could not be checked}"
+  fi
+}
+
+# A host name rather than an address: all-digit labels such as 100.82.217.101 pass is_valid_fqdn
+# too, so the last label must contain a letter.
+is_dns_name() {
+  is_valid_fqdn "$1" && [[ "${1##*.}" == *[abcdefghijklmnopqrstuvwxyz]* ]]
+}
+
+# Reads the HTTPS values of the deployed runtime .env into KEPT_* and sets KEPT_OK=1 when they are
+# complete, consistent and deployed for the current TS_IP (a runtime .env from before the HTTPS
+# setting has none); returns 1 otherwise. Call it before anything rewrites the runtime .env.
+read_kept_https_state() {
+  local file="$APP_DIR/.env" not_after_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+  local -A kept_env=()
+  KEPT_OK=0
+  KEPT_MODE=''
+  KEPT_TLS=''
+  KEPT_NAME=''
+  KEPT_NOT_AFTER=''
+  KEPT_HOST="$TS_IP"
+  KEPT_SCHEME='http'
+  [[ -f "$file" && -r "$file" ]] || return 1
+  read_env_file "$file" kept_env
+  ((${#ENV_PARSE_ERRORS[@]} == 0)) || return 1
+  [[ "${kept_env[TS_IP]:-}" == "$TS_IP" ]] || return 1
+  case "${kept_env[HTTPS_MODE]:-}" in
+    auto | off) KEPT_MODE="${kept_env[HTTPS_MODE]}" ;;
+    *) return 1 ;;
+  esac
+  if [[ "${kept_env[TLS]:-}" == 1 ]]; then
+    if ! is_dns_name "${kept_env[TLS_NAME]:-}" ||
+      [[ "${kept_env[PUBLIC_HOST]:-}" != "${kept_env[TLS_NAME]}" || "${kept_env[PUBLIC_SCHEME]:-}" != https ||
+        "${kept_env[COMPOSE_FILE]:-}" != *compose.tls.yaml* || "${kept_env[TLS_DIR]:-}" != "$TLS_DIR" ||
+        ! "${kept_env[TLS_NOT_AFTER]:-}" =~ $not_after_re ]]; then
+      return 1
+    fi
+    KEPT_TLS=1
+    KEPT_NAME="${kept_env[TLS_NAME]}"
+    KEPT_NOT_AFTER="${kept_env[TLS_NOT_AFTER]}"
+    KEPT_HOST="$KEPT_NAME"
+    KEPT_SCHEME='https'
+  elif is_dns_name "${kept_env[PUBLIC_HOST]:-}"; then
+    KEPT_NAME="${kept_env[PUBLIC_HOST]}"
+    KEPT_HOST="$KEPT_NAME"
+  fi
+  KEPT_OK=1
+}
+
+# Puts the KEPT_* values in place of the probe results; no certificate step is asked for.
+apply_kept_https_state() {
+  HTTPS_MODE="$KEPT_MODE"
+  TS_NAME="$KEPT_NAME"
+  USE_TLS="$KEPT_TLS"
+  CERT_NOT_AFTER="$KEPT_NOT_AFTER"
+  PUBLIC_HOST="$KEPT_HOST"
+  PUBLIC_SCHEME="$KEPT_SCHEME"
+  CERT_NEEDED=0
+}
+
+# After resolve_https_state: a check that could not answer is no reason to switch the scheme or
+# the host, which recreates JupyterLab and ends its kernels. When read_kept_https_state found
+# usable values for the same mode ($1), they stay; otherwise the resolved fallback (HTTP) stays.
+# Either way no certificate step is asked for, and the next start or update checks again.
+keep_https_state_on_check_error() {
+  https_check_failed || return 0
+  CERT_NEEDED=0
+  if [[ "$KEPT_OK" == 1 && "$KEPT_MODE" == "$1" ]]; then
+    apply_kept_https_state
+    HTTPS_KEPT=1
+    warn "Could not check the Tailscale name or the HTTPS certificate ($(https_check_error)); keeping ${PUBLIC_SCHEME}://${PUBLIC_HOST} as deployed. The next start or update checks again."
+  else
+    warn "Could not check the Tailscale name or the HTTPS certificate ($(https_check_error)); using ${PUBLIC_SCHEME}://${PUBLIC_HOST} for now. The next start or update checks again."
+  fi
+}
+
+# One line describing how the pages are served, for the summary, start and status.
+https_description() {
+  local renewal=''
+  if [[ "$HTTPS_KEPT" == 1 ]]; then
+    printf 'unchanged, %s://%s as deployed (could not check: %s)\n' "$PUBLIC_SCHEME" "$PUBLIC_HOST" "$(https_check_error)"
+  elif [[ "$HTTPS_MODE" == off ]]; then
+    printf "off (HTTPS='off' in the settings); plain HTTP inside the Tailscale tunnel\n"
+  elif https_check_failed; then
+    printf 'could not be checked (%s); %s://%s for now\n' "$(https_check_error)" "$PUBLIC_SCHEME" "$PUBLIC_HOST"
+  elif [[ -z "$TS_NAME" ]]; then
+    printf 'not available: %s; HTTP by IP inside the Tailscale tunnel\n' "${TS_NAME_REASON:-no Tailscale name}"
+  elif [[ "$USE_TLS" == 1 ]]; then
+    if [[ "$CERT_NEEDED" == 1 ]]; then
+      renewal='; renewal due (root step)'
+    elif ((CERT_DAYS_LEFT < CERT_RENEW_DAYS)); then
+      renewal='; renewal due, but Tailscale cannot issue certificates right now'
+    fi
+    printf 'on, certificate for %s valid until %s (%s days left%s)\n' "$TS_NAME" "$CERT_NOT_AFTER" "$CERT_DAYS_LEFT" "$renewal"
+  elif [[ "$TS_CERT_OK" != 1 ]]; then
+    printf 'not available: %s; HTTP by name inside the Tailscale tunnel\n' "${TS_NAME_REASON:-no certificate}"
+  elif [[ "$CERT_VALID" == 1 ]]; then
+    printf 'certificate for %s valid until %s, but not in use yet; run update\n' "$TS_NAME" "$CERT_NOT_AFTER"
+  elif [[ "$CERT_PROBLEM" == missing ]]; then
+    printf 'certificate for %s missing; HTTP by name until the root step issues it\n' "$TS_NAME"
+  else
+    printf 'certificate for %s unusable (%s); HTTP by name until the root step replaces it\n' "$TS_NAME" "$CERT_PROBLEM"
+  fi
+}
+
+# Deploy/start log lines for the probe results.
+report_https_state() {
+  if [[ -n "$TS_NAME" ]]; then
+    info "Tailscale name: $TS_NAME"
+  else
+    info "No Tailscale name (${TS_NAME_REASON}); the pages are published by IP."
+  fi
+  info "HTTPS: $(https_description)"
+}
+
+# COMPOSE_FILE for the runtime .env; $1 GPU (1/0), $2 TLS ('1' or '').
+compose_file_value() {
+  local value='compose.yaml'
+  if [[ "$1" == 1 ]]; then
+    value+=':compose.gpu.yaml'
+  fi
+  if [[ "$2" == 1 ]]; then
+    value+=':compose.tls.yaml'
+  fi
+  printf '%s\n' "$value"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -671,7 +1106,7 @@ sync_stack() {
   install -d -m 700 -- "$APP_DIR" "$APP_DIR/secrets"
   chmod 700 -- "$APP_DIR" "$APP_DIR/secrets"
   rm -rf -- "$APP_DIR"/.sync-*
-  for name in Dockerfile compose.yaml compose.gpu.yaml; do
+  for name in Dockerfile compose.yaml compose.gpu.yaml compose.tls.yaml; do
     install -m 644 -- "$STACK_DIR/$name" "$APP_DIR/$name"
   done
   for name in jupyter stats theme; do
@@ -703,18 +1138,22 @@ sanitized_hostname() {
 
 # Content of APP_DIR/.env (CONTRACT.md). Every value single-quoted: Compose treats those
 # literally, so no $ or # in a value can be interpolated. No secrets are written here.
+# HTTPS values: PUBLIC_HOST/PUBLIC_SCHEME build the URLs; TLS='1' adds compose.tls.yaml, which
+# mounts TLS_DIR and names the files after TLS_NAME. TLS_NOT_AFTER changes with every renewed
+# certificate, which makes Compose recreate the two services so they load the new files.
 runtime_env_content() {
-  local gpu="$1" compose_file='compose.yaml' profiles=''
-  if [[ "$gpu" == 1 ]]; then
-    compose_file='compose.yaml:compose.gpu.yaml'
-  fi
+  local gpu="$1" profiles='' tls_name='' tls_not_after=''
   if [[ "$STATS_ENABLED" == 1 ]]; then
     profiles='stats'
+  fi
+  if [[ "$USE_TLS" == 1 ]]; then
+    tls_name="$TS_NAME"
+    tls_not_after="$CERT_NOT_AFTER"
   fi
   printf '%s\n' \
     "# Generated by setup-jupyterlab-tailscale.sh; do not edit. Change the settings file and run update." \
     "COMPOSE_PROJECT_NAME='${PROJECT}'" \
-    "COMPOSE_FILE='${compose_file}'" \
+    "COMPOSE_FILE='$(compose_file_value "$gpu" "$USE_TLS")'" \
     "COMPOSE_PROFILES='${profiles}'" \
     "TS_IP='${TS_IP}'" \
     "JUPYTER_PORT='${JUPYTER_PORT}'" \
@@ -724,7 +1163,37 @@ runtime_env_content() {
     "WORKSPACE_DIR='${WORKSPACE_DIR}'" \
     "HOST_NAME='$(sanitized_hostname)'" \
     "JLT_UID='$(id -u)'" \
-    "JLT_GID='$(id -g)'"
+    "JLT_GID='$(id -g)'" \
+    "HTTPS_MODE='${HTTPS_MODE}'" \
+    "PUBLIC_HOST='${PUBLIC_HOST:-$TS_IP}'" \
+    "PUBLIC_SCHEME='${PUBLIC_SCHEME}'" \
+    "TLS='${USE_TLS}'" \
+    "TLS_NAME='${tls_name}'" \
+    "TLS_NOT_AFTER='${tls_not_after}'" \
+    "TLS_DIR='${TLS_DIR}'"
+}
+
+# Dies unless the HTTPS values are safe to write into the single-quoted runtime .env.
+validate_https_values() {
+  case "$HTTPS_MODE" in
+    auto | off) ;;
+    *) die "Refusing to write an invalid HTTPS mode: $(printf '%q' "$HTTPS_MODE")" ;;
+  esac
+  if ! is_tailscale_ipv4 "${PUBLIC_HOST:-$TS_IP}" && ! is_valid_fqdn "${PUBLIC_HOST:-$TS_IP}"; then
+    die "Refusing to write an invalid public host: $(printf '%q' "$PUBLIC_HOST")"
+  fi
+  [[ "$PUBLIC_SCHEME" == http || "$PUBLIC_SCHEME" == https ]] ||
+    die "Refusing to write an invalid URL scheme: $(printf '%q' "$PUBLIC_SCHEME")"
+  is_safe_tls_dir "$TLS_DIR" ||
+    die "Refusing certificate directory $(printf '%q' "$TLS_DIR"): use an absolute path of letters, digits and . _ / -"
+  if [[ "$USE_TLS" == 1 ]]; then
+    is_valid_fqdn "$TS_NAME" || die "Refusing to enable HTTPS without a valid name: $(printf '%q' "$TS_NAME")"
+    [[ "$PUBLIC_SCHEME" == https && "$PUBLIC_HOST" == "$TS_NAME" ]] || die 'Inconsistent HTTPS state (scheme or host).'
+    [[ "$CERT_NOT_AFTER" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+      die "Refusing to write an invalid certificate expiry: $(printf '%q' "$CERT_NOT_AFTER")"
+  elif [[ -n "$USE_TLS" || "$PUBLIC_SCHEME" != http ]]; then
+    die 'Inconsistent HTTPS state (TLS off but scheme https).'
+  fi
 }
 
 write_runtime_env() {
@@ -732,6 +1201,7 @@ write_runtime_env() {
     die "Refusing workspace path with a quote, backslash or control character: $(printf '%q' "$WORKSPACE_DIR")"
   is_tailscale_ipv4 "$TS_IP" || die "Refusing to write an invalid Tailscale IPv4: $(printf '%q' "$TS_IP")"
   is_valid_theme_name "$THEME" || die "Refusing to write an invalid theme name: $(printf '%q' "$THEME")"
+  validate_https_values
   write_file_atomic "$APP_DIR/.env" 600 "$(runtime_env_content "$1")"$'\n'
 }
 
@@ -799,18 +1269,19 @@ ensure_runner_token() {
 }
 
 print_summary() {
-  local mode="$1" gpu="$2" cmd
+  local mode="$1" gpu="$2" cmd base
   cmd="$(script_cmd)"
+  base="${PUBLIC_SCHEME}://${PUBLIC_HOST:-$TS_IP}"
   printf '\n'
   if [[ "$mode" == install ]]; then
     info 'JupyterLab over Tailscale is installed and running.'
   else
     info 'JupyterLab over Tailscale is updated and running.'
   fi
-  printf '  JupyterLab:  http://%s:%s/lab\n' "$TS_IP" "$JUPYTER_PORT"
+  printf '  JupyterLab:  %s:%s/lab\n' "$base" "$JUPYTER_PORT"
   if [[ "$STATS_ENABLED" == 1 ]]; then
-    printf '  Statistics:  http://%s:%s/\n' "$TS_IP" "$STATS_PORT"
-    printf '  Packages:    http://%s:%s/dependencies\n' "$TS_IP" "$STATS_PORT"
+    printf '  Statistics:  %s:%s/\n' "$base" "$STATS_PORT"
+    printf '  Packages:    %s:%s/dependencies\n' "$base" "$STATS_PORT"
     printf '  Stats user:  %s\n' "$STATS_USER"
   else
     printf '  Statistics:  disabled (the Dependencies page too)\n'
@@ -824,6 +1295,13 @@ print_summary() {
   printf '  Settings:    %s\n' "$SETTINGS_FILE"
   printf '  Theme:       %s\n' "$THEME"
   printf '  GPU:         %s\n' "$([[ "$gpu" == 1 ]] && printf 'enabled' || printf 'not used')"
+  printf '  Address:     %s\n' "$TS_IP"
+  if [[ -n "$TS_NAME" ]]; then
+    printf '  Name:        %s\n' "$TS_NAME"
+  else
+    printf '  Name:        none (%s)\n' "${TS_NAME_REASON:-unknown}"
+  fi
+  printf '  HTTPS:       %s\n' "$(https_description)"
   if [[ "$JUPYTER_PASSWORD" == "$DEFAULT_PASSWORD" ]]; then
     printf '\n'
     warn "You are using the default password. Change JUPYTER_PASSWORD in $SETTINGS_FILE and run: $cmd update"
@@ -868,6 +1346,19 @@ deploy() {
     gpu=1
     info 'NVIDIA GPU available: both containers get access to it.'
   fi
+  # Until the name and the certificate are checked with the built image, the runtime .env keeps
+  # the deployed HTTPS values when they belong to this address: a failed build must not leave it
+  # pointing at http://<ip> while the running containers still serve HTTPS by name. A first
+  # install (or a new address) starts from plain HTTP on the IP.
+  HTTPS_MODE="$HTTPS"
+  TS_NAME=''
+  USE_TLS=''
+  CERT_NOT_AFTER=''
+  PUBLIC_HOST="$TS_IP"
+  PUBLIC_SCHEME='http'
+  if read_kept_https_state; then
+    apply_kept_https_state
+  fi
   write_runtime_env "$gpu"
 
   if [[ "$mode" == update ]]; then
@@ -883,6 +1374,13 @@ deploy() {
     gpu=0
     write_runtime_env 0
   fi
+
+  resolve_https_state "$HTTPS"
+  keep_https_state_on_check_error "$HTTPS"
+  ROOT_ATTEMPTED=0
+  early_root_step "$TS_IP" "${ports[@]}"
+  report_https_state
+  write_runtime_env "$gpu"
 
   ensure_secrets
 
@@ -904,7 +1402,9 @@ deploy() {
   info 'Starting containers and waiting until they are healthy...'
   compose "${up_args[@]}" || compose_failure 'The containers did not become healthy.'
 
-  maybe_root_step "$TS_IP" "${ports[@]}"
+  if ((!ROOT_ATTEMPTED)); then
+    maybe_root_step "$TS_IP" "${ports[@]}"
+  fi
 
   docker image prune -f --filter dangling=true \
     --filter "label=org.opencontainers.image.vendor=${PROJECT}" >/dev/null 2>&1 || true
@@ -936,6 +1436,21 @@ load_runtime_env() {
   if [[ "${RUNTIME_ENV[COMPOSE_FILE]:-}" == *compose.gpu.yaml* ]]; then
     DEPLOYED_GPU=1
   fi
+  # Empty for a runtime .env from before the HTTPS setting (HTTP on the IP, no name).
+  DEPLOYED_HTTPS_MODE="${RUNTIME_ENV[HTTPS_MODE]:-}"
+  [[ "$DEPLOYED_HTTPS_MODE" == auto || "$DEPLOYED_HTTPS_MODE" == off ]] || DEPLOYED_HTTPS_MODE=''
+  DEPLOYED_TLS=''
+  if [[ "${RUNTIME_ENV[TLS]:-}" == 1 && "${RUNTIME_ENV[COMPOSE_FILE]:-}" == *compose.tls.yaml* ]]; then
+    DEPLOYED_TLS=1
+  fi
+  DEPLOYED_PUBLIC_HOST="${RUNTIME_ENV[PUBLIC_HOST]:-}"
+  if ! is_valid_fqdn "$DEPLOYED_PUBLIC_HOST" && ! is_tailscale_ipv4 "$DEPLOYED_PUBLIC_HOST"; then
+    DEPLOYED_PUBLIC_HOST="$DEPLOYED_TS_IP"
+  fi
+  DEPLOYED_PUBLIC_SCHEME='http'
+  if [[ "$DEPLOYED_TLS" == 1 && "${RUNTIME_ENV[PUBLIC_SCHEME]:-}" == https ]]; then
+    DEPLOYED_PUBLIC_SCHEME='https'
+  fi
   if ! is_valid_port "$DEPLOYED_JUPYTER_PORT" || ! is_valid_port "$DEPLOYED_STATS_PORT"; then
     die "$file has invalid ports. Run: $(script_cmd) update"
   fi
@@ -949,17 +1464,27 @@ deployed_ports() {
   fi
 }
 
-# Rewrites only the TS_IP line of the runtime .env.
-set_runtime_ts_ip() {
-  local file="$APP_DIR/.env" line content='' found=0
+# Rewrites only the given KEY VALUE pairs of the runtime .env (single-quoted; missing keys are
+# appended). Callers validate the values.
+set_runtime_values() {
+  local file="$APP_DIR/.env" line key content=''
+  local -A pending=()
+  while (($# >= 2)); do
+    pending["$1"]="$2"
+    shift 2
+  done
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" == TS_IP=* ]]; then
-      line="TS_IP='$1'"
-      found=1
+    key="${line%%=*}"
+    if [[ "$line" == *=* && -n "${pending[$key]+set}" ]]; then
+      line="${key}='${pending[$key]}'"
+      unset 'pending[$key]'
     fi
     content+="$line"$'\n'
   done <"$file"
-  ((found)) || content+="TS_IP='$1'"$'\n'
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    content+="${key}='${pending[$key]}'"$'\n'
+  done < <(printf '%s\n' "${!pending[@]}" | sort)
   write_file_atomic "$file" 600 "$content"
 }
 
@@ -984,6 +1509,8 @@ settings_drift_warning() {
     differences+=("STATS_USER ${DEPLOYED_STATS_USER} -> ${STATS_USER}")
   [[ "$THEME" == "$DEPLOYED_THEME" ]] ||
     differences+=("THEME ${DEPLOYED_THEME} -> ${THEME}")
+  [[ "$HTTPS" == "$DEPLOYED_HTTPS_MODE" ]] ||
+    differences+=("HTTPS ${DEPLOYED_HTTPS_MODE:-(deployed before the setting existed)} -> ${HTTPS}")
   if [[ -r "$APP_DIR/secrets/jupyter_password" ]]; then
     current="$(<"$APP_DIR/secrets/jupyter_password")"
   fi
@@ -1029,12 +1556,14 @@ nonlocal_bind_value() {
   fi
 }
 
-# The root step is skipped when nothing would change: the sysctl is in place and either no
-# firewall is active or the recorded rules already match the wanted address and ports.
+# The root step is skipped when nothing would change: no certificate is due (CERT_NEEDED, see
+# refresh_certificate_state), the sysctl is in place and either no firewall is active or the
+# recorded rules already match the wanted address and ports.
 root_step_needed() {
   local ts_ip="$1" wanted firewall
   shift
   wanted="$(sorted_ports "$@")"
+  [[ "$CERT_NEEDED" != 1 ]] || return 0
   [[ -f "$SYSCTL_FILE" ]] || return 0
   [[ "$(nonlocal_bind_value)" == 1 ]] || return 0
   firewall="$(active_firewall)"
@@ -1058,6 +1587,9 @@ run_root() {
   if command -v sudo >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
     if [[ "$1" == host-setup ]]; then
       info "Root is needed once for host settings: net.ipv4.ip_nonlocal_bind=1 (so Docker can publish on the Tailscale IP even when tailscaled starts after Docker at boot) and, when a firewall is active, rules restricting the ports to ${TAILSCALE_IFACE}. sudo may ask for your password."
+      if [[ " $* " == *' --cert '* ]]; then
+        info "The same step issues or renews the HTTPS certificate for ${*: -2:1} with 'tailscale cert' into ${DEFAULT_TLS_DIR} (readable by your group)."
+      fi
     else
       info 'Root is needed to remove the host settings made by host-setup (sysctl file, firewall rules). sudo may ask for your password.'
     fi
@@ -1077,11 +1609,45 @@ run_root() {
   return 0
 }
 
+# host-setup arguments for the ports, plus the certificate pair when one is due.
+root_step_args() {
+  ROOT_ARGS=(host-setup "$@")
+  if [[ "$CERT_NEEDED" == 1 ]]; then
+    ROOT_ARGS+=(--cert "$TS_NAME" "$(id -g)")
+  fi
+}
+
+# True when run_root can run the step itself now (sudo from a terminal, or cached credentials)
+# instead of only printing ROOT_STEP_REQUIRED.
+root_runs_here() {
+  command -v sudo >/dev/null 2>&1 || return 1
+  [[ -t 0 && -t 1 ]] && return 0
+  sudo -n true >/dev/null 2>&1
+}
+
 maybe_root_step() {
   local ts_ip="$1"
   shift
   if root_step_needed "$ts_ip" "$@"; then
-    run_root host-setup "$ts_ip" "$@"
+    root_step_args "$ts_ip" "$@"
+    run_root "${ROOT_ARGS[@]}"
+  fi
+}
+
+# Before 'compose up': when the step can run here, run it now, so a new certificate is already
+# in place when the containers start; then check the certificate again. Otherwise the caller
+# deploys with what is usable now and maybe_root_step prints ROOT_STEP_REQUIRED afterwards.
+# Sets ROOT_ATTEMPTED=1 when the step ran (successfully or not), so it is not asked twice.
+early_root_step() {
+  local ts_ip="$1"
+  shift
+  if root_step_needed "$ts_ip" "$@" && root_runs_here; then
+    root_step_args "$ts_ip" "$@"
+    run_root "${ROOT_ARGS[@]}"
+    ROOT_ATTEMPTED=1
+    if [[ "$CERT_NEEDED" == 1 ]]; then
+      refresh_certificate_state
+    fi
   fi
 }
 
@@ -1237,10 +1803,134 @@ firewalld_apply() {
   printf 'Note: firewalld zones do not filter Docker-published ports; the password is the access control.\n'
 }
 
+# Warns when group $1 lets more than one account read the key: its members plus every account
+# with it as primary group (a shared group such as 'users' instead of a per-user group).
+root_warn_shared_key_group() {
+  local gid="$1" entry name _password _uid primary _rest shown
+  local -a members=()
+  local -A readers=()
+  entry="$(getent group "$gid" 2>/dev/null)" || entry=''
+  if [[ -n "$entry" ]]; then
+    IFS=',' read -r -a members <<<"${entry##*:}"
+    for name in "${members[@]}"; do
+      if [[ -n "$name" ]]; then
+        readers["$name"]=1
+      fi
+    done
+  fi
+  while IFS=: read -r name _password _uid primary _rest; do
+    if [[ -n "$name" && "$primary" == "$gid" ]]; then
+      readers["$name"]=1
+    fi
+  done < <(getent passwd 2>/dev/null || true)
+  ((${#readers[@]} > 1)) || return 0
+  shown="$(printf '%s\n' "${!readers[@]}" | sort | head -n 8 | tr '\n' ' ')"
+  warn "Group ${gid} is shared by ${#readers[@]} accounts ($(clean_text "${shown% }")): each of them can read the HTTPS private key in ${TLS_DIR}. Give your account its own primary group to keep the key private."
+}
+
+# host-setup --cert: 'tailscale cert' for the full MagicDNS name into TLS_DIR (root:<gid> 0750,
+# certificate 0644, key 0640: the containers run with the desktop user's gid). Files for other
+# names are removed. Returns 1 with the reason printed when no certificate could be written.
+# It runs as an 'if' condition, where set -e does not apply: every step checks its own result,
+# and the previous files stay until both new ones are complete.
+root_issue_certificate() {
+  local name="$1" gid="$2" output tmp_crt='' tmp_key='' path base
+  local help='Check in the Tailscale admin console (https://login.tailscale.com/admin/dns) that MagicDNS and HTTPS Certificates are enabled, and that this machine is logged in (tailscale status).'
+  if [[ -L "$ROOT_STATE_DIR" || -L "$TLS_DIR" ]]; then
+    warn "Refusing to write certificates: $ROOT_STATE_DIR or $TLS_DIR is a symbolic link."
+    return 1
+  fi
+  if [[ -e "$ROOT_STATE_DIR" && ! -d "$ROOT_STATE_DIR" ]] || [[ -e "$TLS_DIR" && ! -d "$TLS_DIR" ]]; then
+    warn "Refusing to write certificates: $ROOT_STATE_DIR or $TLS_DIR exists but is not a directory."
+    return 1
+  fi
+  if ! command -v tailscale >/dev/null 2>&1; then
+    warn "tailscale not found in root's PATH; no certificate for ${name}."
+    return 1
+  fi
+  if [[ ! -d "$ROOT_STATE_DIR" ]] && ! mkdir -m 755 -- "$ROOT_STATE_DIR"; then
+    warn "Could not create $ROOT_STATE_DIR; no certificate for ${name}."
+    return 1
+  fi
+  if [[ ! -d "$TLS_DIR" ]] && ! mkdir -m 750 -- "$TLS_DIR"; then
+    warn "Could not create $TLS_DIR; no certificate for ${name}."
+    return 1
+  fi
+  if ! chown -h "root:${gid}" -- "$TLS_DIR" || ! chmod 750 -- "$TLS_DIR"; then
+    warn "Could not give $TLS_DIR owner root:${gid} and mode 0750; no certificate for ${name}."
+    return 1
+  fi
+  # Without both temp names the call below would be a bare 'tailscale cert', which writes a
+  # root-only key into the working directory (TLS_DIR) over the group-readable one.
+  if ! tmp_crt="$(mktemp "$TLS_DIR/.${name}.crt.XXXXXX")" || [[ -z "$tmp_crt" ]] ||
+    ! tmp_key="$(mktemp "$TLS_DIR/.${name}.key.XXXXXX")" || [[ -z "$tmp_key" ]]; then
+    rm -f -- ${tmp_crt:+"$tmp_crt"} ${tmp_key:+"$tmp_key"}
+    warn "Could not create temporary files in $TLS_DIR (disk or inodes full?); no certificate for ${name}."
+    return 1
+  fi
+  # Always the full name and both file flags: a bare 'tailscale cert <name>' writes into the
+  # working directory, and the short node name is refused. --min-validity: see CERT_RENEW_DAYS.
+  # Run from TLS_DIR all the same.
+  if ! output="$(cd -- "$TLS_DIR" && tailscale cert --cert-file "$tmp_crt" --key-file "$tmp_key" \
+    --min-validity "$CERT_MIN_VALIDITY" "$name" 2>&1)"; then
+    rm -f -- "$tmp_crt" "$tmp_key"
+    printf '%s\n' "$output" | sed 's/^/  tailscale cert: /' >&2
+    warn "tailscale cert could not issue a certificate for ${name}. ${help}"
+    return 1
+  fi
+  if [[ ! -s "$tmp_crt" || ! -s "$tmp_key" ]]; then
+    rm -f -- "$tmp_crt" "$tmp_key"
+    warn "tailscale cert reported success but wrote no certificate for ${name}. ${help}"
+    return 1
+  fi
+  if ! chown "root:${gid}" -- "$tmp_crt" "$tmp_key" || ! chmod 644 -- "$tmp_crt" || ! chmod 640 -- "$tmp_key"; then
+    rm -f -- "$tmp_crt" "$tmp_key"
+    warn "Could not set owner root:${gid} and modes 0644/0640 on the new certificate for ${name}; the previous files are unchanged."
+    return 1
+  fi
+  # Two renames cannot happen at once: a service starting in between sees a mismatched pair,
+  # exits and is started again by its restart policy.
+  if ! mv -f -- "$tmp_key" "$TLS_DIR/${name}.key"; then
+    rm -f -- "$tmp_crt" "$tmp_key"
+    warn "Could not move the new key for ${name} into place; the previous files are unchanged."
+    return 1
+  fi
+  if ! mv -f -- "$tmp_crt" "$TLS_DIR/${name}.crt"; then
+    rm -f -- "$tmp_crt"
+    warn "Could not move the new certificate for ${name} into place after its key: the two files no longer match. Run host-setup again."
+    return 1
+  fi
+  for path in "$TLS_DIR"/* "$TLS_DIR"/.[!.]*; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    base="${path##*/}"
+    case "$base" in
+      "${name}.crt" | "${name}.key") ;;
+      *.crt | *.key | .*.crt.* | .*.key.*)
+        if [[ -f "$path" || -L "$path" ]] && rm -f -- "$path"; then
+          printf 'tls: removed %s\n' "$path"
+        fi
+        ;;
+    esac
+  done
+  printf 'tls: certificate for %s in %s (root:%s, certificate 0644, key 0640)\n' "$name" "$TLS_DIR" "$gid"
+  root_warn_shared_key_group "$gid"
+}
+
 cmd_host_setup() {
   root_prepare host-setup
+  local usage='Usage: host-setup <tailscale-ipv4> <port> [<port>] [--cert <magicdns-name> <gid>]'
+  local cert_name='' cert_gid='' cert_failed=0 tls_name tls_gid
+  # The certificate pair is optional and always last.
+  if (($# >= 5)) && [[ "${*: -3:1}" == --cert ]]; then
+    cert_name="${*: -2:1}"
+    cert_gid="${*: -1}"
+    set -- "${@:1:$#-3}"
+    is_valid_fqdn "$cert_name" ||
+      die "host-setup: $(printf '%q' "$cert_name") is not a full MagicDNS name (e.g. host.tailnet.ts.net)"
+    is_valid_gid "$cert_gid" || die "host-setup: $(printf '%q' "$cert_gid") is not a group id from 1 to 4294967294"
+  fi
   if (($# < 2 || $# > 3)); then
-    die 'Usage: host-setup <tailscale-ipv4> <port> [<port>]'
+    die "$usage"
   fi
   local ts_ip="$1" port ports previous_ports previous_firewall previous_bind previous_zone firewall='none'
   local state port_word
@@ -1264,6 +1954,13 @@ cmd_host_setup() {
   previous_firewall="${ROOT_STATE[FIREWALL]:-none}"
   previous_zone="${ROOT_STATE[FIREWALLD_ZONE]:-}"
   previous_bind="${ROOT_STATE[PREV_NONLOCAL_BIND]:-}"
+  # Without --cert an existing certificate stays as it is, and so does its record.
+  tls_name="${ROOT_STATE[TLS_NAME]:-}"
+  tls_gid="${ROOT_STATE[TLS_GID]:-}"
+  if ! is_valid_fqdn "$tls_name" || ! is_valid_gid "$tls_gid"; then
+    tls_name=''
+    tls_gid=''
+  fi
 
   # a) Boot race: see the comment written into the sysctl file.
   if [[ ! "$previous_bind" =~ ^[01]$ ]]; then
@@ -1307,7 +2004,18 @@ cmd_host_setup() {
     after_rules_write_block "$ts_ip"
   fi
 
-  # e) State for the unprivileged commands and for teardown.
+  # e) HTTPS certificate for the MagicDNS name. A failure is reported, and the exit status says
+  #    so, but the settings above stay applied.
+  if [[ -n "$cert_name" ]]; then
+    if root_issue_certificate "$cert_name" "$cert_gid"; then
+      tls_name="$cert_name"
+      tls_gid="$cert_gid"
+    else
+      cert_failed=1
+    fi
+  fi
+
+  # f) State for the unprivileged commands and for teardown.
   state="$(printf '%s\n' \
     '# Managed by setup-jupyterlab-tailscale.sh host-setup; read by the unprivileged commands.' \
     "TS_IP='${ts_ip}'" \
@@ -1317,10 +2025,21 @@ cmd_host_setup() {
   if [[ "$firewall" == firewalld && -n "${FIREWALLD_ZONE_USED:-}" ]]; then
     state+="FIREWALLD_ZONE='${FIREWALLD_ZONE_USED}'"$'\n'
   fi
+  if [[ -n "$tls_name" ]]; then
+    state+="TLS_NAME='${tls_name}'"$'\n'"TLS_GID='${tls_gid}'"$'\n'
+  fi
+  if [[ -L "$ROOT_STATE_DIR" ]]; then
+    die "host-setup: $ROOT_STATE_DIR is a symbolic link; refusing to write the state file."
+  fi
   install -d -m 755 "$ROOT_STATE_DIR"
   chmod 755 "$ROOT_STATE_DIR"
   write_file_atomic "$ROOT_STATE_FILE" 644 "$state" root:root
-  printf 'host-setup done: %s, ports %s, firewall %s\n' "$ts_ip" "$ports" "$firewall"
+  if ((cert_failed)); then
+    # The builder looks for "but no certificate for" to say that only the certificate failed.
+    die "host-setup: sysctl and firewall settings applied (${ts_ip}, ports ${ports}, firewall ${firewall}), but no certificate for ${cert_name}; see above."
+  fi
+  printf 'host-setup done: %s, ports %s, firewall %s%s\n' "$ts_ip" "$ports" "$firewall" \
+    "${cert_name:+, certificate for ${cert_name}}"
 }
 
 cmd_host_teardown() {
@@ -1374,7 +2093,21 @@ cmd_host_teardown() {
     sysctl -q -w "net.ipv4.ip_nonlocal_bind=${previous_bind}"
     printf 'sysctl: net.ipv4.ip_nonlocal_bind restored to %s\n' "$previous_bind"
   fi
-  if [[ -d "$ROOT_STATE_DIR" ]]; then
+  # Certificates first (not following a symlink), then the state directory around them.
+  if [[ -L "$TLS_DIR" ]]; then
+    rm -f -- "$TLS_DIR"
+    printf 'Removed the symbolic link %s\n' "$TLS_DIR"
+    removed=1
+  elif [[ -d "$TLS_DIR" ]]; then
+    rm -rf -- "$TLS_DIR"
+    printf 'Removed %s (HTTPS certificates)\n' "$TLS_DIR"
+    removed=1
+  fi
+  if [[ -L "$ROOT_STATE_DIR" ]]; then
+    rm -f -- "$ROOT_STATE_DIR"
+    printf 'Removed the symbolic link %s\n' "$ROOT_STATE_DIR"
+    removed=1
+  elif [[ -d "$ROOT_STATE_DIR" ]]; then
     rm -rf -- "$ROOT_STATE_DIR"
     printf 'Removed %s\n' "$ROOT_STATE_DIR"
     removed=1
@@ -1413,28 +2146,75 @@ cmd_update() {
   deploy update
 }
 
+# start follows the Tailscale name and the certificate for deployments with the HTTPS setting:
+# rewrites the published address and TLS values when they changed (a renewed certificate
+# included), so 'up' recreates the services with them. A check that could not answer changes
+# nothing (keep_https_state_on_check_error).
+start_follow_https() {
+  local tls_name='' tls_not_after='' compose_file
+  local -a values
+  read_kept_https_state || true
+  resolve_https_state "$DEPLOYED_HTTPS_MODE"
+  keep_https_state_on_check_error "$DEPLOYED_HTTPS_MODE"
+  early_root_step "$TS_IP" "${ports[@]}"
+  report_https_state
+  if [[ "$USE_TLS" == 1 ]]; then
+    tls_name="$TS_NAME"
+    tls_not_after="$CERT_NOT_AFTER"
+  fi
+  compose_file="$(compose_file_value "$DEPLOYED_GPU" "$USE_TLS")"
+  validate_https_values
+  values=(COMPOSE_FILE "$compose_file" PUBLIC_HOST "$PUBLIC_HOST" PUBLIC_SCHEME "$PUBLIC_SCHEME"
+    TLS "$USE_TLS" TLS_NAME "$tls_name" TLS_NOT_AFTER "$tls_not_after" TLS_DIR "$TLS_DIR")
+  if [[ "${RUNTIME_ENV[COMPOSE_FILE]:-}" != "$compose_file" || "${RUNTIME_ENV[PUBLIC_HOST]:-}" != "$PUBLIC_HOST" ||
+    "${RUNTIME_ENV[PUBLIC_SCHEME]:-}" != "$PUBLIC_SCHEME" || "${RUNTIME_ENV[TLS]:-}" != "$USE_TLS" ||
+    "${RUNTIME_ENV[TLS_NAME]:-}" != "$tls_name" || "${RUNTIME_ENV[TLS_NOT_AFTER]:-}" != "$tls_not_after" ||
+    "${RUNTIME_ENV[TLS_DIR]:-}" != "$TLS_DIR" ]]; then
+    set_runtime_values "${values[@]}"
+    if [[ "$DEPLOYED_PUBLIC_SCHEME://$DEPLOYED_PUBLIC_HOST" != "$PUBLIC_SCHEME://$PUBLIC_HOST" ]]; then
+      info "Published address changed from ${DEPLOYED_PUBLIC_SCHEME}://${DEPLOYED_PUBLIC_HOST} to ${PUBLIC_SCHEME}://${PUBLIC_HOST}; updated $APP_DIR/.env (the services are recreated)."
+    else
+      info "HTTPS certificate or settings changed; updated $APP_DIR/.env (the services are recreated to load them)."
+    fi
+  fi
+}
+
 cmd_start() {
-  local ports
+  local ports base
   refuse_root
   require_installed
   require_docker
   load_runtime_env
   wait_for_tailscale 60
   if [[ "$TS_IP" != "$DEPLOYED_TS_IP" ]]; then
-    set_runtime_ts_ip "$TS_IP"
+    set_runtime_values TS_IP "$TS_IP"
     info "Tailscale IPv4 changed from ${DEPLOYED_TS_IP:-<none>} to ${TS_IP}; updated $APP_DIR/.env (the containers are recreated on the new address)."
+    if [[ "$DEPLOYED_PUBLIC_HOST" == "$DEPLOYED_TS_IP" ]]; then
+      DEPLOYED_PUBLIC_HOST="$TS_IP"
+    fi
     DEPLOYED_TS_IP="$TS_IP"
   fi
   read -r -a ports <<<"$(deployed_ports)"
-  maybe_root_step "$TS_IP" "${ports[@]}"
+  ROOT_ATTEMPTED=0
+  if [[ -n "$DEPLOYED_HTTPS_MODE" ]]; then
+    start_follow_https
+  else
+    # Deployed before the HTTPS setting: HTTP on the IP until the next update.
+    PUBLIC_HOST="$TS_IP"
+    PUBLIC_SCHEME='http'
+  fi
+  if ((!ROOT_ATTEMPTED)); then
+    maybe_root_step "$TS_IP" "${ports[@]}"
+  fi
   info 'Starting containers and waiting until they are healthy...'
   compose up -d --remove-orphans --wait --wait-timeout 180 ||
     compose_failure 'The containers did not become healthy.'
+  base="${PUBLIC_SCHEME}://${PUBLIC_HOST}"
   info 'Running:'
-  printf '  JupyterLab:  http://%s:%s/lab\n' "$TS_IP" "$DEPLOYED_JUPYTER_PORT"
+  printf '  JupyterLab:  %s:%s/lab\n' "$base" "$DEPLOYED_JUPYTER_PORT"
   if [[ "$DEPLOYED_STATS_ENABLED" == 1 ]]; then
-    printf '  Statistics:  http://%s:%s/  (user %s)\n' "$TS_IP" "$DEPLOYED_STATS_PORT" "$DEPLOYED_STATS_USER"
-    printf '  Packages:    http://%s:%s/dependencies\n' "$TS_IP" "$DEPLOYED_STATS_PORT"
+    printf '  Statistics:  %s:%s/  (user %s)\n' "$base" "$DEPLOYED_STATS_PORT" "$DEPLOYED_STATS_USER"
+    printf '  Packages:    %s:%s/dependencies\n' "$base" "$DEPLOYED_STATS_PORT"
   fi
   settings_drift_warning
 }
@@ -1509,7 +2289,7 @@ show_containers() {
 }
 
 cmd_status() {
-  local mode firewall bind live_ip='' ports
+  local mode firewall bind live_ip='' ports base docker_ok=0
   refuse_root
   if [[ -f "$SETTINGS_FILE" ]]; then
     mode="$(stat -L -c '%a' -- "$SETTINGS_FILE")"
@@ -1546,16 +2326,46 @@ cmd_status() {
 
   printf 'Containers:\n'
   if docker_usable; then
+    docker_ok=1
     show_containers
   else
     printf '  Docker is not reachable (daemon down, or not in the docker group yet).\n'
   fi
 
+  # Live name and certificate (both need the JupyterLab image), compared with the deployment.
+  TS_IP="${live_ip:-$DEPLOYED_TS_IP}"
+  HTTPS_MODE="${DEPLOYED_HTTPS_MODE:-$DEFAULT_HTTPS}"
+  if ((docker_ok)) && [[ -n "$TS_IP" ]]; then
+    resolve_https_state "$HTTPS_MODE"
+    if [[ -n "$TS_NAME" ]]; then
+      printf 'Name:              %s\n' "$TS_NAME"
+    elif [[ "$TS_PROBE_FAILED" == 1 ]]; then
+      printf 'Name:              unknown (%s)\n' "$TS_NAME_REASON"
+    else
+      printf 'Name:              none (%s)\n' "$TS_NAME_REASON"
+    fi
+    if [[ -z "$DEPLOYED_HTTPS_MODE" ]]; then
+      printf "HTTPS:             not deployed yet (deployed before the HTTPS setting); run '%s update'\n" "$(script_cmd)"
+    elif https_check_failed; then
+      printf 'HTTPS:             could not be checked right now (%s); deployed %s://%s\n' "$(https_check_error)" \
+        "$DEPLOYED_PUBLIC_SCHEME" "$DEPLOYED_PUBLIC_HOST"
+    else
+      printf 'HTTPS:             %s\n' "$(https_description)"
+      if [[ "$DEPLOYED_PUBLIC_SCHEME://$DEPLOYED_PUBLIC_HOST" != "$PUBLIC_SCHEME://$PUBLIC_HOST" ]]; then
+        warn "Deployed as ${DEPLOYED_PUBLIC_SCHEME}://${DEPLOYED_PUBLIC_HOST}, but ${PUBLIC_SCHEME}://${PUBLIC_HOST} applies now; run '$(script_cmd) restart' to follow."
+      fi
+    fi
+  else
+    printf 'Name:              unknown (the check needs Docker and the Tailscale IPv4); deployed host %s\n' "${DEPLOYED_PUBLIC_HOST:-<none>}"
+    printf 'HTTPS:             deployed %s\n' "$([[ "$DEPLOYED_TLS" == 1 ]] && printf 'on (%s)' "${RUNTIME_ENV[TLS_NAME]:-?}" || printf 'off')"
+  fi
+
   printf 'URLs:\n'
-  printf '  JupyterLab:  http://%s:%s/lab\n' "${DEPLOYED_TS_IP:-<ts-ip>}" "$DEPLOYED_JUPYTER_PORT"
+  base="${DEPLOYED_PUBLIC_SCHEME}://${DEPLOYED_PUBLIC_HOST:-<ts-ip>}"
+  printf '  JupyterLab:  %s:%s/lab\n' "$base" "$DEPLOYED_JUPYTER_PORT"
   if [[ "$DEPLOYED_STATS_ENABLED" == 1 ]]; then
-    printf '  Statistics:  http://%s:%s/\n' "${DEPLOYED_TS_IP:-<ts-ip>}" "$DEPLOYED_STATS_PORT"
-    printf '  Packages:    http://%s:%s/dependencies\n' "${DEPLOYED_TS_IP:-<ts-ip>}" "$DEPLOYED_STATS_PORT"
+    printf '  Statistics:  %s:%s/\n' "$base" "$DEPLOYED_STATS_PORT"
+    printf '  Packages:    %s:%s/dependencies\n' "$base" "$DEPLOYED_STATS_PORT"
   fi
 
   bind="$(nonlocal_bind_value)"
@@ -1569,15 +2379,17 @@ cmd_status() {
   esac
   read_root_state
   if [[ -f "$ROOT_STATE_FILE" ]]; then
-    printf '  Root state:        TS_IP=%s PORTS=%s FIREWALL=%s\n' \
-      "${ROOT_STATE[TS_IP]:-?}" "${ROOT_STATE[PORTS]:-?}" "${ROOT_STATE[FIREWALL]:-?}"
+    printf '  Root state:        TS_IP=%s PORTS=%s FIREWALL=%s%s\n' \
+      "${ROOT_STATE[TS_IP]:-?}" "${ROOT_STATE[PORTS]:-?}" "${ROOT_STATE[FIREWALL]:-?}" \
+      "${ROOT_STATE[TLS_NAME]:+ TLS_NAME=${ROOT_STATE[TLS_NAME]}}"
   else
     printf '  Root state:        none (%s missing; host-setup has not run)\n' "$ROOT_STATE_FILE"
   fi
+  printf '  Certificates:      %s (%s)\n' "$TLS_DIR" "$([[ -d "$TLS_DIR" ]] && printf 'present' || printf 'missing')"
   read -r -a ports <<<"$(deployed_ports)"
   if root_step_needed "${live_ip:-$DEPLOYED_TS_IP}" "${ports[@]}"; then
-    printf "  Root step needed:  yes -> sudo %s host-setup %s %s\n" \
-      "$(printf '%q' "$SCRIPT_PATH")" "${live_ip:-$DEPLOYED_TS_IP}" "${ports[*]}"
+    root_step_args "${live_ip:-$DEPLOYED_TS_IP}" "${ports[@]}"
+    printf "  Root step needed:  yes -> sudo %s %s\n" "$(printf '%q' "$SCRIPT_PATH")" "${ROOT_ARGS[*]}"
   else
     printf '  Root step needed:  no\n'
   fi
@@ -1667,7 +2479,7 @@ cmd_uninstall() {
     warn 'Docker is not reachable; skipping container cleanup (nothing appears to be deployed).'
   fi
 
-  if [[ -e "$SYSCTL_FILE" || -e "$ROOT_STATE_FILE" ]]; then
+  if [[ -e "$SYSCTL_FILE" || -e "$ROOT_STATE_FILE" || -e "$DEFAULT_TLS_DIR" ]]; then
     run_root host-teardown
   fi
 
@@ -1705,7 +2517,8 @@ usage() {
   cmd="$(script_cmd)"
   cat <<EOF
 JupyterLab over Tailscale: JupyterLab and a statistics dashboard in Docker,
-published only on this machine's Tailscale IPv4 address.
+published only on this machine's Tailscale IPv4 address, reachable by its MagicDNS name
+and served over HTTPS when the tailnet allows it.
 
 Usage: $cmd <command> [options]
 
@@ -1714,7 +2527,8 @@ Commands:
                                      with defaults when it is missing.
   update                             Apply changed settings and refresh the base image
                                      (docker compose build --pull).
-  start                              Start the containers; follows a changed Tailscale IP.
+  start                              Start the containers; follows a changed Tailscale IP,
+                                     name or certificate (renewed when due).
   stop                               Stop the containers.
   restart                            stop, then start.
   status                             Deployment, containers, addresses, firewall
@@ -1728,25 +2542,36 @@ Commands:
   help                               Show this help.
 
 Root-only helpers (run through sudo by the commands above, or pkexec by the builder):
-  host-setup <tailscale-ipv4> <port> [<port>]
+  host-setup <tailscale-ipv4> <port> [<port>] [--cert <magicdns-name> <gid>]
                                      net.ipv4.ip_nonlocal_bind=1 and, when ufw/firewalld is
                                      active, rules limiting the ports to ${TAILSCALE_IFACE}.
-  host-teardown                      Undo host-setup.
+                                     --cert: 'tailscale cert' for the full MagicDNS name into
+                                     ${DEFAULT_TLS_DIR} (group <gid> may read the key).
+  host-teardown                      Undo host-setup, certificates included.
 
 Settings file: $SETTINGS_FILE
   JUPYTER_PASSWORD, JUPYTER_PORT (8888), STATS_ENABLED (1), STATS_PORT (8889), STATS_USER (jupyter),
-  THEME (amazing; a file name from stack/theme without .json)
+  THEME (amazing; a file name from stack/theme without .json),
+  HTTPS (auto | off; default auto)
 
-Pages:
-  http://<tailscale-ip>:<JUPYTER_PORT>/lab           JupyterLab
-  http://<tailscale-ip>:<STATS_PORT>/                Statistics      (when STATS_ENABLED=1)
-  http://<tailscale-ip>:<STATS_PORT>/dependencies    Kernel packages (when STATS_ENABLED=1)
+HTTPS='auto': when MagicDNS and HTTPS Certificates are enabled in the tailnet (Tailscale admin
+console, DNS page), the root step issues a certificate for <name>.<tailnet>.ts.net and renews it
+when fewer than ${CERT_RENEW_DAYS} days are left (on install, update and start); JupyterLab and
+the dashboard then serve HTTPS on the same ports. Without a certificate the pages stay on HTTP:
+by name when MagicDNS works, else by IP. HTTPS='off' always uses HTTP.
+
+Pages (<host>: the MagicDNS name, else the Tailscale IP; https when a certificate is in use):
+  http(s)://<host>:<JUPYTER_PORT>/lab           JupyterLab
+  http(s)://<host>:<STATS_PORT>/                Statistics      (when STATS_ENABLED=1)
+  http(s)://<host>:<STATS_PORT>/dependencies    Kernel packages (when STATS_ENABLED=1)
 
 Environment overrides:
   JLT_SETTINGS_FILE   settings file              (default: <script dir>/.env)
   JLT_APP_DIR         deployed stack directory   (default: ~/.local/share/${PROJECT})
   JLT_WORKSPACE_DIR   notebook workspace         (default: ~/jupyter-workspace)
   JLT_GPU             auto | on | off            (default: auto)
+  JLT_TLS_DIR         certificate directory, for tests only; host-setup always writes
+                      ${DEFAULT_TLS_DIR}
 EOF
 }
 
