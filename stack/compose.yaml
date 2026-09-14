@@ -56,12 +56,9 @@ services:
         target: /opt/custom
         read_only: true
     healthcheck:
-      # GET /api is unauthenticated in jupyter_server; the slim image has no curl.
-      test:
-        - CMD
-        - python
-        - -c
-        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8888/api', timeout=4).status == 200 else 1)"
+      # GET /api is unauthenticated in jupyter_server; the slim image has no curl. The
+      # script follows HTTP or HTTPS (compose.tls.yaml).
+      test: ["CMD", "python", "/srv/jupyter/jupyter_healthcheck.py"]
       interval: 30s
       timeout: 5s
       start_period: 60s
@@ -152,9 +149,13 @@ services:
     environment:
       STATS_USER: "${STATS_USER:-jupyter}"
       JUPYTER_PASSWORD_FILE: /run/secrets/jupyter_password
+      # compose.tls.yaml switches this to https.
       JUPYTER_INTERNAL_URL: http://jupyterlab:8888
-      JUPYTER_PUBLIC_URL: "http://${TS_IP}:${JUPYTER_PORT}/lab"
-      STATS_PUBLIC_URL: "http://${TS_IP}:${STATS_PORT}/"
+      # Links as the browser sees them: the MagicDNS name when there is one, https when a
+      # certificate is in use (PUBLIC_* from .env; the defaults cover an older .env).
+      PUBLIC_SCHEME: "${PUBLIC_SCHEME:-http}"
+      JUPYTER_PUBLIC_URL: "${PUBLIC_SCHEME:-http}://${PUBLIC_HOST:-${TS_IP}}:${JUPYTER_PORT}/lab"
+      STATS_PUBLIC_URL: "${PUBLIC_SCHEME:-http}://${PUBLIC_HOST:-${TS_IP}}:${STATS_PORT}/"
       # The Dependencies page proxies to the runner; it copes with the runner being down.
       DEPS_INTERNAL_URL: http://deps:8890
       DEPS_TOKEN_FILE: /run/secrets/deps_token

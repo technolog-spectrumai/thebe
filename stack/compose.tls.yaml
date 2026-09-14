@@ -1,0 +1,39 @@
+# HTTPS override, used through COMPOSE_FILE='compose.yaml[:compose.gpu.yaml]:compose.tls.yaml'
+# only when setup-jupyterlab-tailscale.sh finds a valid certificate for this machine's
+# MagicDNS name in TLS_DIR (written by 'host-setup --cert' with 'tailscale cert'). JupyterLab
+# and the dashboard then serve HTTPS on their usual ports; deps stays internal and plain.
+#
+# TLS_DIR is mounted as a directory, read-only: host-setup renames renewed files into it,
+# and a file bind mount would keep showing the old inode. The key is root:<gid> 0640, and
+# the containers run with that gid. TLS_NOT_AFTER changes with each renewal, so Compose
+# recreates both services and they load the new certificate.
+services:
+  jupyterlab:
+    environment:
+      JLT_TLS_CERT: "/run/tls/${TLS_NAME:?TLS_NAME missing - run setup-jupyterlab-tailscale.sh update}.crt"
+      JLT_TLS_KEY: "/run/tls/${TLS_NAME:?TLS_NAME missing - run setup-jupyterlab-tailscale.sh update}.key"
+      JLT_TLS_NOT_AFTER: "${TLS_NOT_AFTER:-}"
+    volumes:
+      # Long syntax: a missing directory is an error instead of an empty root-owned one.
+      - type: bind
+        source: "${TLS_DIR:?TLS_DIR missing - run setup-jupyterlab-tailscale.sh update}"
+        target: /run/tls
+        read_only: true
+        bind:
+          create_host_path: false
+
+  stats:
+    environment:
+      JLT_TLS_CERT: "/run/tls/${TLS_NAME:?TLS_NAME missing - run setup-jupyterlab-tailscale.sh update}.crt"
+      JLT_TLS_KEY: "/run/tls/${TLS_NAME:?TLS_NAME missing - run setup-jupyterlab-tailscale.sh update}.key"
+      JLT_TLS_NOT_AFTER: "${TLS_NOT_AFTER:-}"
+      # JupyterLab speaks HTTPS now; the certificate names the public MagicDNS host, not
+      # 'jupyterlab', so the dashboard's internal client does not verify it.
+      JUPYTER_INTERNAL_URL: https://jupyterlab:8888
+    volumes:
+      - type: bind
+        source: "${TLS_DIR:?TLS_DIR missing - run setup-jupyterlab-tailscale.sh update}"
+        target: /run/tls
+        read_only: true
+        bind:
+          create_host_path: false

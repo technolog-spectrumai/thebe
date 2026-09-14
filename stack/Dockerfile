@@ -58,7 +58,8 @@ RUN python -m ipykernel install --prefix /usr/local --name python3 \
 # directories COPY creates, leaving /srv/jupyter without the search bit. This gives
 # directories 755 and the files 644 whatever their mode in the app dir.
 COPY --chmod=u=rwX,go=rX jupyter/jupyter_server_config.py /srv/jupyter/jupyter_server_config.py
-COPY --chmod=u=rwX,go=rX jupyter/kernel_launcher.py jupyter/deps_runner.py jupyter/deps_healthcheck.py /srv/jupyter/
+COPY --chmod=u=rwX,go=rX jupyter/kernel_launcher.py jupyter/deps_runner.py jupyter/deps_healthcheck.py \
+     jupyter/jupyter_healthcheck.py /srv/jupyter/
 
 # Mount points owned by the container user: Docker initialises an empty named volume
 # with the ownership of the image directory it is mounted over (custom_packages at
@@ -76,6 +77,7 @@ RUN test -r /srv/jupyter/jupyter_server_config.py \
  && test -r /srv/jupyter/kernel_launcher.py \
  && test -r /srv/jupyter/deps_runner.py \
  && test -r /srv/jupyter/deps_healthcheck.py \
+ && test -r /srv/jupyter/jupyter_healthcheck.py \
  && test -w /opt/custom && test -w /var/cache/pip \
  && python -c 'import json; spec = json.load(open("/usr/local/share/jupyter/kernels/python3/kernel.json")); open(spec["argv"][2]).close(); assert "PYTHONPATH" not in spec["env"]'
 WORKDIR /workspace
@@ -105,9 +107,11 @@ COPY --chmod=u=rwX,go=rX theme/ /srv/stats/theme/
 USER jupyter
 # The app reads its templates and the theme once at start-up, and an unreadable theme file only
 # shows up as the fallback colours. Fail the build instead.
-RUN test -r /srv/stats/app.py && test -r /srv/stats/theme.py && test -r /srv/stats/templates/base.html \
+RUN test -r /srv/stats/app.py && test -r /srv/stats/serve.py && test -r /srv/stats/theme.py \
+ && test -r /srv/stats/templates/base.html \
  && test -r /srv/stats/static/oya.css && test -r /srv/stats/theme/amazing.json \
  && for file in /srv/stats/theme/*.json; do test -r "$file" || exit 1; done
 WORKDIR /srv/stats
 EXPOSE 8889
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8889", "--no-server-header"]
+# serve.py starts uvicorn on 8889, with TLS when compose.tls.yaml sets JLT_TLS_CERT/JLT_TLS_KEY.
+CMD ["python", "/srv/stats/serve.py"]
