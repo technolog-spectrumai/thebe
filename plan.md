@@ -56,6 +56,21 @@ merely written.
 - [x] Live deploy: `/theme.css` behind auth, switch to `market` and back recreated only `stats`, unknown theme refused, idempotent re-install
 - [x] README (Themes section, `THEME` setting, `/theme.css`) + commit
 
+**Stage 6 — HTTPS by Tailscale name** (design in §10)
+Implemented by two parallel agents and validated per side in the sandbox; integration review and fixes are running.
+- [x] `HTTPS='auto'|'off'` setting; MagicDNS name + certificate eligibility detected from `tailscale status --json` inside the image (154 installer checks incl. canned/hostile status JSON)
+- [x] Root step issues/renews the certificate with `tailscale cert` into `/var/lib/jupyterlab-tailscale/tls` (root:gid 0750, crt 0644, key 0640); teardown removes it (64 root-helper checks in a container with a stub `tailscale`; the real `tailscale cert` is only exercised live)
+- [x] `compose.tls.yaml`: JupyterLab and the dashboard serve HTTPS on the same ports; health checks and the internal dashboard → JupyterLab call follow; `TLS_NOT_AFTER` makes Compose recreate both services after a renewal (sandbox with a test CA, verified with `curl --cacert`)
+- [x] Name-based URLs everywhere (summary, status, dashboard links, builder Open buttons); certificate state in `status` and in the dashboard footer (82 stats checks: valid, expiring, expired, plain HTTP)
+- [x] Builder: extended root-step line, one automatic re-deploy after a certificate step, name in the header, `HTTPS` kept in the settings (85 offscreen tests)
+- [x] `verify_cuda.sh` talks to the dashboard over HTTPS when it is on
+- [x] Integration review + fixes; end-to-end sandbox run of both sides together (fixed: renewal loop — `tailscale cert --min-validity 528h`; unchecked failures inside the certificate step; HTTPS downgrade after a failed build; transient probe failures now keep the deployed state; builder message when only the certificate failed; shared-group warning. Final: 87 builder tests, 212 installer checks, 64 + 35 root-helper checks, 95 end-to-end checks)
+- [x] Live deploy without a terminal: HTTP by name on `basilisk-systems.lyrebird-hen.ts.net`, all three containers healthy, `ROOT_STEP_REQUIRED … --cert basilisk-systems.lyrebird-hen.ts.net 1000` printed
+- [x] Live: real certificate issued (Let's Encrypt, `DNS:basilisk-systems.lyrebird-hen.ts.net`, valid until 2026-11-25; key root:1000 0640); `start` switched jupyterlab and stats to HTTPS (deps kept); `https://basilisk-systems.lyrebird-hen.ts.net:8888/api` and `:8889/health` verify against the system CAs (`ssl_verify_result 0`), by IP rejected, Secure session cookie, internal HTTPS hop, same-origin HTTPS writes allowed and http-scheme Origin refused, footer shows the certificate, second `start` recreates nothing, builder URLs and `verify_cuda.sh` use HTTPS
+- [x] Small commits per area (07751bd … 3086820)
+- [x] README: tablet URLs by name, "Connecting by name over HTTPS", settings, architecture, host step, commands, builder, dashboard footer, security, troubleshooting, uninstall, layout (committed separately from plan.md)
+- [ ] Small commits per area
+
 ## 0. Goal
 
 Turn `setup-jupyterlab-tailscale.sh` from "host venv + systemd user service" into a
@@ -384,3 +399,38 @@ Stage 4: each Open button reaches its page. Stage 5: decision only (§6).
 - Stage 4: extend `builder.py`, templates; `README.md`.
 - Stage 5: `stack/theme/*.json`, theme loader in `stack/stats/app.py`, `stack/stats/static/oya.css`,
   `builder.py`, installer (`THEME` key); `README.md`.
+- Stage 6: installer, `stack/compose.yaml`, `stack/compose.tls.yaml`, `stack/Dockerfile`,
+  `stack/jupyter/jupyter_server_config.py`, `stack/jupyter/jupyter_healthcheck.py`,
+  `stack/stats/serve.py` and other stats files, `builder.py`, `tests/test_builder.py`,
+  `verify_cuda.sh`, `README.md`.
+
+## 10. Stage 6 — HTTPS by Tailscale name
+
+Request: reach the services by the laptop's Tailscale name, the way zenobia does. Chosen: HTTPS
+with a real certificate from `tailscale cert`, served by JupyterLab and the dashboard themselves on
+the same ports.
+
+- **Facts:** MagicDNS is on (`basilisk-systems.lyrebird-hen.ts.net`), the tailnet has HTTPS
+  certificates enabled (the name is in `CertDomains`), `tailscale cert` needs root. Plain HTTP by
+  name already worked before this stage (Host checks and the CSRF guard use the request's own host).
+- **Setting:** `HTTPS='auto'` (default) or `'off'`.
+- **Detection:** `tailscale status --json`, parsed inside the built image (no host Python or jq):
+  the name when MagicDNS is on, certificate eligibility when the name is in `CertDomains`.
+- **Certificate:** the root step runs `tailscale cert --cert-file … --key-file … <full name>` into
+  `/var/lib/jupyterlab-tailscale/tls` (root:<user gid> 0750; crt 0644, key 0640) so the non-root
+  containers can read it through the group. It is requested when missing, mismatched, unreadable or
+  within 21 days of expiry; `host-teardown` removes it. Root step line:
+  `host-setup <ip> <port> [<port>] [--cert <name> <gid>]`. In a terminal the root step runs before
+  the containers start, so the first install already uses HTTPS.
+- **Containers:** `compose.tls.yaml` (added to `COMPOSE_FILE` when a valid certificate exists)
+  mounts the directory read-only and passes `JLT_TLS_CERT`/`JLT_TLS_KEY`; JupyterLab sets
+  `certfile`/`keyfile`; the dashboard starts through `serve.py` with uvicorn's TLS options; health
+  checks and the dashboard's internal call to JupyterLab use HTTPS (unverified on the internal
+  Compose network only, where the certificate cannot match the service name). `deps` is untouched.
+- **URLs:** `PUBLIC_SCHEME://PUBLIC_HOST:<port>` in the summary, `status`, the dashboard links and
+  the builder's Open buttons; the name even without a certificate (HTTP by name), the IP only when no
+  name is known. The IP keeps working but shows a certificate warning under HTTPS.
+- **Builder:** accepts the extended root-step line, runs `install` once more after a successful
+  certificate step, shows the name in the header.
+- **Visibility:** `status` and the dashboard show the certificate's validity; renewal happens on the
+  next `install`/`update`/`start` (or builder Deploy/Start) when fewer than 21 days remain.
