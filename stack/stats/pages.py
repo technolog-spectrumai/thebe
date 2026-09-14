@@ -5,9 +5,9 @@ Markup instance (fragments assembled here from escaped parts and constant SVG). 
 unknown placeholder raises, and every page is rendered once at start-up, so a template
 mistake stops the service instead of serving a broken page.
 
-Adding a page (e.g. Stage 3's Dependencies): create templates/<key>.html and add a
-NavItem to NAV_ITEMS. app.py registers a GET route for every entry and the navigation
-bar lists it.
+Adding a page: create templates/<key>.html and add a NavItem to NAV_ITEMS. app.py
+registers a GET route for every entry and the navigation bar lists it, in this order,
+followed by the external JupyterLab link.
 """
 
 import html
@@ -37,8 +37,7 @@ class NavItem:
 
 NAV_ITEMS = (
     NavItem("statistics", "Statistics", "/", "chart", scripts=("stats.js",)),
-    # Stage 3, for example:
-    # NavItem("dependencies", "Dependencies", "/dependencies", "package", scripts=("dependencies.js",)),
+    NavItem("dependencies", "Dependencies", "/dependencies", "package", scripts=("deps.js",)),
 )
 
 # Inline SVG icons (24x24 grid, stroked with currentColor so they follow the theme).
@@ -70,6 +69,17 @@ ICON_PATHS = {
     "gpu": '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="15.5" cy="12" r="3"/><path d="M6 10h4M6 14h4M6 18v3M10 18v3"/>',
     "alert": '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
     "package": '<path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5z"/><path d="M3 7.5 12 12l9-4.5M12 12v9"/>',
+    "download": '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
+    "refresh": '<path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.5V9H15"/>',
+    "stop": '<rect x="6" y="6" width="12" height="12" rx="1.5"/>',
+    "trash": (
+        '<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/>'
+        '<path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'
+    ),
+    "terminal": '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m6 9 3 3-3 3M12 15h6"/>',
+    "save": '<path d="M5 3h11l5 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M7 3v5h8V3M7 21v-7h10v7"/>',
+    "file": '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/>',
+    "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
 }
 
 

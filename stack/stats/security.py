@@ -8,6 +8,7 @@ password (not even /health).
 
 import base64
 import binascii
+import json
 import secrets
 from pathlib import Path
 
@@ -113,6 +114,82 @@ class BasicAuthMiddleware:
                     (b"content-type", b"text/plain; charset=utf-8"),
                     (b"content-length", str(len(body)).encode("ascii")),
                     (b"www-authenticate", self._challenge),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+class CsrfGuardMiddleware:
+    """Refuse cross-site writes to the API below `prefix` (the Dependencies page).
+
+    Browsers resend Basic credentials on cross-site requests too, so the password alone
+    does not stop another web page from posting to the dashboard. Every request below the
+    prefix other than GET/HEAD must therefore
+      - not be marked cross-site by Sec-Fetch-Site (same-origin or none only),
+      - carry an Origin equal to this server's own scheme://host, if it carries one,
+      - send X-Requested-With: thebe and Content-Type: application/json. A plain HTML form
+        can set neither, and a cross-site fetch() with them needs a CORS preflight, which
+        this app never approves.
+    """
+
+    SAFE_METHODS = frozenset(("GET", "HEAD"))
+    SAME_SITE_FETCH = frozenset((b"same-origin", b"none"))
+
+    def __init__(self, app, *, prefix: str, requested_with: bytes = b"thebe"):
+        self.app = app
+        self._prefix = prefix.rstrip("/")
+        self._requested_with = requested_with
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] not in self.SAFE_METHODS and self._guarded(scope["path"]):
+            problem = self._problem(scope)
+            if problem is not None:
+                await self._refuse(send, *problem)
+                return
+        await self.app(scope, receive, send)
+
+    def _guarded(self, path: str) -> bool:
+        return path == self._prefix or path.startswith(self._prefix + "/")
+
+    def _problem(self, scope) -> tuple[int, str] | None:
+        values: dict[bytes, list[bytes]] = {}
+        for name, value in scope["headers"]:
+            values.setdefault(name, []).append(value)
+
+        def single(name: bytes) -> bytes | None:
+            found = values.get(name)
+            if not found:
+                return None
+            # A repeated header cannot be judged reliably; treat it as a mismatch.
+            return found[0].strip() if len(found) == 1 else b"\x00"
+
+        fetch_site = single(b"sec-fetch-site")
+        if fetch_site is not None and fetch_site.lower() not in self.SAME_SITE_FETCH:
+            return 403, "Cross-site request refused."
+        origin = single(b"origin")
+        if origin is not None:
+            host = single(b"host")
+            scheme = scope.get("scheme", "http").encode("ascii")
+            if host is None or origin.lower() != scheme + b"://" + host.lower():
+                return 403, "Cross-origin request refused."
+        if single(b"x-requested-with") != self._requested_with:
+            return 403, "Missing X-Requested-With header."
+        content_type = (single(b"content-type") or b"").split(b";", 1)[0].strip().lower()
+        if content_type != b"application/json":
+            return 415, "The request body must be application/json."
+        return None
+
+    @staticmethod
+    async def _refuse(send, status: int, message: str):
+        body = json.dumps({"error": message}).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
                 ],
             }
         )

@@ -734,6 +734,28 @@ ensure_secrets() {
   HASH_CHANGED=1
 }
 
+# Random credential between the dashboard and the package runner (deps). deps never gets the
+# JupyterLab password or its hash: pip runs the build scripts of third-party packages there.
+# Created once and then kept; sets TOKEN_CHANGED=1 when it was (re)created, because Compose
+# does not notice a changed secret file and the two containers must read the same one.
+ensure_runner_token() {
+  local file="$APP_DIR/secrets/deps_token" token=''
+  TOKEN_CHANGED=0
+  install -d -m 700 -- "$APP_DIR/secrets"
+  if [[ -f "$file" ]]; then
+    token="$(<"$file")"
+  fi
+  if [[ "$token" =~ ^[0-9a-f]{64}$ ]]; then
+    chmod 600 -- "$file"
+    return 0
+  fi
+  # Only through a pipe: the token never appears in argv or the environment.
+  token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die 'Could not generate the package runner token.'
+  write_file_atomic "$file" 600 "$token"
+  TOKEN_CHANGED=1
+}
+
 print_summary() {
   local mode="$1" gpu="$2" cmd
   cmd="$(script_cmd)"
@@ -746,9 +768,10 @@ print_summary() {
   printf '  JupyterLab:  http://%s:%s/lab\n' "$TS_IP" "$JUPYTER_PORT"
   if [[ "$STATS_ENABLED" == 1 ]]; then
     printf '  Statistics:  http://%s:%s/\n' "$TS_IP" "$STATS_PORT"
+    printf '  Packages:    http://%s:%s/dependencies\n' "$TS_IP" "$STATS_PORT"
     printf '  Stats user:  %s\n' "$STATS_USER"
   else
-    printf '  Statistics:  disabled\n'
+    printf '  Statistics:  disabled (the Dependencies page too)\n'
   fi
   if [[ -t 1 ]]; then
     printf '  Password:    %s\n' "$JUPYTER_PASSWORD"
@@ -796,6 +819,7 @@ deploy() {
 
   info "Copying $STACK_DIR to $APP_DIR"
   sync_stack
+  ensure_runner_token
 
   if gpu_requested; then
     gpu=1
@@ -821,15 +845,17 @@ deploy() {
 
   if [[ "$STATS_ENABLED" != 1 ]]; then
     # A profile-disabled service is neither stopped by up nor treated as an orphan;
-    # naming it here enables its profile just for this command.
-    info 'Statistics disabled: removing the stats container if it exists.'
-    compose rm -s -f stats || warn 'Could not remove the stats container.'
+    # naming the services here enables their profile just for this command. The package
+    # runner (deps) belongs to the dashboard; installed packages stay in their volume and
+    # notebooks keep using them.
+    info 'Statistics disabled: removing the stats and deps containers if they exist.'
+    compose rm -s -f stats deps || warn 'Could not remove the stats and deps containers.'
   fi
 
   local up_args=(up -d --remove-orphans --wait --wait-timeout 300)
-  if [[ "$HASH_CHANGED" == 1 ]]; then
-    # Secret file contents are not part of Compose's config hash, so a new password would
-    # otherwise keep the old containers (still bound to the old files).
+  if [[ "$HASH_CHANGED" == 1 || "$TOKEN_CHANGED" == 1 ]]; then
+    # Secret file contents are not part of Compose's config hash, so a new password or runner
+    # token would otherwise keep the old containers (still bound to the old files).
     up_args+=(--force-recreate)
   fi
   info 'Starting containers and waiting until they are healthy...'
@@ -1361,6 +1387,7 @@ cmd_start() {
   printf '  JupyterLab:  http://%s:%s/lab\n' "$TS_IP" "$DEPLOYED_JUPYTER_PORT"
   if [[ "$DEPLOYED_STATS_ENABLED" == 1 ]]; then
     printf '  Statistics:  http://%s:%s/  (user %s)\n' "$TS_IP" "$DEPLOYED_STATS_PORT" "$DEPLOYED_STATS_USER"
+    printf '  Packages:    http://%s:%s/dependencies\n' "$TS_IP" "$DEPLOYED_STATS_PORT"
   fi
   settings_drift_warning
 }
@@ -1370,7 +1397,8 @@ cmd_stop() {
   require_installed
   require_docker
   info 'Stopping containers...'
-  # --profile stats also stops a stats container left over from before statistics were disabled.
+  # --profile stats also stops stats and deps containers left over from before statistics
+  # were disabled. A running package install in deps is cancelled and shown as interrupted.
   compose --profile stats stop || die 'docker compose stop failed; see the output above.'
 }
 
@@ -1380,19 +1408,43 @@ cmd_restart() {
   cmd_start
 }
 
+# Only the published ports of a `compose ps` Ports column: a port the image merely EXPOSEs
+# (8888/tcp on the deps container, which runs the JupyterLab image) is not reachable.
+published_ports() {
+  local part out=''
+  local -a parts=()
+  IFS=',' read -r -a parts <<<"$1"
+  for part in "${parts[@]}"; do
+    part="${part# }"
+    if [[ "$part" == *'->'* ]]; then
+      out+="${out:+, }${part}"
+    fi
+  done
+  printf '%s\n' "${out:--}"
+}
+
+# Name shown in the status table: the deps service is not self-explanatory.
+service_label() {
+  case "$1" in
+    deps) printf 'deps (package runner)\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 show_containers() {
   local output name service state health ports error
   local -a expected=(jupyterlab)
   local -A seen=()
-  if ! output="$(compose ps -a --format '{{.Name}}|{{.Service}}|{{.State}}|{{.Health}}|{{.Ports}}' 2>/dev/null)"; then
+  # --profile stats: also list stats/deps containers left over after statistics were disabled.
+  if ! output="$(compose --profile stats ps -a --format '{{.Name}}|{{.Service}}|{{.State}}|{{.Health}}|{{.Ports}}' 2>/dev/null)"; then
     warn "'docker compose ps' failed in $APP_DIR."
     return 0
   fi
-  printf '  %-12s %-11s %-10s %s\n' SERVICE STATE HEALTH PORTS
+  printf '  %-22s %-11s %-10s %s\n' SERVICE STATE HEALTH PORTS
   while IFS='|' read -r name service state health ports; do
     [[ -n "$name" ]] || continue
     seen["$service"]=1
-    printf '  %-12s %-11s %-10s %s\n' "$service" "$state" "${health:--}" "${ports:--}"
+    printf '  %-22s %-11s %-10s %s\n' "$(service_label "$service")" "$state" "${health:--}" "$(published_ports "$ports")"
     if [[ "$state" != running ]]; then
       error="$(docker inspect --format '{{.State.Error}}' "$name" 2>/dev/null)" || error=''
       if [[ -n "$error" ]]; then
@@ -1401,10 +1453,10 @@ show_containers() {
       fi
     fi
   done <<<"$output"
-  [[ "$DEPLOYED_STATS_ENABLED" == 1 ]] && expected+=(stats)
+  [[ "$DEPLOYED_STATS_ENABLED" == 1 ]] && expected+=(deps stats)
   for service in "${expected[@]}"; do
     if [[ -z "${seen[$service]:-}" ]]; then
-      printf "  %-12s no container -> run '%s start'\n" "$service" "$(script_cmd)"
+      printf "  %-22s no container -> run '%s start'\n" "$(service_label "$service")" "$(script_cmd)"
     fi
   done
 }
@@ -1455,6 +1507,7 @@ cmd_status() {
   printf '  JupyterLab:  http://%s:%s/lab\n' "${DEPLOYED_TS_IP:-<ts-ip>}" "$DEPLOYED_JUPYTER_PORT"
   if [[ "$DEPLOYED_STATS_ENABLED" == 1 ]]; then
     printf '  Statistics:  http://%s:%s/\n' "${DEPLOYED_TS_IP:-<ts-ip>}" "$DEPLOYED_STATS_PORT"
+    printf '  Packages:    http://%s:%s/dependencies\n' "${DEPLOYED_TS_IP:-<ts-ip>}" "$DEPLOYED_STATS_PORT"
   fi
 
   bind="$(nonlocal_bind_value)"
@@ -1619,7 +1672,7 @@ Commands:
   status                             Deployment, containers, addresses, firewall
                                      (exit 3 when not installed).
   logs [--no-follow] [SERVICE...]    Last 100 log lines, following unless --no-follow.
-                                     Services: jupyterlab, stats.
+                                     Services: jupyterlab, stats, deps (package runner).
   uninstall [--yes] [--delete-workspace]
                                      Remove containers, images, volumes, host settings and
                                      the app dir. Keeps the workspace unless
@@ -1634,6 +1687,11 @@ Root-only helpers (run through sudo by the commands above, or pkexec by the buil
 
 Settings file: $SETTINGS_FILE
   JUPYTER_PASSWORD, JUPYTER_PORT (8888), STATS_ENABLED (1), STATS_PORT (8889), STATS_USER (jupyter)
+
+Pages:
+  http://<tailscale-ip>:<JUPYTER_PORT>/lab           JupyterLab
+  http://<tailscale-ip>:<STATS_PORT>/                Statistics      (when STATS_ENABLED=1)
+  http://<tailscale-ip>:<STATS_PORT>/dependencies    Kernel packages (when STATS_ENABLED=1)
 
 Environment overrides:
   JLT_SETTINGS_FILE   settings file              (default: <script dir>/.env)

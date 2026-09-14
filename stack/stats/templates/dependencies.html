@@ -1,0 +1,192 @@
+      <!-- Filled in by /static/deps.js from /api/dependencies (proxied to the deps runner).
+           Buttons stay disabled until the first state has loaded. -->
+      <section class="page-header">
+        <div class="page-header__text">
+          <p class="eyebrow">JupyterLab kernel packages</p>
+          <h1 class="page-title">Dependencies</h1>
+          <p class="page-subtitle" id="deps-summary">Connecting to the package runner…</p>
+        </div>
+        <div class="status">
+          <span class="pill pill--idle" id="job-pill" role="status">
+            <span class="pill__dot" aria-hidden="true"></span><span id="job-pill-label">Connecting…</span>
+          </span>
+        </div>
+      </section>
+
+      <noscript><p class="note note--caution"><span class="note__text">This page needs JavaScript to manage packages.</span></p></noscript>
+
+      <div class="note note--warn" id="deps-unavailable" role="alert" hidden>
+        {{ icon_alert }}
+        <div class="note__text">
+          <p class="strong" id="deps-unavailable-title">Package runner unavailable</p>
+          <p id="deps-unavailable-text"></p>
+        </div>
+      </div>
+
+      <div class="stack" id="deps">
+        <section class="tiles tiles--storage" aria-label="Storage">
+          <article class="tile" id="tile-venv">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_package }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">Custom packages</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+
+          <article class="tile" id="tile-cache">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_download }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">Download cache</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+
+          <article class="tile" id="tile-free">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_disk }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">Free disk</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <div class="meter meter--sm" role="meter" aria-label="Docker disk usage" aria-valuemin="0" aria-valuemax="100"><div class="meter__fill"></div></div>
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+        </section>
+
+        <div class="cards">
+          <div class="cards__column">
+            <section class="card" aria-labelledby="job-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="job-title">{{ icon_terminal }}Install job</h2>
+                  <code class="caption mono" id="job-id"></code>
+                </div>
+                <ul class="rows">
+                  <li class="row"><span class="row__key">Action</span><span class="row__value" id="job-action">—</span></li>
+                  <li class="row"><span class="row__key">Started</span><span class="row__value" id="job-started">—</span></li>
+                  <li class="row"><span class="row__key">Finished</span><span class="row__value" id="job-finished">—</span></li>
+                  <li class="row"><span class="row__key">Duration</span><span class="row__value" id="job-duration">—</span></li>
+                </ul>
+                <!-- Empty until the runner has answered: before that nothing is known about jobs. -->
+                <p class="job-message" id="job-message"></p>
+                <p class="note note--caution" id="disk-note" hidden>{{ icon_alert }}<span class="note__text"></span></p>
+                <div class="actions">
+                  <button class="btn btn--primary" id="btn-install" type="button" disabled>{{ icon_download }}Install / update</button>
+                  <button class="btn btn--danger" id="btn-reset" type="button" disabled>{{ icon_refresh }}Reset &amp; reinstall</button>
+                  <button class="btn btn--ghost" id="btn-cancel" type="button" hidden>{{ icon_stop }}Cancel</button>
+                  <button class="btn btn--ghost" id="btn-clear-cache" type="button" disabled>{{ icon_trash }}Clear download cache</button>
+                </div>
+                <p class="note note--warn" id="action-note" role="status" hidden>{{ icon_alert }}<span class="note__text"></span></p>
+              </div>
+            </section>
+
+            <section class="card" aria-labelledby="req-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="req-title">{{ icon_file }}Requirements</h2>
+                  <code class="caption mono">requirements.txt</code>
+                </div>
+                <label class="visually-hidden" for="requirements">Requirements, one per line</label>
+                <textarea class="code-editor" id="requirements" rows="10" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-describedby="req-help" data-placeholder="rich&#10;polars&gt;=1.0" disabled></textarea>
+                <div class="note note--warn" id="req-errors" role="alert" hidden>
+                  {{ icon_alert }}
+                  <div class="note__text">
+                    <p class="strong">Not saved. Fix these lines:</p>
+                    <ul class="error-list" id="req-error-list"></ul>
+                  </div>
+                </div>
+                <div class="editor-bar">
+                  <span class="caption" id="req-state" aria-live="polite"></span>
+                  <button class="btn btn--ghost" id="btn-save" type="button" disabled>{{ icon_save }}Save</button>
+                </div>
+                <p class="caption" id="req-help">
+                  One requirement per line, as in a pip requirements file; <code>#</code> starts a comment.
+                  Packages already in the image (numpy, pandas, matplotlib, scipy, ipywidgets, jupyter…) are kept at
+                  their pinned versions: a line that needs another version of one of them fails instead of replacing it.
+                </p>
+                <details class="details">
+                  <summary>Examples</summary>
+                  <div class="details__body">
+                    <p>Plain packages from PyPI, optionally with a version:</p>
+                    <pre class="code-sample">rich
+polars&gt;=1.0
+scikit-learn</pre>
+                    <p><span class="strong">PyTorch, CPU only</span> (about 200 MB to download). An index option must
+                      stand on a line of its own (pip ignores it next to a package) and then applies to the whole file,
+                      so every package listed is looked up on the PyTorch index only:</p>
+                    <pre class="code-sample">--index-url https://download.pytorch.org/whl/cpu
+torch</pre>
+                    <p>To mix the CPU build with packages from PyPI, add the PyTorch index as an extra one and pin the
+                      <code>+cpu</code> build (the current version is listed on download.pytorch.org):</p>
+                    <pre class="code-sample">--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+rich</pre>
+                    <p><span class="strong">PyTorch with CUDA</span> for the NVIDIA GPU: the default build from PyPI
+                      bundles the CUDA libraries, about 3 GB to download and more on disk:</p>
+                    <pre class="code-sample">torch</pre>
+                    <p>Not allowed, because they would install outside the managed environment or read other files:
+                      <code>-r</code>, <code>-c</code>, <code>-e</code>, <code>--target</code>, <code>--prefix</code>,
+                      <code>--root</code>, <code>--user</code>, <code>--src</code>.</p>
+                  </div>
+                </details>
+              </div>
+            </section>
+
+            <section class="card" aria-labelledby="log-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="log-title">{{ icon_terminal }}Log</h2>
+                  <span class="caption" id="log-state"></span>
+                </div>
+                <pre class="log" id="log" tabindex="0" aria-labelledby="log-title" data-empty="The output of pip appears here."></pre>
+              </div>
+            </section>
+          </div>
+
+          <div class="cards__column">
+            <p class="note note--info">{{ icon_info }}<span class="note__text">
+              Restart the kernel (<span class="strong">Kernel → Restart Kernel</span>) to use newly installed packages.
+              Custom packages live in a Docker volume and survive updates; uninstall removes them.
+            </span></p>
+
+            <section class="card" aria-labelledby="installed-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="installed-title">{{ icon_package }}Installed</h2>
+                  <span class="pill pill--idle" id="installed-count" hidden></span>
+                </div>
+                <div class="table-wrap table-wrap--scroll" id="installed-table" hidden>
+                  <table class="table">
+                    <caption class="visually-hidden">Packages in the custom environment</caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">Package</th>
+                        <th scope="col" class="num">Version</th>
+                      </tr>
+                    </thead>
+                    <tbody id="installed-rows"></tbody>
+                  </table>
+                </div>
+                <div class="empty" id="installed-empty" hidden>
+                  <span class="empty__icon">{{ icon_package }}</span>
+                  <p class="empty__title">No custom packages yet</p>
+                  <p class="empty__text">Add requirements and press Install / update. Packages that come with the image are not listed.</p>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>

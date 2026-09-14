@@ -35,19 +35,23 @@ merely written.
 - [x] Commit
 
 **Stage 3 — Dependencies page**
-- [ ] `/dependencies` page + API: pip into the shared volume with constraints, single job, live log
-- [ ] Notebook imports a custom package after kernel restart; `torch.cuda.is_available()` on this laptop
-- [ ] README + commit
+- [x] Internal `deps` runner (JupyterLab image, no host mounts, no published port, its own random token) + `/dependencies` page and proxied API in stats (Basic auth, CSRF guard, validated requirements, one cancellable job, live log, sizes, cache clear); adversarial review + fixes; sandbox run incl. torch CPU install, cancel and interruption
+- [x] Live deploy (24 checks): three healthy containers, page/API/CSRF/validation, `rich` installed from the page and imported by a real kernel from the custom venv while numpy stays the image's, GPU visible to kernels (`cuInit` 0, 1 device), reset + cache clear, idempotent re-install
+- [ ] CUDA build of torch installed and `torch.cuda.is_available()` checked on this laptop (≈3 GB download; waiting for your go — the disk has ~9 GB free)
+- [x] Commit (code)
+- [ ] README (Dependencies section, runner token, torch examples) + commit
 
 **Stage 4 — Ops links**
-- [ ] Builder "Pages" card with Open buttons; dashboard navigation for every page
+- [x] Builder: every page in one `PAGES` table; Open per service plus links for Dependencies, Stats API and Health (enabled while the container runs, deployed address); 70 offscreen tests
+- [x] Dashboard navigation for every page (Statistics, Dependencies, JupyterLab; icons hidden below 480 px so it fits a phone)
+- [x] Commit (code)
 - [ ] README + commit
 
 **Stage 5 — Harmonization with zenobia (no imports)**
 - [x] zenobia theme files copied to `stack/theme/{amazing,bitter,market,spectre}.json`
 - [ ] `THEME` setting validated by the script and the builder
 - [ ] Stats app generates `theme.css` from the theme JSON
-- [ ] Builder QSS generated from the same JSON
+- [x] Builder QSS generated from the same JSON (`load_theme_colors` + `theme_tokens`, all four theme files tested in light and dark)
 - [ ] README + commit
 
 ## 0. Goal
@@ -82,7 +86,7 @@ Proposed (see §8 for the questions still open):
 | Base image | `python:3.13-slim-trixie` for both images, one multi-stage Dockerfile, targets `jupyterlab` and `stats`. | Every pinned package has cp313 manylinux wheels → no compiler in the image. |
 | Boot race | `install` writes `/etc/sysctl.d/60-jupyterlab-tailscale.conf` → `net.ipv4.ip_nonlocal_bind = 1` (one `sudo`). | Docker binds `<ts-ip>:8888` in the daemon; if tailscaled is late at boot the bind fails with `cannot assign requested address` and **Docker never retries** (`daemon/daemon.go:665`; docs: restart policies only apply after a successful start). A `docker.service After=tailscaled` drop-in does not help (tailscaled reports ready before the IP exists, tailscale#11504). The sysctl makes the bind succeed regardless of timing. |
 | Firewall | Rules are applied only when a firewall is **active**. ufw: `allow in on tailscale0 to any port <p> proto tcp comment 'jupyterlab-tailscale'` per port **plus** a `DOCKER-USER` block in `/etc/ufw/after.rules` (between markers) that drops traffic to `<ts-ip>:<port>` arriving on any interface other than `tailscale0`. firewalld: port in the zone of `tailscale0` (as today; untestable here). | Docker-published ports take the DNAT→FORWARD path and bypass ufw INPUT rules entirely (docs.docker.com/engine/network/packet-filtering-firewalls). The `DOCKER-USER` rule is the only one that actually restricts the port to the tailnet interface. On this laptop ufw is installed but **disabled** (`/etc/ufw/ufw.conf: ENABLED=no`), so today nothing is configured and `status` says so explicitly instead of "no rule needed". |
-| Secrets | Password → `$APP_DIR/secrets/jupyter_password` (0600); argon2 hash → `$APP_DIR/secrets/jupyter_hashed_password` (0600). Both are Compose `secrets:` (file) mounts. | The hash contains `$…$`; Compose interpolation would mangle it. Secrets never appear in `compose.yaml`, in `docker inspect`, or in the environment. |
+| Secrets | Password → `$APP_DIR/secrets/jupyter_password` (0600); argon2 hash → `$APP_DIR/secrets/jupyter_hashed_password` (0600); random runner token → `$APP_DIR/secrets/deps_token` (0600, Stage 3, `stats` ↔ `deps` only). All are Compose `secrets:` (file) mounts. | The hash contains `$…$`; Compose interpolation would mangle it. Secrets never appear in `compose.yaml`, in `docker inspect`, or in the environment. |
 | Hash generation | Inside the built image: `docker run --rm -i <image> python -c '…passwd(sys.stdin.read())'`. Re-hash **only when the password changed** (`passwd_check` against the stored hash). | No host Python. Re-hashing the same password changes Jupyter's cookie secret and logs every browser out. |
 | Container user | Both images create user `jupyter` with the host's uid/gid (build args). | The workspace bind mount must stay writable by the desktop user. |
 | Stage 3 packages | pip jobs run in a separate internal `deps` container (JupyterLab image, no host mounts, no published port) into a persistent venv with system site packages (`custom_packages` → `/opt/custom/venv`), constrained by `constraints.txt` frozen from the JupyterLab image; kernels add it with `site.addsitedir` in a small launcher. The stats app only proxies the page and API. | No Docker socket, no image rebuild per package, pip never runs next to the host `/proc`/`/sys` mounts, image packages cannot be shadowed or re-versioned, the Jupyter server itself never imports user packages. |
@@ -270,8 +274,10 @@ JupyterLab.
 - **`deps` runner service** (profile `stats`): runs the *JupyterLab image* with
   `python /srv/jupyter/deps_runner.py`, so pip sees exactly the packages notebooks already have.
   No published port, no host mounts, no workspace; read-only root filesystem; volumes
-  `custom_packages:/opt/custom` and `pip_cache:/var/cache/pip`; Basic auth (same user and
-  password secret) on every route of its small stdlib HTTP API on the Compose network.
+  `custom_packages:/opt/custom` and `pip_cache:/var/cache/pip`; Basic auth (same user, and a
+  random runner token `secrets/deps_token` shared only with `stats`) on every route of its small
+  stdlib HTTP API on the Compose network. `deps` never gets the JupyterLab password or its hash:
+  pip runs third-party build scripts there, which can read every file the runner can.
 - **Environment:** `/opt/custom/venv` created with `python -m venv --system-site-packages
   --without-pip`; jobs run `venv/bin/python -m pip install -c /opt/constraints.txt -r
   /opt/custom/requirements.txt`, so already-present packages are not duplicated and cannot be
@@ -287,7 +293,8 @@ JupyterLab.
 - **Page** in the stats app (proxied to the runner): requirements editor with Save, job status
   pill, Install / update, Reset & reinstall (confirm), Cancel, Clear download cache, live log,
   installed packages table, sizes of the venv and cache, free disk (warning below 5 GB), the
-  "restart the kernel" note, and examples (`torch --index-url https://download.pytorch.org/whl/cpu`,
+  "restart the kernel" note, and examples (CPU torch: `--index-url https://download.pytorch.org/whl/cpu`
+  on a line of its own followed by `torch` — pip silently ignores index options next to a package;
   CUDA builds from PyPI ≈ 3 GB). Non-GET API calls require JSON, an `X-Requested-With: thebe`
   header and a same-origin `Origin`/`Sec-Fetch-Site`, because browsers resend Basic credentials
   on cross-site requests.

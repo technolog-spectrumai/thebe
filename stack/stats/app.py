@@ -8,28 +8,38 @@ Environment (set by compose.yaml):
   STATS_USER, JUPYTER_PASSWORD_FILE      Basic auth credentials
   JUPYTER_INTERNAL_URL                   JupyterLab on the Compose network (kernels, health)
   JUPYTER_PUBLIC_URL                     link target in the navigation bar
+  DEPS_INTERNAL_URL, DEPS_TOKEN_FILE     deps runner behind the Dependencies page and its token
   HOST_NAME, HOST_PROC, HOST_SYS         host identity and the read-only /proc and /sys mounts
   WORKSPACE_DIR                          filesystem whose usage is reported
 """
 
 import asyncio
 import contextlib
+import json
 import logging
 import mimetypes
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import hoststats
 import pages
 from cache import RefreshingValue
+from depsapi import DepsClient
 from gpustats import GpuReader
 from jupyterapi import JupyterClient, jupyter_reachable
-from security import BasicAuthMiddleware, ConfigError, SecurityHeadersMiddleware, read_password_file
+from security import (
+    BasicAuthMiddleware,
+    ConfigError,
+    CsrfGuardMiddleware,
+    SecurityHeadersMiddleware,
+    read_password_file,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -42,11 +52,13 @@ if not log.handlers:
     log.setLevel(logging.INFO)
     log.propagate = False
 
+QUIET_POLL_PATHS = ("/api/stats", "/health", "/api/dependencies", "/api/dependencies/log")
+
 
 class _QuietPolling(logging.Filter):
     """Drop access-log lines for successful dashboard polls and health checks.
 
-    An open page polls every 3 s; failures (401s included) are still logged.
+    An open page polls every few seconds; failures (401s included) are still logged.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -54,7 +66,7 @@ class _QuietPolling(logging.Filter):
         if isinstance(record.args, tuple) and len(record.args) == 5:
             _, method, path, _, status = record.args
             if method == "GET" and isinstance(status, int) and status < 400:
-                return str(path).split("?", 1)[0] not in ("/api/stats", "/health")
+                return str(path).split("?", 1)[0] not in QUIET_POLL_PATHS
         return True
 
 
@@ -77,12 +89,24 @@ except ConfigError as exc:
 USERNAME = (os.environ.get("STATS_USER") or "jupyter").encode("utf-8")
 JUPYTER_INTERNAL_URL = os.environ.get("JUPYTER_INTERNAL_URL") or "http://jupyterlab:8888"
 JUPYTER_PUBLIC_URL = os.environ.get("JUPYTER_PUBLIC_URL") or ""
+# Set but empty disables the proxy: the page then shows the "unavailable" state.
+DEPS_INTERNAL_URL = os.environ.get("DEPS_INTERNAL_URL", "http://deps:8890")
+# The runner accepts its own random token, not the password (see deps_runner.py). Without
+# it only the Dependencies page is unavailable; the dashboard itself keeps working.
+_deps_token_file = os.environ.get("DEPS_TOKEN_FILE") or "/run/secrets/deps_token"
+try:
+    DEPS_TOKEN = read_password_file(_deps_token_file)
+    _deps_problem = None
+except ConfigError as exc:
+    DEPS_TOKEN, _deps_problem = b"", f"runner token: {exc}"
+    log.warning("Dependencies page disabled: %s", _deps_problem)
 
 # --- data sources --------------------------------------------------------------------
 
 sampler = hoststats.Sampler(interval=2.0)
 gpu_reader = GpuReader()
 jupyter_client = JupyterClient(JUPYTER_INTERNAL_URL, PASSWORD)
+deps_client = DepsClient(DEPS_INTERNAL_URL, USERNAME, DEPS_TOKEN, unavailable_reason=_deps_problem)
 
 
 def _kernels_error(message: str) -> dict:
@@ -199,5 +223,97 @@ async def health() -> JSONResponse:
     return JSONResponse({"status": "ok", "jupyter": await jupyter_health.get()})
 
 
-# The ASGI application uvicorn serves: headers outermost so even 401s carry them.
-app = SecurityHeadersMiddleware(BasicAuthMiddleware(api, username=USERNAME, password=PASSWORD))
+# --- Dependencies API: a thin proxy to the deps runner ----------------------------------
+# Writes below /api/dependencies are additionally guarded by CsrfGuardMiddleware.
+
+DEPS_MAX_BODY_BYTES = 64 * 1024
+DEPS_TIMEOUT = 10.0
+# Emptying a large pip cache can take a while; the runner does it before answering.
+DEPS_CACHE_CLEAR_TIMEOUT = 120.0
+_OFFSET = re.compile(r"[0-9]{1,15}")
+
+
+async def _deps(method: str, path: str, body: dict | None = None, timeout: float = DEPS_TIMEOUT) -> JSONResponse:
+    status, payload = await asyncio.to_thread(deps_client.call, method, path, body, timeout=timeout)
+    return JSONResponse(payload, status_code=status)
+
+
+async def _json_body(request: Request) -> dict | JSONResponse:
+    """The request's JSON object (at most 64 KB), or the error response to send instead."""
+    declared = request.headers.get("content-length")
+    if declared is not None and (not declared.isascii() or not declared.isdigit()):
+        return JSONResponse({"error": "Invalid Content-Length."}, status_code=400)
+    if declared is not None and int(declared) > DEPS_MAX_BODY_BYTES:
+        return JSONResponse({"error": "The request body is larger than 64 KB."}, status_code=413)
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > DEPS_MAX_BODY_BYTES:
+            return JSONResponse({"error": "The request body is larger than 64 KB."}, status_code=413)
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    if not raw.strip():
+        return {}
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):  # UnicodeDecodeError; RecursionError: deep nesting
+        return JSONResponse({"error": "The request body is not valid JSON."}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "The request body must be a JSON object."}, status_code=400)
+    return body
+
+
+@api.get("/api/dependencies")
+async def dependencies_state() -> JSONResponse:
+    return await _deps("GET", "/state")
+
+
+@api.get("/api/dependencies/log")
+async def dependencies_log(request: Request) -> JSONResponse:
+    offset = request.query_params.get("offset", "0")
+    if not _OFFSET.fullmatch(offset):
+        return JSONResponse({"error": "offset must be a non-negative integer"}, status_code=400)
+    return await _deps("GET", f"/log?offset={int(offset)}", timeout=5.0)
+
+
+@api.put("/api/dependencies/requirements")
+async def dependencies_requirements(request: Request) -> JSONResponse:
+    body = await _json_body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    return await _deps("PUT", "/requirements", body)
+
+
+@api.post("/api/dependencies/jobs")
+async def dependencies_jobs(request: Request) -> JSONResponse:
+    body = await _json_body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    return await _deps("POST", "/jobs", body)
+
+
+@api.post("/api/dependencies/cancel")
+async def dependencies_cancel(request: Request) -> JSONResponse:
+    body = await _json_body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    return await _deps("POST", "/cancel", body)
+
+
+@api.post("/api/dependencies/cache/clear")
+async def dependencies_cache_clear(request: Request) -> JSONResponse:
+    body = await _json_body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    return await _deps("POST", "/cache/clear", body, timeout=DEPS_CACHE_CLEAR_TIMEOUT)
+
+
+# The ASGI application uvicorn serves: headers outermost so even 401s carry them, then
+# the password, then the cross-site guard for the Dependencies API.
+app = SecurityHeadersMiddleware(
+    BasicAuthMiddleware(
+        CsrfGuardMiddleware(api, prefix="/api/dependencies"),
+        username=USERNAME,
+        password=PASSWORD,
+    )
+)

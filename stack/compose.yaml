@@ -1,5 +1,5 @@
-# JupyterLab and the statistics dashboard, published only on the Tailscale IPv4.
-# Every ${...} value comes from the .env next to this file, written by
+# JupyterLab, the statistics dashboard and its package runner, published only on the
+# Tailscale IPv4. Every ${...} value comes from the .env next to this file, written by
 # setup-jupyterlab-tailscale.sh. Passwords never pass through interpolation: they are
 # files under ./secrets/, mounted as Compose secrets.
 name: jupyterlab-tailscale
@@ -49,7 +49,12 @@ services:
         bind:
           create_host_path: false
       - jupyter_state:/state
-      - custom_packages:/opt/custom
+      # Packages installed by the deps service; kernels add its venv to sys.path
+      # (kernel_launcher.py). Read-only: only the runner changes it.
+      - type: volume
+        source: custom_packages
+        target: /opt/custom
+        read_only: true
     healthcheck:
       # GET /api is unauthenticated in jupyter_server; the slim image has no curl.
       test:
@@ -63,6 +68,56 @@ services:
       start_interval: 2s
       retries: 3
     # Time for kernels to shut down cleanly before SIGKILL.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Package runner behind the dashboard's Dependencies page. It runs the JupyterLab image,
+  # so pip sees exactly the packages notebooks have, but without the workspace, the Jupyter
+  # state or a published port: pip (and the build scripts of the packages it installs)
+  # only reaches the two package volumes. The stats container, which has the host's /proc
+  # and /sys, never runs pip.
+  deps:
+    # The jupyterlab service builds this image; deps only reuses it (no build section).
+    image: jupyterlab-tailscale/jupyterlab:local
+    pull_policy: never
+    profiles:
+      - stats
+    command: ["python", "/srv/jupyter/deps_runner.py"]
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - "/tmp:size=64m"
+    environment:
+      STATS_USER: "${STATS_USER:-jupyter}"
+      DEPS_TOKEN_FILE: /run/secrets/deps_token
+      CUSTOM_DIR: /opt/custom
+      PIP_CACHE_DIR: /var/cache/pip
+      HOME: /tmp
+    # Only the runner token, never jupyter_password or its hash: build scripts of the
+    # packages pip installs run here and can read whatever the runner can.
+    secrets:
+      - deps_token
+    volumes:
+      - custom_packages:/opt/custom
+      - pip_cache:/var/cache/pip
+    healthcheck:
+      # /health requires Basic auth like every route of the runner.
+      test: ["CMD", "python", "/srv/jupyter/deps_healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      start_interval: 2s
+      retries: 3
+    # A running pip job is cancelled (SIGTERM, SIGKILL after 10 s) before the runner exits.
     stop_grace_period: 30s
     logging:
       driver: json-file
@@ -100,16 +155,17 @@ services:
       JUPYTER_INTERNAL_URL: http://jupyterlab:8888
       JUPYTER_PUBLIC_URL: "http://${TS_IP}:${JUPYTER_PORT}/lab"
       STATS_PUBLIC_URL: "http://${TS_IP}:${STATS_PORT}/"
+      # The Dependencies page proxies to the runner; it copes with the runner being down.
+      DEPS_INTERNAL_URL: http://deps:8890
+      DEPS_TOKEN_FILE: /run/secrets/deps_token
       HOST_NAME: "${HOST_NAME:-}"
       # Host /proc and /sys, read-only, for host-wide CPU, memory, network and sensors.
       HOST_PROC: /host/proc
       HOST_SYS: /host/sys
       WORKSPACE_DIR: /workspace
-      CUSTOM_DIR: /opt/custom
-      PIP_CACHE_DIR: /var/cache/pip
-      TMPDIR: /var/cache/pip/tmp
     secrets:
       - jupyter_password
+      - deps_token
     volumes:
       - type: bind
         source: /proc
@@ -130,10 +186,10 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - custom_packages:/opt/custom
-      - pip_cache:/var/cache/pip
     depends_on:
       jupyterlab:
+        condition: service_started
+      deps:
         condition: service_started
     healthcheck:
       # /health requires Basic auth like every route; the script sends the header.
@@ -157,8 +213,13 @@ secrets:
     file: ./secrets/jupyter_hashed_password
   jupyter_password:
     file: ./secrets/jupyter_password
+  # Random credential between stats and deps, created once by the installer.
+  deps_token:
+    file: ./secrets/deps_token
 
 volumes:
   jupyter_state:
+  # /opt/custom: venv, requirements.txt, job state and log of the deps runner.
   custom_packages:
+  # pip's download cache, written only by the deps runner.
   pip_cache:

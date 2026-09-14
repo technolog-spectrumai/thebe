@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
-# One Dockerfile, two images: target `jupyterlab` (notebook server) and target `stats`
-# (dashboard). The build context is the app dir, i.e. a copy of stack/; compose.yaml
-# picks the target for each service.
+# One Dockerfile, two images: target `jupyterlab` (notebook server, also used by the `deps`
+# package runner) and target `stats` (dashboard). The build context is the app dir, i.e. a
+# copy of stack/; compose.yaml picks the target for each service.
 
 ARG PYTHON_IMAGE=python:3.13-slim-trixie
 
@@ -36,36 +36,48 @@ FROM base AS jupyterlab
 RUN --mount=type=bind,source=jupyter/requirements.lock.txt,target=/tmp/requirements.lock.txt \
     pip install --no-cache-dir --only-binary=:all: --root-user-action=ignore \
         -r /tmp/requirements.lock.txt \
- && pip freeze --no-cache-dir > /opt/constraints.txt
-# /opt/constraints.txt is copied into the stats image: user packages are installed there
-# with --constraint, so shared dependencies keep the versions the notebooks already use.
+ && pip freeze --all --no-cache-dir > /opt/constraints.txt
+# /opt/constraints.txt: the deps runner installs custom packages with --constraint, so a
+# package the image already has keeps its version and is not installed a second time.
+# --all also pins pip: a requirement such as pip==25.1 would otherwise put another pip into
+# the venv, and every later job would run that one.
 
-# Only kernels see the shared custom_packages volume (PYTHONPATH/PATH in the kernelspec);
-# the server process never imports from it, so a broken user package cannot take
-# JupyterLab down. This overwrites the plain spec shipped in the ipykernel wheel.
-# Importing IPython here (as root, HOME=/home/jupyter) leaves a root-owned ~/.ipython
-# in the jupyter home; remove it.
+# Kernels start through kernel_launcher.py, which appends the custom packages venv
+# (the custom_packages volume) after the image's site-packages; PATH finds the venv's
+# console scripts first. The server process never imports from the venv, so a broken user
+# package cannot take JupyterLab down. This overwrites the plain spec shipped in the
+# ipykernel wheel; -Xfrozen_modules=off is what `ipykernel install` writes (the debugger
+# needs it). Importing IPython here (as root, HOME=/home/jupyter) leaves a root-owned
+# ~/.ipython in the jupyter home; remove it.
 RUN python -m ipykernel install --prefix /usr/local --name python3 \
-        --env PYTHONPATH /opt/custom/site-packages \
-        --env PATH /opt/custom/site-packages/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+        --env PATH /opt/custom/venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+ && python -c 'import json, pathlib; path = pathlib.Path("/usr/local/share/jupyter/kernels/python3/kernel.json"); spec = json.loads(path.read_text()); spec["argv"] = ["/usr/local/bin/python", "-Xfrozen_modules=off", "/srv/jupyter/kernel_launcher.py", "-f", "{connection_file}"]; path.write_text(json.dumps(spec, indent=1) + "\n")' \
  && rm -rf /home/jupyter/.ipython
 
 # Symbolic mode on purpose: an octal --chmod=0644 is also applied to the parent
 # directories COPY creates, leaving /srv/jupyter without the search bit. This gives
-# directories 755 and the file 644 whatever its mode in the app dir.
+# directories 755 and the files 644 whatever their mode in the app dir.
 COPY --chmod=u=rwX,go=rX jupyter/jupyter_server_config.py /srv/jupyter/jupyter_server_config.py
+COPY --chmod=u=rwX,go=rX jupyter/kernel_launcher.py jupyter/deps_runner.py jupyter/deps_healthcheck.py /srv/jupyter/
 
 # Mount points owned by the container user: Docker initialises an empty named volume
-# with the ownership of the image directory it is mounted over.
-RUN mkdir -p /state /opt/custom/site-packages /workspace \
- && chown jupyter:jupyter /state /opt/custom /opt/custom/site-packages /workspace
+# with the ownership of the image directory it is mounted over (custom_packages at
+# /opt/custom, pip_cache at /var/cache/pip in the deps container).
+RUN mkdir -p /state /opt/custom /var/cache/pip /workspace \
+ && chown jupyter:jupyter /state /opt/custom /var/cache/pip /workspace
 
 # Terminals start $SHELL (else sh) as a login shell.
 ENV SHELL=/bin/bash
 USER jupyter
 # jupyter silently skips a --config file it cannot read and starts with defaults (token
-# login, localhost only) while GET /api still looks healthy; fail the build instead.
-RUN test -r /srv/jupyter/jupyter_server_config.py
+# login, localhost only) while GET /api still looks healthy; a kernelspec pointing at an
+# unreadable launcher only fails when a notebook opens. Fail the build instead.
+RUN test -r /srv/jupyter/jupyter_server_config.py \
+ && test -r /srv/jupyter/kernel_launcher.py \
+ && test -r /srv/jupyter/deps_runner.py \
+ && test -r /srv/jupyter/deps_healthcheck.py \
+ && test -w /opt/custom && test -w /var/cache/pip \
+ && python -c 'import json; spec = json.load(open("/usr/local/share/jupyter/kernels/python3/kernel.json")); open(spec["argv"][2]).close(); assert "PYTHONPATH" not in spec["env"]'
 WORKDIR /workspace
 EXPOSE 8888
 CMD ["jupyter", "lab", "--config=/srv/jupyter/jupyter_server_config.py"]
@@ -77,18 +89,14 @@ RUN --mount=type=bind,source=stats/requirements.lock.txt,target=/tmp/requirement
     pip install --no-cache-dir --only-binary=:all: --root-user-action=ignore \
         -r /tmp/requirements.lock.txt
 
-COPY --from=jupyterlab /opt/constraints.txt /opt/constraints.txt
 COPY stats/*.py /srv/stats/
 COPY stats/templates/ /srv/stats/templates/
 COPY stats/static/ /srv/stats/static/
 
 # The COPY lines above keep the modes the files have in the app dir; make the app
 # readable by the non-root user regardless (dirs 755, files 644, executables stay
-# executable). /var/cache/pip is the pip_cache volume; its tmp/ is TMPDIR for pip
-# because the root filesystem is read-only and /tmp is a small tmpfs.
-RUN chmod -R u=rwX,go=rX /srv/stats \
- && mkdir -p /opt/custom/site-packages /var/cache/pip/tmp \
- && chown jupyter:jupyter /opt/custom /opt/custom/site-packages /var/cache/pip /var/cache/pip/tmp
+# executable).
+RUN chmod -R u=rwX,go=rX /srv/stats
 
 USER jupyter
 WORKDIR /srv/stats
