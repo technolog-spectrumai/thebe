@@ -1,0 +1,15 @@
+# GPU override, used through COMPOSE_FILE='compose.yaml:compose.gpu.yaml' only when
+# setup-jupyterlab-tailscale.sh detects an NVIDIA GPU and the container toolkit. Without
+# a working toolkit Docker refuses to create the containers, hence a separate file.
+services:
+  jupyterlab:
+    gpus: all
+    environment:
+      # compute: CUDA driver libraries for notebooks; utility: nvidia-smi and NVML.
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+  stats:
+    gpus: all
+    environment:
+      # NVML only, for the GPU tile.
+      NVIDIA_DRIVER_CAPABILITIES: utility

@@ -1,0 +1,1228 @@
+/* oya design language, theme "Amazing Moon", as plain CSS.
+ *
+ * Token values are verbatim from zenobia data/themes/amazing.json. Component recipes
+ * reproduce the Tailwind 3.4 utilities the oya templates use (rounded-2xl cards with
+ * shadow-md, stat tiles, tracking-widest eyebrows, meters, pills). No Tailwind runtime,
+ * no icon font, nothing loaded from a CDN.
+ *
+ * Marked deviations from oya, for readability:
+ *  - --accent-text: small accent text uses --link in dark mode (oya's accent is 2.7:1 there);
+ *  - --*-text: status colours are mixed with --text-main in light mode (raw ~3.3:1 on cards);
+ *  - an unset darkMode follows prefers-color-scheme (see theme.js).
+ */
+
+@font-face {
+  font-family: "Orbitron";
+  font-style: normal;
+  font-weight: 400 900; /* variable font: real 600/800 weights, unlike oya's static 400/700 pair */
+  font-display: swap;
+  src: url("orbitron-latin.woff2") format("woff2");
+}
+
+/* ---- tokens ----------------------------------------------------------------------- */
+
+:root {
+  color-scheme: light;
+
+  --primary-bg: #f2f3f5;
+  --bubble-bg: #e8e9ec;
+  --sunken: #e1e2e5;
+  --header-bg: #1d2333;
+  --appbar-bg: #252c3e;
+  --appbar-text: #e4e7ef;
+  --footer-bg: #1d2333;
+  --footer-text: #e4e7ef;
+  --text-main: #0f1114;
+  --accent: #2f3d63;
+  --link: #2a4b8f;
+  --warn: #d94a4a;
+  --success: #4a8f7a;
+  --caution: #a07800;
+  --accent-1: #4f5fa1;
+  --accent-2: #2f3d63;
+  /* oya's card rule: light cards use accent-2 borders, dark cards accent-1. */
+  --border: var(--accent-2);
+
+  --accent-text: var(--accent);
+  --success-text: color-mix(in srgb, var(--success) 65%, var(--text-main));
+  --caution-text: color-mix(in srgb, var(--caution) 65%, var(--text-main));
+  --warn-text: color-mix(in srgb, var(--warn) 65%, var(--text-main));
+  --divider: color-mix(in srgb, var(--border) 35%, transparent);
+  --meter-track: rgb(0 0 0 / 0.1);
+  --meter-fill: var(--accent);
+  --highlight: color-mix(in srgb, var(--accent-1) 12%, transparent);
+
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --font-display: "Orbitron", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Noto Sans",
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --primary-bg: #0a0c11;
+  --bubble-bg: #191f2d;
+  --sunken: #141821;
+  --header-bg: #0f1420;
+  --appbar-bg: #151b29;
+  --appbar-text: #cfd4df;
+  --footer-bg: #0f1420;
+  --footer-text: #cfd4df;
+  --text-main: #d3d7e0;
+  --accent: #4f5fa1;
+  --link: #5f7fc9;
+  --warn: #ff4455;
+  --success: #5fa38c;
+  --caution: #f0a820;
+  --accent-1: #4f5fa1;
+  --accent-2: #2f3d63;
+  --border: var(--accent-1);
+
+  --accent-text: color-mix(in srgb, var(--link) 75%, var(--text-main));
+  --success-text: color-mix(in srgb, var(--success) 75%, var(--text-main));
+  --caution-text: var(--caution);
+  --warn-text: color-mix(in srgb, var(--warn) 70%, var(--text-main));
+  --meter-track: rgb(255 255 255 / 0.1);
+  --meter-fill: var(--link);
+  --highlight: color-mix(in srgb, var(--accent-1) 22%, transparent);
+}
+
+/* ---- base (Tailwind preflight subset) ------------------------------------------------ */
+
+*,
+::before,
+::after {
+  box-sizing: border-box;
+  border-width: 0;
+  border-style: solid;
+  border-color: var(--border);
+}
+
+html {
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+  tab-size: 4;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--primary-bg);
+  color: var(--text-main);
+  font-family: var(--font-sans);
+  line-height: inherit;
+  -webkit-font-smoothing: antialiased;
+  transition: color 0.3s var(--ease), background-color 0.3s var(--ease);
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+ul,
+ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+table {
+  border-collapse: collapse;
+  text-indent: 0;
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+}
+
+a {
+  color: var(--link);
+  text-underline-offset: 2px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+}
+
+.icon {
+  width: 1.125rem;
+  height: 1.125rem;
+  flex: 0 0 auto;
+}
+
+.icon--xs {
+  width: 0.75rem;
+  height: 0.75rem;
+  opacity: 0.7;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.skip-link {
+  position: absolute;
+  left: 1rem;
+  top: -3rem;
+  z-index: 20;
+  padding: 0.5rem 1rem;
+  border-radius: 0.5rem;
+  background: var(--accent);
+  color: var(--primary-bg);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.skip-link:focus {
+  top: 1rem;
+}
+
+/* ---- app bar (header.html: appbar-bg + appbar-text + shadow-md) ---------------------- */
+
+.appbar {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  background: var(--appbar-bg);
+  color: var(--appbar-text);
+  box-shadow: var(--shadow-md);
+}
+
+.appbar__inner {
+  max-width: 72rem;
+  margin-inline: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.625rem 0.75rem;
+}
+
+.appbar :focus-visible {
+  outline-color: var(--appbar-text);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.625rem;
+  min-width: 0;
+  margin-right: auto;
+  color: inherit;
+  text-decoration: none;
+}
+
+.brand__mark {
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  flex: 0 0 auto;
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--appbar-text) 10%, transparent);
+}
+
+.brand__mark .icon {
+  width: 1.375rem;
+  height: 1.375rem;
+}
+
+.brand__title {
+  font-family: var(--font-display);
+  font-size: 1.125rem;
+  line-height: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  white-space: nowrap;
+}
+
+.brand__suffix {
+  display: none;
+}
+
+.nav {
+  order: 3;
+  flex: 1 0 100%;
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.nav-link,
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  border-radius: 0.25rem;
+  color: inherit;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  box-shadow: var(--shadow-sm);
+  transition: opacity 0.15s var(--ease), background-color 0.15s var(--ease), box-shadow 0.15s var(--ease);
+}
+
+.nav-link:hover,
+.theme-toggle:hover {
+  opacity: 0.9;
+  background: color-mix(in srgb, var(--appbar-text) 8%, transparent);
+}
+
+.nav-link[aria-current="page"] {
+  background: color-mix(in srgb, var(--appbar-text) 14%, transparent);
+  box-shadow: inset 0 -2px 0 var(--appbar-text);
+}
+
+.theme-toggle {
+  border: 1px solid color-mix(in srgb, var(--appbar-text) 25%, transparent);
+}
+
+.theme-toggle__when-light,
+.theme-toggle__when-dark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.theme-toggle__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+:root[data-theme="dark"] .theme-toggle__when-light,
+:root:not([data-theme="dark"]) .theme-toggle__when-dark {
+  display: none;
+}
+
+@media (min-width: 640px) {
+  .appbar {
+    padding-inline: 1.5rem;
+  }
+
+  .brand__title {
+    font-size: 1.5rem;
+    line-height: 2rem;
+  }
+
+  .nav {
+    order: 0;
+    flex: 0 1 auto;
+  }
+
+  .theme-toggle__label {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip: auto;
+  }
+}
+
+@media (min-width: 1024px) {
+  .brand__suffix {
+    display: inline;
+  }
+}
+
+/* ---- page shell ------------------------------------------------------------------- */
+
+.page {
+  flex: 1 0 auto;
+  padding: 1.5rem 1rem 2.5rem;
+}
+
+.container {
+  max-width: 72rem;
+  margin-inline: auto;
+}
+
+.stack > * + * {
+  margin-top: 2rem;
+}
+
+@media (min-width: 640px) {
+  .page {
+    padding: 2rem 1.5rem 3rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  .page {
+    padding-inline: 2rem;
+  }
+}
+
+.footer {
+  padding: 1rem;
+  background: var(--footer-bg);
+  color: var(--footer-text);
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
+.footer__inner {
+  max-width: 72rem;
+  margin-inline: auto;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.25rem 1rem;
+  opacity: 0.75;
+}
+
+.footer a {
+  color: inherit;
+}
+
+/* ---- typography ------------------------------------------------------------------- */
+
+.page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+}
+
+.page-header__text {
+  min-width: 0;
+}
+
+/* Brand label: text-xs font-semibold uppercase tracking-widest, accent. */
+.eyebrow {
+  font-family: var(--font-display);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-text);
+  overflow-wrap: anywhere;
+}
+
+.page-title {
+  margin-top: 0.25rem;
+  font-family: var(--font-display);
+  font-size: 1.875rem;
+  line-height: 2.25rem;
+  font-weight: 700;
+}
+
+.page-subtitle {
+  margin-top: 0.375rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  opacity: 0.7;
+}
+
+/* In-card section header: text-sm font-bold uppercase tracking-wide opacity-60. */
+.section-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-display);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+  color: color-mix(in srgb, var(--text-main) 70%, transparent);
+}
+
+.section-title .icon {
+  color: var(--accent-text);
+}
+
+/* Group label: text-xs font-semibold uppercase tracking-wide opacity-55. */
+.group-label {
+  margin-bottom: 0.625rem;
+  font-size: 0.75rem;
+  line-height: 1rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+  opacity: 0.6;
+}
+
+.caption {
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: color-mix(in srgb, var(--text-main) 70%, transparent);
+}
+
+.unit {
+  margin-left: 0.25em;
+  font-family: var(--font-sans);
+  font-size: 0.75em;
+  font-weight: 600;
+  opacity: 0.65;
+}
+
+.strong {
+  font-weight: 600;
+}
+
+.status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+
+/* ---- stat tiles (vault/partials/_stat_card.html) ------------------------------------ */
+
+.tiles {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* An odd tile out fills the last row instead of leaving a hole. */
+.tiles > :nth-child(2n + 1):last-child {
+  grid-column: span 2;
+}
+
+@media (min-width: 640px) {
+  .tiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .tiles > :nth-child(2n + 1):last-child {
+    grid-column: auto;
+  }
+
+  .tiles > :nth-child(4n + 3):last-child {
+    grid-column: span 2;
+  }
+
+  .tiles > :nth-child(4n + 2):last-child {
+    grid-column: span 3;
+  }
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--bubble-bg);
+  box-shadow: var(--shadow-sm);
+  transition: opacity 0.3s var(--ease), background-color 0.3s var(--ease), border-color 0.3s var(--ease);
+}
+
+.tile__inner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.tile__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  flex: 0 0 auto;
+  border-radius: 0.5rem;
+  background: var(--primary-bg);
+  color: var(--accent-text);
+  transition: color 0.3s var(--ease);
+}
+
+.tile__icon--success {
+  color: var(--success-text);
+}
+
+.tile__icon--caution {
+  color: var(--caution-text);
+}
+
+.tile__icon--warn {
+  color: var(--warn-text);
+}
+
+.tile__text {
+  min-width: 0;
+}
+
+.tile__value {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  line-height: 2rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile__unit {
+  margin-left: 0.2em;
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  font-weight: 600;
+  opacity: 0.65;
+}
+
+.tile__value--pair {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 1.25rem;
+}
+
+.tile__arrow {
+  margin-right: 0.25rem;
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  color: var(--accent-text);
+}
+
+.tile__label {
+  font-size: 0.75rem;
+  line-height: 1rem;
+  opacity: 0.6;
+}
+
+.tile__foot {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: auto;
+}
+
+.tile__meta {
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: color-mix(in srgb, var(--text-main) 72%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- meters (quota/my_usage.html, bucket_metrics.html) -------------------------------- */
+
+.meter {
+  height: 0.5rem;
+  border-radius: 9999px;
+  overflow: hidden;
+  background: var(--meter-track);
+}
+
+.meter--sm {
+  height: 0.375rem;
+}
+
+.meter__fill {
+  width: 0;
+  height: 100%;
+  border-radius: 9999px;
+  background: var(--meter-fill);
+  transition: width 0.5s var(--ease), background-color 0.3s var(--ease);
+}
+
+.meter__fill.meter__fill--caution {
+  background: var(--caution);
+}
+
+.meter__fill.meter__fill--warn {
+  background: var(--warn);
+}
+
+/* ---- status pills (jess/_status_chip.html) -------------------------------------------- */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem 0.75rem;
+  border: 1px solid currentColor;
+  border-radius: 9999px;
+  background: color-mix(in srgb, currentColor 15%, transparent);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pill--sm {
+  padding: 0.0625rem 0.5rem;
+  font-size: 0.6875rem;
+}
+
+.pill--ok {
+  color: var(--success-text);
+}
+
+.pill--caution {
+  color: var(--caution-text);
+}
+
+.pill--warn {
+  color: var(--warn-text);
+}
+
+.pill--accent {
+  color: var(--accent-text);
+}
+
+.pill--idle {
+  color: color-mix(in srgb, var(--text-main) 75%, transparent);
+  background: var(--sunken);
+  border-color: color-mix(in srgb, var(--text-main) 30%, transparent);
+}
+
+.pill__dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+  background: currentColor;
+}
+
+.pill--live .pill__dot {
+  animation: pulse 2s var(--ease) infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* ---- cards / bubbles (zenobia home.html: rounded-2xl, shadow-md) ------------------------ */
+
+/* Two independent columns on wide screens (wide cards | narrow cards), so a short card
+   never stretches to the height of its neighbour and shows an empty bottom half. */
+.cards,
+.cards__column {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  min-width: 0;
+}
+
+@media (min-width: 1024px) {
+  .cards {
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+    align-items: start;
+  }
+}
+
+.card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: var(--bubble-bg);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+  transition: opacity 0.3s var(--ease), background-color 0.3s var(--ease), border-color 0.3s var(--ease);
+}
+
+.card__body {
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+  padding: 1.25rem;
+}
+
+.card__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  min-width: 0;
+}
+
+#dashboard.is-stale .tile,
+#dashboard.is-stale .card {
+  opacity: 0.6;
+}
+
+/* ---- inset stats, usage blocks, row lists ------------------------------------------- */
+
+.stat-strip {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (min-width: 640px) {
+  .stat-strip {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .stat-strip--6 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1024px) {
+  .stat-strip--6 {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+}
+
+.stat {
+  min-width: 0;
+  padding: 0.625rem 0.875rem;
+  border: 1px solid var(--divider);
+  border-radius: 0.75rem;
+  background: var(--primary-bg);
+}
+
+.stat__label {
+  font-size: 0.75rem;
+  line-height: 1rem;
+  opacity: 0.65;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stat__value {
+  margin-top: 0.125rem;
+  font-family: var(--font-display);
+  font-size: 1.0625rem;
+  line-height: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.usage__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.usage__label {
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+}
+
+.usage__value {
+  font-family: var(--font-display);
+  font-size: 1.125rem;
+  line-height: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Row list with dividers (zenobia home.html + vault metrics.html). */
+.rows {
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--primary-bg);
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.625rem 1rem;
+  border-bottom: 1px solid var(--divider);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  transition: background-color 0.15s var(--ease);
+}
+
+.row:last-child {
+  border-bottom: 0;
+}
+
+.row:hover {
+  background: var(--bubble-bg);
+}
+
+.row__key {
+  font-weight: 500;
+  opacity: 0.65;
+}
+
+.row__value {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* ---- per-thread meters -------------------------------------------------------------- */
+
+.cores {
+  display: grid;
+  gap: 0.5rem 1.25rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (min-width: 640px) {
+  .cores {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.core {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr) 2.5rem;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.core__label {
+  opacity: 0.55;
+}
+
+.core__value {
+  text-align: right;
+}
+
+/* ---- tables --------------------------------------------------------------------------- */
+
+.table-wrap {
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--primary-bg);
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+.table th,
+.table td {
+  padding: 0.625rem 0.75rem;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.table thead th {
+  background: var(--bubble-bg);
+  border-bottom: 1px solid var(--border);
+  color: color-mix(in srgb, var(--text-main) 70%, transparent);
+  font-size: 0.6875rem;
+  line-height: 1rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+  white-space: nowrap;
+}
+
+.table tbody th,
+.table tbody td {
+  border-bottom: 1px solid var(--divider);
+  font-weight: 400;
+}
+
+.table tbody tr:last-child th,
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.table tbody tr {
+  transition: background-color 0.15s var(--ease);
+}
+
+.table tbody tr:hover {
+  background: var(--bubble-bg);
+}
+
+.table .num {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.table tr.is-highlight {
+  background: var(--highlight);
+}
+
+.table tr.is-highlight > :first-child {
+  box-shadow: inset 3px 0 0 var(--accent-text);
+}
+
+.table__empty {
+  padding: 1.25rem 1rem;
+  text-align: center;
+  opacity: 0.6;
+}
+
+.cell-stack {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+}
+
+.cell-sub {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1rem;
+  opacity: 0.6;
+}
+
+@media (min-width: 640px) {
+  .table th,
+  .table td {
+    padding-inline: 1rem;
+  }
+}
+
+@media (max-width: 639.98px) {
+  .hide-sm {
+    display: none;
+  }
+
+  /* The remaining three columns must fit a 390 px phone without scrolling. */
+  .table {
+    font-size: 0.8125rem;
+  }
+
+  .table th,
+  .table td {
+    padding-inline: 0.5rem;
+  }
+}
+
+/* ---- notes, empty states ------------------------------------------------------------ */
+
+.note {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid currentColor;
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+.note .icon {
+  margin-top: 0.0625rem;
+}
+
+.note--caution {
+  color: var(--caution-text);
+}
+
+.note--warn {
+  color: var(--warn-text);
+}
+
+.note__text {
+  color: var(--text-main);
+  overflow-wrap: anywhere;
+}
+
+/* Empty state: rounded-xl border-dashed text-center (vault metrics.html). */
+.empty {
+  display: grid;
+  justify-items: center;
+  gap: 0.375rem;
+  padding: 1.75rem 1.25rem;
+  border: 1px dashed color-mix(in srgb, var(--border) 55%, transparent);
+  border-radius: 0.75rem;
+  text-align: center;
+}
+
+.empty__icon {
+  margin-bottom: 0.25rem;
+  color: var(--accent-text);
+  opacity: 0.8;
+}
+
+.empty__icon .icon {
+  width: 1.75rem;
+  height: 1.75rem;
+}
+
+.empty__title {
+  font-family: var(--font-display);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 700;
+}
+
+.empty__text {
+  max-width: 32rem;
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+  color: color-mix(in srgb, var(--text-main) 70%, transparent);
+  overflow-wrap: anywhere;
+}
+
+.empty .btn {
+  margin-top: 0.625rem;
+}
+
+/* ---- buttons (zenobia home.html, _login_form.html) ------------------------------------ */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.625rem 1.125rem;
+  border-radius: 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+  text-decoration: none;
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: color 0.15s var(--ease), background-color 0.15s var(--ease), border-color 0.15s var(--ease),
+    opacity 0.15s var(--ease);
+}
+
+.btn--primary {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--primary-bg);
+}
+
+.btn--primary:hover {
+  opacity: 0.9;
+}
+
+.btn--ghost {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+}
+
+.btn--ghost:hover {
+  background: var(--primary-bg);
+}
+
+.btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-text);
+}
+
+/* ---- GPU devices ---------------------------------------------------------------------- */
+
+.devices {
+  display: grid;
+  gap: 0.875rem;
+}
+
+.device {
+  display: grid;
+  gap: 0.875rem;
+  padding: 1rem;
+  border: 1px solid var(--divider);
+  border-radius: 0.75rem;
+  background: var(--primary-bg);
+}
+
+.device__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.device__name {
+  font-weight: 600;
+  line-height: 1.25rem;
+  overflow-wrap: anywhere;
+}
+
+.device .rows {
+  background: var(--bubble-bg);
+}
+
+.device .row:hover {
+  background: var(--primary-bg);
+}
+
+.value--caution {
+  color: var(--caution-text);
+}
+
+.value--warn {
+  color: var(--warn-text);
+}
+
+/* ---- motion ----------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

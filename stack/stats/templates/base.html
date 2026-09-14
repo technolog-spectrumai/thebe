@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{{ page_title }} · {{ host_name }}</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/oya.css">
+  <!-- Blocking on purpose: sets data-theme before the first paint, so there is no flash of the wrong theme. -->
+  <script src="/static/theme.js"></script>
+</head>
+<body data-jupyter-url="{{ jupyter_url }}">
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="appbar">
+    <div class="appbar__inner">
+      <a class="brand" href="/">
+        <span class="brand__mark">{{ icon_logo }}</span>
+        <span class="brand__title">JupyterLab<span class="brand__suffix"> over Tailscale</span></span>
+      </a>
+      <nav class="nav" aria-label="Pages">
+        {{ nav }}
+      </nav>
+      <button class="theme-toggle" id="theme-toggle" type="button">
+        <span class="visually-hidden">Theme: </span>
+        <span class="theme-toggle__when-light">{{ icon_sun }}<span class="theme-toggle__label">Light mode</span></span>
+        <span class="theme-toggle__when-dark">{{ icon_moon }}<span class="theme-toggle__label">Dark mode</span></span>
+      </button>
+    </div>
+  </header>
+
+  <main id="main" class="page">
+    <div class="container stack">
+{{ content }}
+    </div>
+  </main>
+
+  <footer class="footer">
+    <div class="footer__inner">
+      <span>{{ app_name }} · {{ host_name }}</span>
+      <span>Published on the Tailscale address only · <a href="/static/OFL.txt">Orbitron licence (OFL)</a></span>
+    </div>
+  </footer>
+
+  {{ scripts }}
+</body>
+</html>

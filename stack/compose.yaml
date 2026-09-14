@@ -1,0 +1,164 @@
+# JupyterLab and the statistics dashboard, published only on the Tailscale IPv4.
+# Every ${...} value comes from the .env next to this file, written by
+# setup-jupyterlab-tailscale.sh. Passwords never pass through interpolation: they are
+# files under ./secrets/, mounted as Compose secrets.
+name: jupyterlab-tailscale
+
+services:
+  jupyterlab:
+    image: jupyterlab-tailscale/jupyterlab:local
+    # Built locally: never ask a registry for this tag, build it when it is missing.
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: jupyterlab
+      args:
+        JLT_UID: "${JLT_UID:-1000}"
+        JLT_GID: "${JLT_GID:-1000}"
+    restart: unless-stopped
+    # tini as PID 1 reaps orphaned kernel and terminal processes.
+    init: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    ports:
+      # The :? guard stops Compose when TS_IP is unset or empty; an empty host part
+      # would publish the port on 0.0.0.0.
+      - "${TS_IP:?Tailscale IPv4 missing - run setup-jupyterlab-tailscale.sh start}:${JUPYTER_PORT:?}:8888"
+    environment:
+      HOME: /home/jupyter
+      # Config, data, lab settings and IPython profile persist on the jupyter_state
+      # volume; the runtime dir (connection files, sockets) stays ephemeral.
+      JUPYTER_CONFIG_DIR: /state/config
+      JUPYTER_DATA_DIR: /state/data
+      JUPYTER_RUNTIME_DIR: /tmp/jupyter-runtime
+      JUPYTERLAB_SETTINGS_DIR: /state/lab/user-settings
+      JUPYTERLAB_WORKSPACES_DIR: /state/lab/workspaces
+      IPYTHONDIR: /state/ipython
+    secrets:
+      - jupyter_hashed_password
+    volumes:
+      # Long syntax so a missing host directory is an error; the short syntax would
+      # let the daemon create it owned by root. The :? guard matters: an empty source
+      # resolves to the project directory itself (the app dir with secrets/).
+      - type: bind
+        source: "${WORKSPACE_DIR:?WORKSPACE_DIR missing - run setup-jupyterlab-tailscale.sh install}"
+        target: /workspace
+        bind:
+          create_host_path: false
+      - jupyter_state:/state
+      - custom_packages:/opt/custom
+    healthcheck:
+      # GET /api is unauthenticated in jupyter_server; the slim image has no curl.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8888/api', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      start_interval: 2s
+      retries: 3
+    # Time for kernels to shut down cleanly before SIGKILL.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  stats:
+    image: jupyterlab-tailscale/stats:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: stats
+      args:
+        JLT_UID: "${JLT_UID:-1000}"
+        JLT_GID: "${JLT_GID:-1000}"
+    # Enabled by COMPOSE_PROFILES='stats' in .env.
+    profiles:
+      - stats
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - "/tmp:size=64m"
+    ports:
+      - "${TS_IP:?Tailscale IPv4 missing - run setup-jupyterlab-tailscale.sh start}:${STATS_PORT:?}:8889"
+    environment:
+      STATS_USER: "${STATS_USER:-jupyter}"
+      JUPYTER_PASSWORD_FILE: /run/secrets/jupyter_password
+      JUPYTER_INTERNAL_URL: http://jupyterlab:8888
+      JUPYTER_PUBLIC_URL: "http://${TS_IP}:${JUPYTER_PORT}/lab"
+      STATS_PUBLIC_URL: "http://${TS_IP}:${STATS_PORT}/"
+      HOST_NAME: "${HOST_NAME:-}"
+      # Host /proc and /sys, read-only, for host-wide CPU, memory, network and sensors.
+      HOST_PROC: /host/proc
+      HOST_SYS: /host/sys
+      WORKSPACE_DIR: /workspace
+      CUSTOM_DIR: /opt/custom
+      PIP_CACHE_DIR: /var/cache/pip
+      TMPDIR: /var/cache/pip/tmp
+    secrets:
+      - jupyter_password
+    volumes:
+      - type: bind
+        source: /proc
+        target: /host/proc
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /sys
+        target: /host/sys
+        read_only: true
+        bind:
+          create_host_path: false
+      # Read-only, only for disk usage of the workspace filesystem.
+      - type: bind
+        source: "${WORKSPACE_DIR:?WORKSPACE_DIR missing - run setup-jupyterlab-tailscale.sh install}"
+        target: /workspace
+        read_only: true
+        bind:
+          create_host_path: false
+      - custom_packages:/opt/custom
+      - pip_cache:/var/cache/pip
+    depends_on:
+      jupyterlab:
+        condition: service_started
+    healthcheck:
+      # /health requires Basic auth like every route; the script sends the header.
+      test: ["CMD", "python", "/srv/stats/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      start_interval: 2s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# File secrets are read-only bind mounts at /run/secrets/<name>. Compose ignores
+# uid/gid/mode for them, so the files keep their host owner (the desktop user, same uid
+# as the container user) and mode 0600.
+secrets:
+  jupyter_hashed_password:
+    file: ./secrets/jupyter_hashed_password
+  jupyter_password:
+    file: ./secrets/jupyter_password
+
+volumes:
+  jupyter_state:
+  custom_packages:
+  pip_cache:

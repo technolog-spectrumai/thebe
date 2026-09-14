@@ -1,0 +1,11 @@
+# Statistics dashboard (FastAPI). Top-level pins only; the image installs
+# requirements.lock.txt, which is `pip freeze` of these in python:3.13-slim-trixie.
+fastapi==0.141.1
+# fastapi sets no upper bound on starlette, so pin it explicitly.
+starlette==1.6.0
+# Plain uvicorn (no [standard] extras): one worker serving a handful of requests.
+uvicorn==0.53.0
+pydantic==2.13.5
+# Pure-Python NVML bindings; they dlopen libnvidia-ml.so.1 injected by the
+# NVIDIA container toolkit and degrade to "no GPU" when it is absent.
+nvidia-ml-py==13.610.43

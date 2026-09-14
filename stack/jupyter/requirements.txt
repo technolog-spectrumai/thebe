@@ -1,0 +1,15 @@
+# Top-level pins for the JupyterLab image. The image installs requirements.lock.txt
+# (the full pip freeze of these pins), never this file directly. After changing a pin,
+# regenerate the lock from this directory:
+#   docker run --rm -i python:3.13-slim-trixie sh -c 'pip install -q --root-user-action=ignore --only-binary=:all: -r /dev/stdin >&2 && pip freeze' < requirements.txt > requirements.lock.txt
+jupyterlab==4.6.3
+jupyter_server==2.21.0
+jupyterlab-server==2.28.0
+ipykernel==7.3.0
+ipywidgets==8.1.9
+numpy==2.5.3
+pandas==3.0.5
+matplotlib==3.11.2
+scipy==1.18.1
+# jupyter_server.auth.passwd / passwd_check use argon2 for the password hash.
+argon2-cffi==25.1.0

@@ -1,0 +1,271 @@
+      <!-- Figures are filled in by /static/stats.js from /api/stats:
+           [data-bind] + [data-format] set text, [data-meter] sets a meter, [data-error] shows a note. -->
+      <section class="page-header">
+        <div class="page-header__text">
+          <p class="eyebrow">{{ host_name }}</p>
+          <h1 class="page-title">Statistics</h1>
+          <p class="page-subtitle" id="host-summary">Collecting host details…</p>
+        </div>
+        <div class="status">
+          <span class="pill pill--idle" id="live-pill" role="status">
+            <span class="pill__dot" aria-hidden="true"></span><span id="live-label">Connecting…</span>
+          </span>
+          <span class="caption" id="updated-at"></span>
+        </div>
+      </section>
+
+      <noscript><p class="note note--caution"><span class="note__text">This dashboard needs JavaScript to load its figures.</span></p></noscript>
+
+      <div class="stack" id="dashboard">
+        <section class="tiles" aria-label="Overview">
+          <article class="tile" id="tile-cpu">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_cpu }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">CPU</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <div class="meter meter--sm" role="meter" aria-label="CPU usage" aria-valuemin="0" aria-valuemax="100"><div class="meter__fill"></div></div>
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+
+          <article class="tile" id="tile-memory">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_memory }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">Memory</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <div class="meter meter--sm" role="meter" aria-label="Memory usage" aria-valuemin="0" aria-valuemax="100"><div class="meter__fill"></div></div>
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+
+          <article class="tile" id="tile-disk">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_disk }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">Disk</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <div class="meter meter--sm" role="meter" aria-label="Workspace disk usage" aria-valuemin="0" aria-valuemax="100"><div class="meter__fill"></div></div>
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+
+          <article class="tile" id="tile-uptime">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_clock }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">Uptime</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+
+          <article class="tile" id="tile-gpu">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_gpu }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">GPU</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <div class="meter meter--sm" role="meter" aria-label="GPU utilisation" aria-valuemin="0" aria-valuemax="100"><div class="meter__fill"></div></div>
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+
+          <article class="tile" id="tile-kernels">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_kernel }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">Kernels</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+
+          <article class="tile" id="tile-network">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_network }}</span>
+              <div class="tile__text">
+                <p class="tile__value tile__value--pair">
+                  <span class="tile__pair"><span class="tile__arrow" aria-hidden="true">↓</span><span class="visually-hidden">Download </span><span data-part="rx">—</span><span class="tile__unit" data-part="rx-unit"></span></span>
+                  <span class="tile__pair"><span class="tile__arrow" aria-hidden="true">↑</span><span class="visually-hidden">Upload </span><span data-part="tx">—</span><span class="tile__unit" data-part="tx-unit"></span></span>
+                </p>
+                <p class="tile__label">Network</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
+        </section>
+
+        <div class="cards">
+          <!-- Wide column on desktop; on narrow screens both columns simply stack. -->
+          <div class="cards__column">
+            <section class="card" aria-labelledby="cpu-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="cpu-title">{{ icon_cpu }}Processor</h2>
+                  <span class="caption" data-bind="host.cpu_model"></span>
+                </div>
+                <p class="note note--caution" data-error="cpu.error" hidden>{{ icon_alert }}<span class="note__text"></span></p>
+                <div class="stat-strip stat-strip--6">
+                  <div class="stat"><p class="stat__label">Usage</p><p class="stat__value" data-bind="cpu.percent" data-format="percent">—</p></div>
+                  <div class="stat"><p class="stat__label">Temperature</p><p class="stat__value" data-bind="cpu.temperature_c" data-format="celsius">—</p></div>
+                  <div class="stat"><p class="stat__label">Threads</p><p class="stat__value" data-bind="cpu.cores" data-format="integer">—</p></div>
+                  <div class="stat"><p class="stat__label">Load 1 min</p><p class="stat__value" data-bind="host.load.0" data-format="load">—</p></div>
+                  <div class="stat"><p class="stat__label">Load 5 min</p><p class="stat__value" data-bind="host.load.1" data-format="load">—</p></div>
+                  <div class="stat"><p class="stat__label">Load 15 min</p><p class="stat__value" data-bind="host.load.2" data-format="load">—</p></div>
+                </div>
+                <div>
+                  <p class="group-label">Per thread</p>
+                  <div class="cores" id="cpu-cores" role="list" aria-label="Usage per thread"></div>
+                </div>
+              </div>
+            </section>
+
+            <section class="card" aria-labelledby="network-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="network-title">{{ icon_network }}Network</h2>
+                  <span class="caption">Totals count physical interfaces</span>
+                </div>
+                <p class="note note--caution" data-error="network.error" hidden>{{ icon_alert }}<span class="note__text"></span></p>
+                <div class="stat-strip">
+                  <div class="stat"><p class="stat__label">Download</p><p class="stat__value" data-bind="network.totals.rx_rate" data-format="rate">—</p></div>
+                  <div class="stat"><p class="stat__label">Upload</p><p class="stat__value" data-bind="network.totals.tx_rate" data-format="rate">—</p></div>
+                  <div class="stat"><p class="stat__label">Received since boot</p><p class="stat__value" data-bind="network.totals.rx_bytes" data-format="bytes">—</p></div>
+                  <div class="stat"><p class="stat__label">Sent since boot</p><p class="stat__value" data-bind="network.totals.tx_bytes" data-format="bytes">—</p></div>
+                </div>
+                <div class="table-wrap">
+                  <table class="table">
+                    <caption class="visually-hidden">Host network interfaces</caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">Interface</th>
+                        <th scope="col" class="num">Down</th>
+                        <th scope="col" class="num">Up</th>
+                        <th scope="col" class="num hide-sm">Received</th>
+                        <th scope="col" class="num hide-sm">Sent</th>
+                      </tr>
+                    </thead>
+                    <tbody id="net-rows">
+                      <tr><td colspan="5" class="table__empty">Waiting for data…</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </section>
+
+            <section class="card" aria-labelledby="kernels-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="kernels-title">{{ icon_kernel }}Kernels</h2>
+                  <span class="pill pill--idle" id="kernels-pill">Checking…</span>
+                </div>
+                <p class="note note--warn" id="kernels-error" hidden>{{ icon_alert }}<span class="note__text"></span></p>
+                <div class="table-wrap" id="kernels-table" hidden>
+                  <table class="table">
+                    <caption class="visually-hidden">Running Jupyter kernels</caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">Kernel</th>
+                        <th scope="col">State</th>
+                        <th scope="col" class="num hide-sm">Connections</th>
+                        <th scope="col" class="num">Last activity</th>
+                      </tr>
+                    </thead>
+                    <tbody id="kernel-rows"></tbody>
+                  </table>
+                </div>
+                <div class="empty" id="kernels-empty" hidden>
+                  <span class="empty__icon">{{ icon_notebook }}</span>
+                  <p class="empty__title">No running kernels</p>
+                  <p class="empty__text">Open a notebook in JupyterLab to start one.</p>
+                  <a class="btn btn--ghost" id="kernels-open" href="{{ jupyter_url }}" target="_blank" rel="noopener noreferrer" hidden>{{ icon_external }}Open JupyterLab</a>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div class="cards__column">
+            <section class="card" aria-labelledby="memory-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="memory-title">{{ icon_memory }}Memory</h2>
+                </div>
+                <p class="note note--caution" data-error="memory.error" hidden>{{ icon_alert }}<span class="note__text"></span></p>
+                <div class="usage">
+                  <div class="usage__head"><span class="usage__label">RAM</span><span class="usage__value" data-bind="memory.percent" data-format="percent">—</span></div>
+                  <div class="meter" role="meter" aria-label="RAM usage" aria-valuemin="0" aria-valuemax="100" data-meter="memory.percent"><div class="meter__fill"></div></div>
+                </div>
+                <ul class="rows">
+                  <li class="row"><span class="row__key">Used</span><span class="row__value" data-bind="memory.used" data-format="bytes">—</span></li>
+                  <li class="row"><span class="row__key">Available</span><span class="row__value" data-bind="memory.available" data-format="bytes">—</span></li>
+                  <li class="row"><span class="row__key">Total</span><span class="row__value" data-bind="memory.total" data-format="bytes">—</span></li>
+                </ul>
+                <div class="usage">
+                  <div class="usage__head"><span class="usage__label">Swap</span><span class="usage__value" data-bind="memory.swap_percent" data-format="percent">—</span></div>
+                  <div class="meter" role="meter" aria-label="Swap usage" aria-valuemin="0" aria-valuemax="100" data-meter="memory.swap_percent"><div class="meter__fill"></div></div>
+                </div>
+                <ul class="rows">
+                  <li class="row"><span class="row__key">Used</span><span class="row__value" data-bind="memory.swap_used" data-format="bytes">—</span></li>
+                  <li class="row"><span class="row__key">Total</span><span class="row__value" data-bind="memory.swap_total" data-format="bytes">—</span></li>
+                </ul>
+              </div>
+            </section>
+
+            <section class="card" aria-labelledby="disk-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="disk-title">{{ icon_disk }}Workspace disk</h2>
+                  <code class="caption mono" data-bind="disk.path"></code>
+                </div>
+                <p class="note note--caution" data-error="disk.error" hidden>{{ icon_alert }}<span class="note__text"></span></p>
+                <div class="usage">
+                  <div class="usage__head"><span class="usage__label">Used</span><span class="usage__value" data-bind="disk.percent" data-format="percent">—</span></div>
+                  <div class="meter" role="meter" aria-label="Workspace disk usage" aria-valuemin="0" aria-valuemax="100" data-meter="disk.percent"><div class="meter__fill"></div></div>
+                </div>
+                <ul class="rows">
+                  <li class="row"><span class="row__key">Used</span><span class="row__value" data-bind="disk.used" data-format="bytes">—</span></li>
+                  <li class="row"><span class="row__key">Free</span><span class="row__value" data-bind="disk.free" data-format="bytes">—</span></li>
+                  <li class="row"><span class="row__key">Total</span><span class="row__value" data-bind="disk.total" data-format="bytes">—</span></li>
+                </ul>
+              </div>
+            </section>
+
+            <section class="card" aria-labelledby="gpu-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="gpu-title">{{ icon_gpu }}GPU</h2>
+                  <span class="pill pill--idle" id="gpu-pill">Checking…</span>
+                </div>
+                <div class="devices" id="gpu-devices" hidden></div>
+                <div class="empty" id="gpu-empty" hidden>
+                  <span class="empty__icon">{{ icon_gpu }}</span>
+                  <p class="empty__title">No NVIDIA GPU visible</p>
+                  <p class="empty__text" id="gpu-reason"></p>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
