@@ -127,7 +127,10 @@ class CsrfGuardMiddleware:
     does not stop another web page from posting to the dashboard. Every request below the
     prefix other than GET/HEAD must therefore
       - not be marked cross-site by Sec-Fetch-Site (same-origin or none only),
-      - carry an Origin equal to this server's own scheme://host, if it carries one,
+      - carry an Origin equal to this server's own scheme://host, if it carries one. The
+        scheme is the connection's own ("https" when serve.py runs uvicorn with the Tailscale
+        certificate); uvicorn runs with proxy_headers=False, so no X-Forwarded-Proto header
+        can change it,
       - send X-Requested-With: thebe and Content-Type: application/json. A plain HTML form
         can set neither, and a cross-site fetch() with them needs a CORS preflight, which
         this app never approves.

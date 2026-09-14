@@ -4,6 +4,9 @@ Kernel listing needs a logged-in session. JupyterLab verifies every login with a
 (10 MiB, 10 iterations), so the session cookie is kept for the life of the process and
 a new login happens only when an API call answers 403 (expired cookie, or a new
 password changed JupyterLab's cookie secret) - never once per poll.
+
+The internal URL is http://jupyterlab:8888, or https://jupyterlab:8888 when JupyterLab
+serves HTTPS (compose.tls.yaml).
 """
 
 import http.client
@@ -11,6 +14,7 @@ import http.cookiejar
 import json
 import logging
 import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -32,10 +36,26 @@ class _Forbidden(Exception):
     """An API call answered 403: the session is missing or no longer valid."""
 
 
+def _internal_tls_context() -> ssl.SSLContext:
+    # Internal Compose network only. JupyterLab's certificate names the public MagicDNS host
+    # (<machine>.<tailnet>.ts.net), not "jupyterlab", so it cannot be verified for this URL;
+    # the connection is still encrypted, and it never leaves the Docker bridge network.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+_INTERNAL_TLS = _internal_tls_context()
+
+
 def _opener(*handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
     # An empty ProxyHandler: HTTP(S)_PROXY from the environment must never route the
-    # internal URL (or the password) through a proxy.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), *handlers)
+    # internal URL (or the password) through a proxy. The HTTPS handler only applies to an
+    # https:// internal URL.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_INTERNAL_TLS), *handlers
+    )
 
 
 def _describe(exc: Exception) -> str:
