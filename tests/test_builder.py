@@ -374,6 +374,8 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(builder.service_url(dict(runtime, TS_IP="0.0.0.0"), "jupyterlab"), "")
         self.assertEqual(builder.service_url(dict(runtime, STATS_PORT=""), "stats"), "")
         self.assertEqual(builder.service_url({}, "jupyterlab"), "")
+        deps = next(page for page in builder.PAGES if page.path == "/dependencies")
+        self.assertEqual(builder.page_url(runtime, deps), "http://100.82.217.101:8889/dependencies")
 
     def test_clean_line_mask_and_child_environment(self):
         self.assertEqual(builder.clean_line("\x1b[1;31mred\x1b[0m text\r\n"), "red text")
@@ -983,6 +985,24 @@ class WindowTests(unittest.TestCase):
         window.start_or_restart()
         self.wait_idle(window, 2)
         self.assertEqual(window.results[-1].argv[-1], "start")
+
+    def test_every_page_has_an_open_link(self):
+        opened = []
+        window = self.window(open_url=lambda url: opened.append(url.toString()) or True)
+        extra = [page for page in builder.PAGES if page.service == "stats"][1:]
+        self.assertEqual([page.path for page in extra], ["/dependencies", "/api/stats", "/health"])
+        (self.state / "ps.json").write_text(RUNNING_PS)
+        self.refresh_status(window)
+        self.assertTrue(wait_until(lambda: window.services))
+        for page in extra:
+            self.assertTrue(window.page_buttons[page].isEnabled(), page.label)
+            window.page_buttons[page].click()
+        self.assertEqual(opened, [f"http://{TS_IP}:8889{page.path}" for page in extra])
+
+        (self.state / "ps.json").write_text(RUNNING_PS.replace('"running"', '"exited"'))
+        window.refresh_status()
+        self.assertTrue(wait_until(lambda: not window._any_active() and not window.status_runner.is_running()))
+        self.assertFalse(any(window.page_buttons[page].isEnabled() for page in extra))
 
     def test_stop_and_restart_apply_to_a_crash_looping_container(self):
         (self.state / "ps.json").write_text(RUNNING_PS.replace('"running"', '"restarting"'))

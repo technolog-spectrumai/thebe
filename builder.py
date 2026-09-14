@@ -65,10 +65,14 @@ class Page(NamedTuple):
 
 
 # Every page the stack serves, in one table. The first page of a service is
-# the one its Open button uses; later stages append more rows here.
+# the one its Open button uses; the others get a link under that service, so
+# nobody has to type an address into the tablet's or laptop's browser.
 PAGES = (
     Page("JupyterLab", "jupyterlab", "JUPYTER_PORT", "/lab"),
     Page("Statistics", "stats", "STATS_PORT", "/"),
+    Page("Dependencies", "stats", "STATS_PORT", "/dependencies"),
+    Page("Stats API", "stats", "STATS_PORT", "/api/stats"),
+    Page("Health", "stats", "STATS_PORT", "/health"),
 )
 
 KILL_GRACE_MS = 10_000
@@ -1247,6 +1251,7 @@ class MainWindow(QMainWindow):
     def _build_services_card(self) -> QFrame:
         card, layout = self._card("Services")
         self.rows: dict[str, ServiceRow] = {}
+        self.page_buttons: dict[Page, QPushButton] = {}
         for index, (service, name) in enumerate(SERVICES):
             if index:
                 divider = QFrame()
@@ -1269,6 +1274,19 @@ class MainWindow(QMainWindow):
             line.addWidget(row.open_button, 0, Qt.AlignmentFlag.AlignVCenter)
             layout.addLayout(line)
             self.rows[service] = row
+            # The service's other pages, as links under its row (indented past the dot).
+            extra = [page for page in PAGES if page.service == service][1:]
+            if extra:
+                links = QHBoxLayout()
+                links.setContentsMargins(16, 0, 0, 0)
+                links.setSpacing(0)
+                for page in extra:
+                    button = self._button(page.label, "linkButton", partial(self.open_link, page),
+                                          f"Open {name} · {page.label} in the browser")
+                    links.addWidget(button)
+                    self.page_buttons[page] = button
+                links.addStretch(1)
+                layout.addLayout(links)
         layout.addStretch(1)
         self.services_hint = self._label(
             "State refreshes every 4 seconds. Open uses the deployed Tailscale address.", "hint", wrap=True)
@@ -1437,6 +1455,11 @@ class MainWindow(QMainWindow):
                     _repolish(widget, kind=value)
             running = entry is not None and entry["state"] == "running"
             row.open_button.setEnabled(running and bool(url) and not self._busy)
+            for page, button in self.page_buttons.items():
+                if page.service == service:
+                    link = page_url(self.runtime, page)
+                    button.setEnabled(running and bool(link) and not self._busy)
+                    button.setToolTip(link or f"{page.label} is not deployed")
 
     def _any_active(self) -> bool:
         """A container runs, restarts (a crash loop) or is paused: Stop and Restart apply."""
@@ -1680,7 +1703,12 @@ class MainWindow(QMainWindow):
             self._run_installer("restart" if self._any_active() else "start")
 
     def open_page(self, service: str, *_args: object) -> None:
-        url = service_url(self.runtime, service)
+        self._open(service_url(self.runtime, service))
+
+    def open_link(self, page: Page, *_args: object) -> None:
+        self._open(page_url(self.runtime, page))
+
+    def _open(self, url: str) -> None:
         if not url:
             return
         self.log(f"# Opening {url}")
