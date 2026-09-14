@@ -37,7 +37,8 @@ merely written.
 **Stage 3 — Dependencies page**
 - [x] Internal `deps` runner (JupyterLab image, no host mounts, no published port, its own random token) + `/dependencies` page and proxied API in stats (Basic auth, CSRF guard, validated requirements, one cancellable job, live log, sizes, cache clear); adversarial review + fixes; sandbox run incl. torch CPU install, cancel and interruption
 - [x] Live deploy (24 checks): three healthy containers, page/API/CSRF/validation, `rich` installed from the page and imported by a real kernel from the custom venv while numpy stays the image's, GPU visible to kernels (`cuInit` 0, 1 device), reset + cache clear, idempotent re-install
-- [ ] `verify_cuda.sh`: user-run end-to-end check (GPU in the containers, libcuda from a real kernel, optional CUDA torch install through the Dependencies page, `torch.cuda.is_available()` + a GPU matmul, optional cleanup) — your choice instead of me downloading ≈3 GB
+- [x] `verify_cuda.sh`: end-to-end check (GPU on host and in the container, libcuda from a real kernel, optional torch install through the Dependencies page, `torch.cuda.is_available()` + a GPU matmul, optional cleanup). Validated live: shellcheck clean, exit 4 without torch, refusals without `--yes`/with `--cleanup` alone, full install → verify → cleanup flow with the CPU build (correctly reported as CPU-only, package list restored)
+- [ ] Run `./verify_cuda.sh --install --cleanup` yourself for the real CUDA build (≈3 GB download)
 - [x] Commit (code)
 - [x] README (Dependencies section, runner token, torch examples, persistence/security/troubleshooting updates) + commit
 

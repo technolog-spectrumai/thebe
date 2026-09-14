@@ -415,6 +415,25 @@ container. When enabled, `compose.gpu.yaml` gives `jupyterlab` and `stats` `gpus
 
 Force it with `JLT_GPU=on ./setup-jupyterlab-tailscale.sh update` or disable it with `JLT_GPU=off`.
 
+### Verifying PyTorch on the GPU
+
+`verify_cuda.sh` checks the whole path a notebook uses, from inside the running stack:
+
+```bash
+./verify_cuda.sh                        # GPU on the host and in the container, libcuda from a real kernel,
+                                        # and PyTorch on the GPU if it is already installed
+./verify_cuda.sh --install              # also install PyTorch with CUDA (about 3 GB) from the Dependencies page
+./verify_cuda.sh --install --cleanup    # install, verify, then restore the previous package list
+```
+
+It starts a kernel through the same `python3` kernelspec as notebooks, prints
+`torch.cuda.is_available()`, the device name and a GPU matrix multiply compared with the CPU, and
+exits with 0 when PyTorch uses the GPU, 1 when a check fails, 3 when the stack is not running, and 4
+when the GPU works but PyTorch is not installed. Installing asks for confirmation (or `--yes`),
+refuses with less than 8 GB free (`MIN_FREE_GB`), and cancels the install on Ctrl+C. The requirement
+lines can be changed with `TORCH_REQUIREMENTS`. Calls to the Dependencies page run inside the stats
+container, so the password is never handled by the script.
+
 ## Security model
 
 - **Reachability.** JupyterLab and the dashboard are published only on the Tailscale IPv4 address;
@@ -556,6 +575,7 @@ builder.py                         optional PyQt6 builder (thin frontend over th
 run-builder.sh                     creates .venv with the pinned PyQt6 and starts the builder
 requirements-builder.txt           PyQt6 pins for the builder venv
 tests/test_builder.py              offscreen tests for the builder
+verify_cuda.sh                     end-to-end check that notebooks can use the GPU with PyTorch
 plan.md                            implementation plan and progress
 .env                               your settings (created by install or the builder, not committed)
 .venv/                             builder virtualenv (created by run-builder.sh, not committed)
