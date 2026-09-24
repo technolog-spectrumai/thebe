@@ -30,6 +30,7 @@ share one `config.yaml` and keep their own dependencies in a project-local `.ven
 - [Credentials and settings](#credentials-and-settings)
 - [Graphical builder](#graphical-builder)
 - [Headless runner and config.yaml](#headless-runner-and-configyaml)
+- [Imported directories](#imported-directories)
 - [Commands](#commands)
 - [Persistence](#persistence)
 - [Statistics dashboard](#statistics-dashboard)
@@ -289,7 +290,8 @@ The window follows the desktop's light or dark mode, using the same oya palette 
 | NVIDIA GPU: Expect an NVIDIA GPU | `NVIDIA` ([GPU support](#gpu-support)). Ticked: the notebooks get the GPU, and Deploy and Start stop with the reason when it is not usable. Unticked: never use a GPU. Until it is clicked, `auto` is kept (the box shows whether `nvidia-smi` exists). An exported `JLT_GPU` is ignored here. |
 | Services | A state dot and badge for JupyterLab and Statistics (Running, Starting, Unhealthy, Restarting, Stopped, Not deployed, Disabled), refreshed every 4 seconds, with the deployed URL and an **Open** button that starts the browser. |
 | Page links | Under Statistics: **Dependencies**, **Stats API** and **Health** open those pages directly, so no address has to be typed. Like Open, they are enabled while the container runs and always use the deployed address and port. |
-| **Deploy / Update** | Validates, saves `config.yaml` and the installer's `.env`, then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
+| Imported directories | Up to 7 host directories (path, **Browse…**, optional name) copied into the workspace on Deploy; see [Imported directories](#imported-directories). Only the filled rows and one empty row are shown; an empty row is an unused slot. The card lists what goes where and any problem (missing directory, same name twice, the workspace itself). |
+| **Deploy / Update** | Validates, saves `config.yaml` and the installer's `.env`, copies the imported directories (`run.py import`, when any are set), then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
 | **Start / Restart** | `start` when nothing is running, otherwise `restart`. |
 | **Stop** | `stop` (`docker compose stop`). |
 | Output | Read-only log of every command and its output. |
@@ -365,6 +367,7 @@ check `config.yaml` and to write the installer's `.env`, and both hand the real 
 ./run.sh check           # check config.yaml and show what would be deployed; changes nothing
 ./run.sh start           # also: restart, stop, status, update, logs [...], uninstall [...]
 ./run.sh init            # create config.yaml (from .env, else the defaults) if it is missing
+./run.sh import          # copy the import_dirs into the workspace now (install and update do it too)
 ./run.sh --config /path/other.yaml install
 ```
 
@@ -391,6 +394,10 @@ theme: "amazing"                        # THEME
 https: "auto"                           # HTTPS: auto | off
 nvidia: auto                            # NVIDIA: true | false | auto
 # workspace: "~/jupyter-workspace"      # JLT_WORKSPACE_DIR; relative paths start at config.yaml's directory
+import_dirs:                            # copied into <workspace>/imported/ on install and update
+  - "~/tools"
+  - path: "/opt/lab/tools"
+    name: "lab-tools"
 ```
 
 - A missing setting uses its default. The rules are the script's ([Credentials and
@@ -402,6 +409,48 @@ nvidia: auto                            # NVIDIA: true | false | auto
   `JLT_WORKSPACE_DIR` wins over `workspace`, as it does for the script.
 - `config.yaml` is the source; `.env` is generated from it. If you use only the script, keep editing
   `.env` — but the builder and `run.sh` overwrite it from `config.yaml` on their next run.
+
+## Imported directories
+
+Up to seven host directories — scripts, tools, small datasets — can be **copied** into the notebook
+workspace, so notebooks can use them at `/workspace/imported/<name>/`:
+
+```yaml
+import_dirs:
+  - "~/tools/scripts"          # -> ~/jupyter-workspace/imported/scripts/
+  - path: "/opt/lab/tools"     # -> ~/jupyter-workspace/imported/lab-tools/
+    name: "lab-tools"
+```
+
+In the builder: the **Imported directories** card (path or **Browse…**, optional name). Headless:
+`import_dirs` in `config.yaml`. Both use the same code (`thebe/imports.py`, run as `run.py import`).
+
+- **When:** on `./run.sh install` / `update` and on Deploy in the builder, before the installer
+  (re)starts JupyterLab. `./run.sh import` copies without deploying. `start` does not copy; the
+  script used on its own (`setup-jupyterlab-tailscale.sh install`) does not read `config.yaml` and
+  does not copy either.
+- **A plain copy, nothing more.** No bind mount, no symbolic link, no extra path visible to any
+  container: JupyterLab keeps seeing only `/workspace`. Changing the source later does not change the
+  copy until the next Deploy.
+- **Symbolic links are never followed or created.** Links inside a source (to files or directories)
+  are skipped and listed in the deployment log; so are sockets, pipes and devices, and files that are
+  not readable.
+- **Checked first, all or nothing.** Every source must exist, be a real directory (not itself a
+  symbolic link — select the directory it points to), be readable, and neither be, lie inside nor
+  contain the workspace. Two sources with the same directory name need a `name` for one of them. Any
+  problem refuses the whole deploy before anything is copied or written.
+- **Redeploying updates the same copy.** Each copy records its source in `imported/<name>/.thebe-import`.
+  Files that differ from the source (size or modification time) are replaced, each atomically;
+  identical files are left alone, and nothing is deleted: files you add in JupyterLab stay, and files deleted on the host stay in the copy (delete
+  them in JupyterLab). A copy is never duplicated as `<name> (1)`. A destination that belongs to
+  another source, or that Thebe did not create, is refused rather than merged into.
+- **Failures are contained.** A failed copy (disk full, I/O error) names the source and the file, stops
+  the deploy before the installer runs, and touches nothing outside that copy; every file copied so
+  far is complete, and the next Deploy continues where it stopped.
+- Removing a directory from the list leaves its copy in the workspace.
+
+A copied file edited in JupyterLab no longer matches its source, so the next Deploy puts the host's
+version back. Keep work you want to keep outside `imported/` (new files inside it are kept).
 
 ## Commands
 
@@ -434,6 +483,7 @@ docker compose logs -f jupyterlab
 | Data | Where | Survives `update`/recreation | Removed by `uninstall` |
 | --- | --- | --- | --- |
 | Notebooks and files | `~/jupyter-workspace` (bind mount at `/workspace`) | yes | no (only with `--delete-workspace`) |
+| Copies of [imported directories](#imported-directories) | `~/jupyter-workspace/imported/<name>/` | yes (updated on Deploy) | no (only with `--delete-workspace`) |
 | JupyterLab settings, workspace layouts, IPython history, login cookie secret | Docker volume `jupyterlab-tailscale_jupyter_state` (`/state`) | yes | yes |
 | Packages from the Dependencies page (the venv, its requirements file and the last job log) | Docker volume `jupyterlab-tailscale_custom_packages` (`/opt/custom`, read-only in `jupyterlab`) | yes | yes |
 | pip download cache of the package runner | Docker volume `jupyterlab-tailscale_pip_cache` | yes | yes |
@@ -786,7 +836,8 @@ builder.py                         optional PyQt6 builder (thin frontend over th
 run-builder.sh                     creates .venv with the pinned PyQt6 and starts the builder
 run.py, run.sh                     headless runner: deploy and run from config.yaml without the GUI
 thebe/                             Qt-free core shared by both: settings and validation, config.yaml,
-                                   stack state (Tailscale, compose ps), theme tokens, the runner's CLI
+                                   stack state (Tailscale, compose ps), theme tokens, the runner's CLI,
+                                   imports.py (copying host directories into the workspace)
 lib/venv.sh                        the project-local .venv bootstrap used by run.sh and run-builder.sh
 requirements-run.txt               PyYAML pin (run.sh and the builder)
 requirements-builder.txt           PyQt6 pins for the builder venv (includes requirements-run.txt)
