@@ -24,7 +24,8 @@ readonly DEFAULT_STATS_ENABLED='1'
 readonly DEFAULT_STATS_USER='jupyter'
 readonly DEFAULT_THEME='amazing'
 readonly DEFAULT_HTTPS='auto'
-readonly -a SETTINGS_KEYS=(JUPYTER_PASSWORD JUPYTER_PORT STATS_ENABLED STATS_PORT STATS_USER THEME HTTPS)
+readonly DEFAULT_NVIDIA='auto'
+readonly -a SETTINGS_KEYS=(JUPYTER_PASSWORD JUPYTER_PORT STATS_ENABLED STATS_PORT STATS_USER THEME HTTPS NVIDIA)
 readonly JUPYTER_IMAGE="${PROJECT}/jupyterlab:local"
 readonly STATS_IMAGE="${PROJECT}/stats:local"
 readonly SYSCTL_FILE='/etc/sysctl.d/60-jupyterlab-tailscale.conf'
@@ -288,13 +289,16 @@ default_settings_content() {
     '# THEME colours the dashboard and the builder: a file name from stack/theme without .json.' \
     "# HTTPS: auto serves HTTPS on the Tailscale name when MagicDNS and HTTPS certificates are" \
     "# enabled in the tailnet (certificate from 'tailscale cert'); off keeps plain HTTP." \
+    '# NVIDIA: 1 expects an NVIDIA GPU (install/start fail when Docker cannot use it), 0 runs' \
+    '# without one (no GPU check at all), auto uses the GPU when it works.' \
     "JUPYTER_PASSWORD='${DEFAULT_PASSWORD}'" \
     "JUPYTER_PORT='${DEFAULT_JUPYTER_PORT}'" \
     "STATS_ENABLED='${DEFAULT_STATS_ENABLED}'" \
     "STATS_PORT='${DEFAULT_STATS_PORT}'" \
     "STATS_USER='${DEFAULT_STATS_USER}'" \
     "THEME='${DEFAULT_THEME}'" \
-    "HTTPS='${DEFAULT_HTTPS}'"
+    "HTTPS='${DEFAULT_HTTPS}'" \
+    "NVIDIA='${DEFAULT_NVIDIA}'"
 }
 
 ensure_settings_file() {
@@ -322,8 +326,8 @@ normalize_bool() {
 }
 
 # Loads the settings into JUPYTER_PASSWORD, JUPYTER_PORT, STATS_ENABLED, STATS_PORT,
-# STATS_USER, THEME, HTTPS. Missing keys (or a missing file) fall back to the defaults. Problems are
-# collected in SETTINGS_PROBLEMS; callers decide whether they are fatal.
+# STATS_USER, THEME, HTTPS, NVIDIA (auto, 1 or 0). Missing keys (or a missing file) fall back to
+# the defaults. Problems are collected in SETTINGS_PROBLEMS; callers decide whether they are fatal.
 load_settings() {
   local key known entry bool themes
   declare -gA SETTINGS_RAW=()
@@ -352,6 +356,7 @@ load_settings() {
   STATS_USER="${SETTINGS_RAW[STATS_USER]-$DEFAULT_STATS_USER}"
   THEME="${SETTINGS_RAW[THEME]-$DEFAULT_THEME}"
   HTTPS="${SETTINGS_RAW[HTTPS]-$DEFAULT_HTTPS}"
+  NVIDIA="${SETTINGS_RAW[NVIDIA]-$DEFAULT_NVIDIA}"
 
   local length="${#JUPYTER_PASSWORD}"
   if ((length < 8 || length > 128)); then
@@ -402,6 +407,14 @@ load_settings() {
     auto | off) ;;
     *) SETTINGS_PROBLEMS+=("HTTPS must be one of: auto, off (got $(printf '%q' "$HTTPS"))") ;;
   esac
+
+  if [[ "${NVIDIA,,}" == auto ]]; then
+    NVIDIA='auto'
+  elif bool="$(normalize_bool "$NVIDIA")"; then
+    NVIDIA="$bool"
+  else
+    SETTINGS_PROBLEMS+=("NVIDIA must be auto, 1 or 0 (true/false, yes/no, on/off also work; got $(printf '%q' "$NVIDIA"))")
+  fi
 }
 
 require_valid_settings() {
@@ -505,8 +518,10 @@ docker_usable() {
 # ports, ...) applies. Shell variables take precedence over .env in Compose, so the contract
 # variables are unset first: a stray exported TS_IP must not override the deployed one.
 compose() {
-  local progress=()
+  local progress=() override=()
   [[ -t 1 ]] || progress=(--progress plain)
+  # One start without the GPU override (start_check_gpu); the runtime .env keeps it.
+  [[ -z "$COMPOSE_FILE_OVERRIDE" ]] || override=(env "COMPOSE_FILE=${COMPOSE_FILE_OVERRIDE}")
   (
     unset COMPOSE_PROJECT_NAME COMPOSE_FILE COMPOSE_PROFILES COMPOSE_ENV_FILES COMPOSE_PATH_SEPARATOR \
       TS_IP JUPYTER_PORT STATS_PORT STATS_USER THEME WORKSPACE_DIR HOST_NAME JLT_UID JLT_GID \
@@ -516,7 +531,7 @@ compose() {
     # These images are never pushed; without the attestation the ID only changes with the content.
     # (Compose 5.3 ignores 'provenance: false' in compose.yaml, hence the environment variable.)
     export BUILDX_NO_DEFAULT_ATTESTATIONS=1
-    cd "$APP_DIR" && exec docker compose "${progress[@]}" "$@"
+    cd "$APP_DIR" && exec "${override[@]}" docker compose "${progress[@]}" "$@"
   )
 }
 
@@ -631,6 +646,10 @@ if expires <= time.time():
     done(days=days, not_after=not_after, problem="expired")
 done(1, days, not_after)
 '
+
+# The GPU mode of this deploy (auto, 1 or 0; see gpu_mode) and a COMPOSE_FILE for this run only.
+GPU_MODE="$DEFAULT_NVIDIA"
+COMPOSE_FILE_OVERRIDE=''
 
 # Defaults until resolve_https_state runs: plain HTTP on the Tailscale IP.
 HTTPS_MODE="$DEFAULT_HTTPS"
@@ -970,12 +989,23 @@ gpu_available() {
   return 1
 }
 
-gpu_requested() {
-  case "${JLT_GPU:-auto}" in
-    on) return 0 ;;
-    off) return 1 ;;
-    *) gpu_available ;;
+# The GPU mode for this deploy (auto, 1 or 0): JLT_GPU when it is set, else the NVIDIA setting.
+gpu_mode() {
+  case "${JLT_GPU:-}" in
+    on) printf '1\n' ;;
+    off) printf '0\n' ;;
+    auto) printf 'auto\n' ;;
+    *) printf '%s\n' "$NVIDIA" ;;
   esac
+}
+
+# Where the GPU mode came from, for messages.
+gpu_mode_source() {
+  if [[ -n "${JLT_GPU:-}" ]]; then
+    printf 'JLT_GPU=%s\n' "$JLT_GPU"
+  else
+    printf "NVIDIA='%s' in %s\n" "$NVIDIA" "$SETTINGS_FILE"
+  fi
 }
 
 ensure_workspace() {
@@ -1165,6 +1195,7 @@ runtime_env_content() {
     "JLT_UID='$(id -u)'" \
     "JLT_GID='$(id -g)'" \
     "HTTPS_MODE='${HTTPS_MODE}'" \
+    "NVIDIA='${GPU_MODE}'" \
     "PUBLIC_HOST='${PUBLIC_HOST:-$TS_IP}'" \
     "PUBLIC_SCHEME='${PUBLIC_SCHEME}'" \
     "TLS='${USE_TLS}'" \
@@ -1201,18 +1232,42 @@ write_runtime_env() {
     die "Refusing workspace path with a quote, backslash or control character: $(printf '%q' "$WORKSPACE_DIR")"
   is_tailscale_ipv4 "$TS_IP" || die "Refusing to write an invalid Tailscale IPv4: $(printf '%q' "$TS_IP")"
   is_valid_theme_name "$THEME" || die "Refusing to write an invalid theme name: $(printf '%q' "$THEME")"
+  [[ "$GPU_MODE" == auto || "$GPU_MODE" == 1 || "$GPU_MODE" == 0 ]] ||
+    die "Refusing to write an invalid GPU mode: $(printf '%q' "$GPU_MODE")"
   validate_https_values
   write_file_atomic "$APP_DIR/.env" 600 "$(runtime_env_content "$1")"$'\n'
 }
 
+# A throwaway container with the GPU request of compose.gpu.yaml. On failure it says why and,
+# for a known host problem, how to fix it.
 gpu_probe() {
-  local output
-  if output="$(docker run --rm --network none --gpus all --entrypoint nvidia-smi "$JUPYTER_IMAGE" -L 2>&1)"; then
+  local output spec
+  if output="$(docker run --rm --pull never --network none --gpus all --entrypoint nvidia-smi \
+    "$JUPYTER_IMAGE" -L 2>&1)"; then
     info "GPU check passed: ${output%%$'\n'*}"
     return 0
   fi
   warn "GPU check failed inside the container: ${output%%$'\n'*}"
+  if [[ "$output" == *nvidia-persistenced* ]]; then
+    # A CDI spec generated while nvidia-persistenced ran lists its socket as a mount; with the
+    # daemon stopped (reboot, driver update) Docker cannot create any GPU container.
+    warn "Docker's NVIDIA setup mounts /run/nvidia-persistenced/socket, but nvidia-persistenced is not running. Start it (and at boot): sudo systemctl enable --now nvidia-persistenced"
+    for spec in /etc/cdi/* /var/run/cdi/*; do
+      if [[ -f "$spec" ]] && grep -qsF 'nvidia-persistenced' -- "$spec"; then
+        warn "Or regenerate the CDI spec without the socket: sudo nvidia-ctk cdi generate --output=$spec"
+      fi
+    done
+  fi
   return 1
+}
+
+# How to run without the GPU, for messages.
+gpu_off_hint() {
+  if [[ -n "${JLT_GPU:-}" ]]; then
+    printf 'JLT_GPU=off %s update' "$(script_cmd)"
+  else
+    printf "set NVIDIA='0' in %s (builder: untick NVIDIA GPU), then run: %s update" "$SETTINGS_FILE" "$(script_cmd)"
+  fi
 }
 
 # Keeps the argon2 hash when the password is unchanged: re-hashing produces a new salt, which
@@ -1294,7 +1349,7 @@ print_summary() {
   printf '  Workspace:   %s\n' "$WORKSPACE_DIR"
   printf '  Settings:    %s\n' "$SETTINGS_FILE"
   printf '  Theme:       %s\n' "$THEME"
-  printf '  GPU:         %s\n' "$([[ "$gpu" == 1 ]] && printf 'enabled' || printf 'not used')"
+  printf '  GPU:         %s (NVIDIA %s)\n' "$([[ "$gpu" == 1 ]] && printf 'enabled' || printf 'not used')" "$GPU_MODE"
   printf '  Address:     %s\n' "$TS_IP"
   if [[ -n "$TS_NAME" ]]; then
     printf '  Name:        %s\n' "$TS_NAME"
@@ -1342,10 +1397,20 @@ deploy() {
   sync_stack
   ensure_runner_token
 
-  if gpu_requested; then
-    gpu=1
-    info 'NVIDIA GPU available: both containers get access to it.'
-  fi
+  GPU_MODE="$(gpu_mode)"
+  case "$GPU_MODE" in
+    1)
+      gpu=1
+      info "NVIDIA GPU expected ($(gpu_mode_source)): both containers get access to it."
+      ;;
+    auto)
+      if gpu_available; then
+        gpu=1
+        info 'NVIDIA GPU available: both containers get access to it.'
+      fi
+      ;;
+    *) info "NVIDIA GPU off ($(gpu_mode_source)): the containers run without it." ;;
+  esac
   # Until the name and the certificate are checked with the built image, the runtime .env keeps
   # the deployed HTTPS values when they belong to this address: a failed build must not leave it
   # pointing at http://<ip> while the running containers still serve HTTPS by name. A first
@@ -1370,7 +1435,10 @@ deploy() {
   compose "${build_args[@]}" || die 'docker compose build failed; see the output above.'
 
   if [[ "$gpu" == 1 ]] && ! gpu_probe; then
-    warn 'Continuing without GPU access (set JLT_GPU=off to skip the check, or fix the NVIDIA container toolkit).'
+    if [[ "$GPU_MODE" == 1 ]]; then
+      die "An NVIDIA GPU is expected ($(gpu_mode_source)), but Docker cannot hand it to a container (see above). Fix the NVIDIA driver or Container Toolkit, or run without the GPU: $(gpu_off_hint)"
+    fi
+    warn "Continuing without GPU access. Fix the NVIDIA driver or Container Toolkit and run update again, or skip the check: $(gpu_off_hint)"
     gpu=0
     write_runtime_env 0
   fi
@@ -1436,6 +1504,9 @@ load_runtime_env() {
   if [[ "${RUNTIME_ENV[COMPOSE_FILE]:-}" == *compose.gpu.yaml* ]]; then
     DEPLOYED_GPU=1
   fi
+  # auto for a runtime .env from before the NVIDIA setting.
+  DEPLOYED_NVIDIA="${RUNTIME_ENV[NVIDIA]:-auto}"
+  [[ "$DEPLOYED_NVIDIA" == 1 || "$DEPLOYED_NVIDIA" == 0 ]] || DEPLOYED_NVIDIA='auto'
   # Empty for a runtime .env from before the HTTPS setting (HTTP on the IP, no name).
   DEPLOYED_HTTPS_MODE="${RUNTIME_ENV[HTTPS_MODE]:-}"
   [[ "$DEPLOYED_HTTPS_MODE" == auto || "$DEPLOYED_HTTPS_MODE" == off ]] || DEPLOYED_HTTPS_MODE=''
@@ -1511,6 +1582,8 @@ settings_drift_warning() {
     differences+=("THEME ${DEPLOYED_THEME} -> ${THEME}")
   [[ "$HTTPS" == "$DEPLOYED_HTTPS_MODE" ]] ||
     differences+=("HTTPS ${DEPLOYED_HTTPS_MODE:-(deployed before the setting existed)} -> ${HTTPS}")
+  [[ "$NVIDIA" == "$DEPLOYED_NVIDIA" ]] ||
+    differences+=("NVIDIA ${DEPLOYED_NVIDIA} -> ${NVIDIA}")
   if [[ -r "$APP_DIR/secrets/jupyter_password" ]]; then
     current="$(<"$APP_DIR/secrets/jupyter_password")"
   fi
@@ -2179,6 +2252,21 @@ start_follow_https() {
   fi
 }
 
+# The GPU hand-off can break after a deploy (nvidia-persistenced not running after a reboot, a
+# driver update, a stale CDI spec), and Docker then refuses to create the GPU containers at all.
+# So check it first: NVIDIA='1' stops with the reason; auto starts without the GPU this time and
+# keeps it in the runtime .env, so the next start checks again.
+start_check_gpu() {
+  # A removed image leaves nothing to check with; 'up' rebuilds it.
+  docker image inspect "$JUPYTER_IMAGE" >/dev/null 2>&1 || return 0
+  gpu_probe && return 0
+  if [[ "$DEPLOYED_NVIDIA" == 1 ]]; then
+    die "An NVIDIA GPU is expected (NVIDIA='1'), but Docker cannot hand it to a container (see above). Fix the host and start again, or run without the GPU: $(gpu_off_hint)"
+  fi
+  warn "Starting without GPU access this time; the next start checks again. To stop checking: $(gpu_off_hint)"
+  COMPOSE_FILE_OVERRIDE="$(compose_file_value 0 "$USE_TLS")"
+}
+
 cmd_start() {
   local ports base
   refuse_root
@@ -2205,6 +2293,9 @@ cmd_start() {
   fi
   if ((!ROOT_ATTEMPTED)); then
     maybe_root_step "$TS_IP" "${ports[@]}"
+  fi
+  if [[ "$DEPLOYED_GPU" == 1 ]]; then
+    start_check_gpu
   fi
   info 'Starting containers and waiting until they are healthy...'
   compose up -d --remove-orphans --wait --wait-timeout 180 ||
@@ -2304,10 +2395,10 @@ cmd_status() {
   fi
   load_runtime_env
   printf 'App dir:           %s\n' "$APP_DIR"
-  printf 'Deployed:          JupyterLab port %s, statistics %s, GPU override %s\n' \
+  printf 'Deployed:          JupyterLab port %s, statistics %s, GPU override %s (NVIDIA %s)\n' \
     "$DEPLOYED_JUPYTER_PORT" \
     "$([[ "$DEPLOYED_STATS_ENABLED" == 1 ]] && printf 'on (port %s, user %s)' "$DEPLOYED_STATS_PORT" "$DEPLOYED_STATS_USER" || printf 'off')" \
-    "$([[ "$DEPLOYED_GPU" == 1 ]] && printf 'on' || printf 'off')"
+    "$([[ "$DEPLOYED_GPU" == 1 ]] && printf 'on' || printf 'off')" "$DEPLOYED_NVIDIA"
   printf 'Workspace:         %s\n' "$DEPLOYED_WORKSPACE_DIR"
   printf 'Theme:             %s\n' "$DEPLOYED_THEME"
 
@@ -2552,7 +2643,8 @@ Root-only helpers (run through sudo by the commands above, or pkexec by the buil
 Settings file: $SETTINGS_FILE
   JUPYTER_PASSWORD, JUPYTER_PORT (8888), STATS_ENABLED (1), STATS_PORT (8889), STATS_USER (jupyter),
   THEME (amazing; a file name from stack/theme without .json),
-  HTTPS (auto | off; default auto)
+  HTTPS (auto | off; default auto),
+  NVIDIA (auto | 1 | 0; default auto: 1 expects an NVIDIA GPU, 0 never uses one)
 
 HTTPS='auto': when MagicDNS and HTTPS Certificates are enabled in the tailnet (Tailscale admin
 console, DNS page), the root step issues a certificate for <name>.<tailnet>.ts.net and renews it
@@ -2569,7 +2661,7 @@ Environment overrides:
   JLT_SETTINGS_FILE   settings file              (default: <script dir>/.env)
   JLT_APP_DIR         deployed stack directory   (default: ~/.local/share/${PROJECT})
   JLT_WORKSPACE_DIR   notebook workspace         (default: ~/jupyter-workspace)
-  JLT_GPU             auto | on | off            (default: auto)
+  JLT_GPU             auto | on | off            (overrides NVIDIA for install/update)
   JLT_TLS_DIR         certificate directory, for tests only; host-setup always writes
                       ${DEFAULT_TLS_DIR}
 EOF
