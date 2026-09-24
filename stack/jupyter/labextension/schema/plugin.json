@@ -1,0 +1,22 @@
+{
+  "title": "AI cell button",
+  "description": "An AI button in the notebook toolbar and in each cell's toolbar: the cell's text is sent to the %%ai magic as the request.",
+  "jupyter.lab.toolbars": {
+    "Notebook": [
+      {
+        "name": "thebe-ai",
+        "command": "thebe-ai:cell-prompt",
+        "label": "✨ AI",
+        "caption": "Send the selected cell's text to the AI and replace it with the generated code. Nothing is run.",
+        "rank": 50
+      }
+    ],
+    "Cell": [{ "name": "thebe-ai", "command": "thebe-ai:cell-prompt", "label": "✨ AI", "rank": 5 }]
+  },
+  "jupyter.lab.shortcuts": [
+    { "command": "thebe-ai:cell-prompt", "keys": ["Ctrl Alt G"], "selector": ".jp-Notebook" }
+  ],
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}

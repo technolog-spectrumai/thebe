@@ -1,0 +1,27 @@
+{
+  "name": "thebe-ai-cell",
+  "version": "1.1.0",
+  "description": "An AI button in the notebook and cell toolbars: the cell's text is sent to the %%ai magic as the request.",
+  "license": "BSD-3-Clause",
+  "private": true,
+  "keywords": ["jupyter", "jupyterlab", "jupyterlab-extension"],
+  "files": ["lib/**/*.js", "schema/*.json"],
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc && jupyter labextension build ."
+  },
+  "dependencies": {
+    "@jupyterlab/application": "^4.6.0",
+    "@jupyterlab/notebook": "^4.6.0"
+  },
+  "devDependencies": {
+    "@jupyter/builder": "^1.2.3",
+    "typescript": "~5.9.0"
+  },
+  "jupyterlab": {
+    "extension": true,
+    "outputDir": "thebe_ai_cell/labextension",
+    "schemaDir": "schema"
+  }
+}

@@ -107,6 +107,21 @@
     load: (v) => (isNum(v) ? v.toFixed(2) : null),
   };
 
+  // 987654 -> "987,654" (the reader's locale); tokens are whole numbers.
+  const formatCount = (v) => (isNum(v) ? Math.round(v).toLocaleString() : DASH);
+
+  // 1234 -> "1.2k", 2500000 -> "2.5M": short enough for a tile.
+  function compactCount(v) {
+    if (!isNum(v)) return null;
+    const units = [[1e9, "G"], [1e6, "M"], [1e3, "k"]];
+    for (const [size, suffix] of units) {
+      if (Math.abs(v) >= size) return `${(v / size).toFixed(v >= size * 100 ? 0 : 1)}${suffix}`;
+    }
+    return String(Math.round(v));
+  }
+
+  const formatSeconds = (v) => (isNum(v) ? `${v.toFixed(v >= 100 ? 0 : 1)} s` : DASH);
+
   // ---- DOM helpers ------------------------------------------------------------------
 
   function el(tag, className, text) {
@@ -215,6 +230,7 @@
     gpu: tile("tile-gpu"),
     kernels: tile("tile-kernels"),
     network: tile("tile-network"),
+    ai: tile("tile-ai"),
   };
 
   function setTile(t, { value = null, unit = "", meta = "", percent, levels = USAGE_LEVELS, tone = "" }) {
@@ -334,6 +350,34 @@
     });
   }
 
+  // Share of the AI token budget used, in percent (null without a limit).
+  function aiUsedPercent(usage) {
+    if (!isNum(usage.max_tokens) || usage.max_tokens <= 0 || !isNum(usage.used_tokens)) return null;
+    return Math.min(100, (usage.used_tokens / usage.max_tokens) * 100);
+  }
+
+  function renderAiTile(ai) {
+    const usage = (ai && ai.usage) || {};
+    if (!ai || !ai.available) {
+      setTile(tiles.ai, { meta: ai && ai.enabled === false ? "off" : "unavailable", tone: ai && ai.enabled ? "warn" : "" });
+      return;
+    }
+    const seconds = usage.seconds || {};
+    const time = isNum(seconds.mean) ? `${formatSeconds(seconds.mean)} avg` : "no answers yet";
+    const used = aiUsedPercent(usage);
+    if (used === null) {
+      setTile(tiles.ai, { value: compactCount(usage.used_tokens), unit: "used", meta: `no limit · ${time}` });
+      return;
+    }
+    setTile(tiles.ai, {
+      value: Math.floor(100 - used),
+      unit: "% left",
+      percent: used,
+      meta: `${compactCount(usage.remaining_tokens)} tokens · ${time}`,
+      tone: levelFor(used, USAGE_LEVELS),
+    });
+  }
+
   // ---- detail cards -----------------------------------------------------------------
 
   function renderHostSummary(data) {
@@ -442,6 +486,66 @@
     );
   }
 
+  function renderAi(ai) {
+    const statePill = $("ai-pill");
+    const error = $("ai-error");
+    const details = $("ai-details");
+    if (!ai || !ai.available) {
+      const off = ai && ai.enabled === false;
+      setPill(statePill, off ? "idle" : "warn", off ? "Off" : "Unavailable");
+      error.hidden = !(ai && ai.error);
+      error.querySelector(".note__text").textContent = (ai && ai.error) || "";
+      details.hidden = true;
+      return;
+    }
+    error.hidden = true;
+    details.hidden = false;
+    const usage = ai.usage || {};
+    const monthly = usage.period === "month";
+    const used = aiUsedPercent(usage);
+    const tone = used === null ? "ok" : used >= USAGE_LEVELS.warn ? "warn" : used >= USAGE_LEVELS.caution ? "caution" : "ok";
+    setPill(statePill, tone, used !== null && usage.remaining_tokens <= 0 ? "Budget used up" : `On · ${ai.default || "?"}`);
+
+    $("ai-budget-label").textContent = monthly ? "Token budget this month" : "Token budget in total";
+    writeValue($("ai-budget-value"), used === null ? "no limit" : [used.toFixed(1), "% used"]);
+    setMeter($("ai-meter"), used === null ? null : used);
+    $("ai-left").textContent = used === null ? "no limit" : `${formatCount(usage.remaining_tokens)} tokens`;
+    // Short values: rows do not wrap, and the card must fit a phone.
+    $("ai-used").textContent = `${formatCount(usage.used_tokens)} tokens`;
+    $("ai-split").textContent = `${formatCount(usage.input_tokens)} / ${formatCount(usage.output_tokens)}`;
+    $("ai-limit").textContent = usage.max_tokens > 0
+      ? `${formatCount(usage.max_tokens)} ${monthly ? "per month" : "in total"}`
+      : "no limit";
+    $("ai-reset").textContent = usage.period_end
+      ? new Date(parseTime(usage.period_end)).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" })
+      : "never";
+
+    const seconds = usage.seconds || {};
+    $("ai-answers").textContent = formatCount(usage.requests);
+    $("ai-failed").textContent = formatCount(usage.errors);
+    $("ai-mean").textContent = formatSeconds(seconds.mean);
+    $("ai-stdev").textContent = seconds.count === 1 ? "one answer" : formatSeconds(seconds.stdev);
+
+    $("ai-rows").replaceChildren(
+      ...(usage.providers || []).map((item) => {
+        const row = el("tr");
+        const name = el("th");
+        name.scope = "row";
+        name.append(el("span", "strong", item.name || "provider"), el("span", "cell-sub", `${item.api || ""} ${item.model || ""}`));
+        const times = item.seconds || {};
+        const answers = isNum(item.errors) && item.errors ? `${formatCount(item.requests)} (${item.errors} failed)` : formatCount(item.requests);
+        row.append(
+          name,
+          numCell(answers),
+          numCell(formatCount((item.input_tokens || 0) + (item.output_tokens || 0)), "hide-sm"),
+          numCell(formatSeconds(times.mean)),
+          numCell(formatSeconds(times.stdev)),
+        );
+        return row;
+      }),
+    );
+  }
+
   function buildDevice() {
     const device = el("article", "device");
     const head = el("div", "device__head");
@@ -518,6 +622,8 @@
     renderInterfaces(data.network || {});
     renderKernels(data.kernels || {}, data.generated_at);
     renderGpu(data.gpu || {});
+    renderAiTile(data.ai);
+    renderAi(data.ai);
   }
 
   // ---- connection state and polling ---------------------------------------------------

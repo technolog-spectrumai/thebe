@@ -7,6 +7,10 @@ its .pth files: an image package always wins over a custom copy of the same name
 broken custom package cannot stop the kernel from starting. The Jupyter server itself
 never imports from the venv.
 
+It also loads the %%ai magic (kernel/thebe_ai.py) into every kernel, through
+extra_extensions: the user's own IPython `extensions` setting stays untouched, and a failure
+to load it only logs a warning. Only kernel/ is added to sys.path, never /srv/jupyter itself.
+
 Everything else is what ipykernel_launcher does.
 """
 
@@ -17,6 +21,7 @@ from pathlib import Path
 VENV_SITE_PACKAGES = Path(
     f"/opt/custom/venv/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
 )
+KERNEL_EXTENSIONS = Path(__file__).resolve().parent / "kernel"
 
 if __name__ == "__main__":
     # Running a script puts its directory (/srv/jupyter) first on sys.path; notebooks
@@ -30,6 +35,9 @@ if __name__ == "__main__":
             site.addsitedir(str(VENV_SITE_PACKAGES))
         except Exception as exc:  # the kernel must start even with a damaged venv
             print(f"kernel_launcher: ignoring {VENV_SITE_PACKAGES}: {exc!r}", file=sys.stderr)
+
+    sys.path.insert(0, str(KERNEL_EXTENSIONS))
+    sys.argv.append("--IPKernelApp.extra_extensions=thebe_ai")
 
     from ipykernel import kernelapp as app
 

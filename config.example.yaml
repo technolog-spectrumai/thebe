@@ -33,3 +33,24 @@ nvidia: auto
 #   - path: "/opt/lab/tools"
 #     name: "lab-tools"
 import_dirs: []
+
+# AI code generation in notebooks: the %%ai magic and the AI button in the toolbars.
+# The keys are read from this file on install and update (Deploy in the builder) only. They
+# reach the AI gateway container, never notebooks or the browser. The budget counts the input
+# and output tokens of all providers together; the Statistics page shows how much is left.
+# ai:
+#   default: "claude"              # what a plain %%ai uses; the others by name: %%ai openai
+#   providers:
+#     claude:
+#       api: "anthropic"
+#       model: "claude-sonnet-5"
+#       api_key: "sk-ant-..."
+#     openai:
+#       api: "openai"
+#       model: "gpt-5.4-mini"
+#       api_key: "sk-..."
+#   budget:
+#     max_tokens: 1000000          # 0 = no limit
+#     period: "month"              # month: starts again on the 1st (UTC); total: never
+#   timeout: 60                    # seconds to wait for one answer
+#   max_output_tokens: 2048        # the longest answer, in tokens

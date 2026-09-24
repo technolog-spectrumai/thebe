@@ -14,8 +14,10 @@ share one `config.yaml` and keep their own dependencies in a project-local `.ven
  tablet ──(Tailscale, WireGuard)──► 100.x.y.z:8888  ──► container "jupyterlab"  (JupyterLab)
                                     100.x.y.z:8889  ──► container "stats"       (dashboard + Dependencies page)
                                         │                     │         │
-                    published only on the Tailscale IPv4      │         └─► container "deps" (pip runner,
-                    never on 0.0.0.0, loopback or the LAN     │             internal only, no published port)
+                    published only on the Tailscale IPv4      │         ├─► container "deps" (pip runner,
+                    never on 0.0.0.0, loopback or the LAN     │         │   internal only, no published port)
+                                                              │         └─► container "ai" (AI gateway: the API
+                                                              │             keys, token budget; optional, internal)
                                                               ├─ ~/jupyter-workspace  (notebooks)
                                                               └─ /proc, /sys          (read-only, stats only)
 ```
@@ -36,6 +38,7 @@ share one `config.yaml` and keep their own dependencies in a project-local `.ven
 - [Statistics dashboard](#statistics-dashboard)
 - [Dependencies page](#dependencies-page)
 - [Python packages: three layers](#python-packages-three-layers)
+- [AI code generation](#ai-code-generation)
 - [Themes](#themes)
 - [GPU support](#gpu-support)
 - [Security model](#security-model)
@@ -55,29 +58,36 @@ Compose there.
 | --- | --- | --- |
 | Configuration of the builder and `run.sh` | `<repo>/config.yaml` | What you edit when you use the builder or `run.sh`; they write `.env` from it. Mode `0600`, gitignored. See [config.yaml](#headless-runner-and-configyaml). |
 | Settings (password, ports, stats on/off) | `<repo>/.env` | The installer's input. Created with defaults on first install, mode `0600`, gitignored. |
-| Stack sources | `<repo>/stack/` | `Dockerfile`, `compose.yaml`, `compose.gpu.yaml`, `compose.tls.yaml`, `jupyter/`, `stats/`, `theme/`. |
+| Stack sources | `<repo>/stack/` | `Dockerfile`, `compose.yaml`, `compose.gpu.yaml`, `compose.tls.yaml`, `jupyter/`, `stats/`, `ai/`, `theme/`. |
 | Deployed stack (app dir) | `~/.local/share/jupyterlab-tailscale/` | A copy of `stack/` plus generated files; Compose project directory. |
 | Runtime variables | `~/.local/share/jupyterlab-tailscale/.env` | Generated on every deploy: Tailscale IP and name, URL scheme, TLS state, ports, profiles, uid/gid. **No secrets.** |
-| Secrets | `~/.local/share/jupyterlab-tailscale/secrets/` | The password, its argon2 hash and a random package-runner token, each mode `0600`, mounted as Compose secrets. |
+| AI settings | `<repo>/.ai.json` | The `ai:` section of `config.yaml` with the API keys, written by the builder and `run.sh` (mode `0600`, gitignored); absent when AI is off. See [AI code generation](#ai-code-generation). |
+| Secrets | `~/.local/share/jupyterlab-tailscale/secrets/` | The password, its argon2 hash, a random package-runner token, the AI settings (`ai_config`, with the keys; `{}` when AI is off) and a random AI gateway token, each mode `0600`, mounted as Compose secrets. |
 | HTTPS certificate | `/var/lib/jupyterlab-tailscale/tls/` | `<name>.crt` and `<name>.key` from `tailscale cert`, owned by root and readable by your group; mounted read-only through `compose.tls.yaml` when valid. |
 | Notebooks | `~/jupyter-workspace` | Bind-mounted at `/workspace`. Never deleted by default. |
 
-Compose project `jupyterlab-tailscale` runs three services on the default bridge network (so notebooks
-and `pip` have outbound internet access):
+Compose project `jupyterlab-tailscale` runs up to four services on bridge networks with outbound
+internet access (for notebooks, `pip` and the AI providers' APIs):
 
 | Service | Image (built locally) | Published on | Contents |
 | --- | --- | --- | --- |
 | `jupyterlab` | `jupyterlab-tailscale/jupyterlab:local` (~1 GB) | `<tailscale-ip>:8888` | JupyterLab 4.6.3, jupyter_server 2.21.0, ipykernel 7.3.0, ipywidgets 8.1.9, numpy 2.5.3, pandas 3.0.5, matplotlib 3.11.2, scipy 1.18.1 |
 | `stats` | `jupyterlab-tailscale/stats:local` (~210 MB) | `<tailscale-ip>:8889` | FastAPI 0.141.1, uvicorn 0.53.0, nvidia-ml-py 13.610.43: the dashboard and the Dependencies page |
 | `deps` | reuses `jupyterlab-tailscale/jupyterlab:local` | nothing (internal) | A small pip runner used by the Dependencies page |
+| `ai` | `jupyterlab-tailscale/ai:local` (~250 MB) | nothing (internal, network `ai`) | openai 3.19.2, anthropic 1.8.0: the [AI gateway](#ai-code-generation), the only container with the AI API keys |
 
-`stats` and `deps` belong to the `stats` profile and are only created while statistics are enabled.
+`stats` and `deps` belong to the `stats` profile and are only created while statistics are enabled;
+`ai` belongs to the `ai` profile and exists only while `config.yaml` has an `ai:` section. Only
+`jupyterlab` and `stats` share the `ai` network with the gateway; `deps` cannot reach it.
 
-Both images start from `python:3.13-slim-trixie` and install exactly the versions in
-`stack/*/requirements.lock.txt` (every transitive package pinned, wheels only). All containers run
+The three images start from `python:3.13-slim-trixie` and install exactly the versions in
+`stack/*/requirements.lock.txt` (every transitive package pinned, wheels only). The AI button in
+the notebook and cell toolbars is a small TypeScript JupyterLab extension, built with Node in a separate build
+stage (`node:22-trixie-slim`, exact versions from `package-lock.json`, no install scripts); only the
+built files (about 60 KB) go into the JupyterLab image. All containers run
 as a non-root user whose uid/gid match yours, with all Linux capabilities dropped,
 `no-new-privileges`, an init process, health checks, `restart: unless-stopped` and rotated JSON
-logs (3 × 10 MB). `stats` and `deps` additionally have a read-only root filesystem.
+logs (3 × 10 MB). `stats`, `deps` and `ai` additionally have a read-only root filesystem.
 
 Inside its container each server listens on all of the *container's* interfaces — that is how
 Docker forwards traffic to it. What decides who can connect is the host side of the port mapping,
@@ -402,6 +412,11 @@ import_dirs:                            # copied into <workspace>/imported/ on i
   - "~/tools"
   - path: "/opt/lab/tools"
     name: "lab-tools"
+ai:                                     # optional: AI code generation (see below)
+  default: "claude"
+  providers:
+    claude: {api: "anthropic", model: "claude-sonnet-5", api_key: "sk-ant-..."}
+  budget: {max_tokens: 1000000, period: "month"}
 ```
 
 - A missing setting uses its default. The rules are the script's ([Credentials and
@@ -491,6 +506,7 @@ docker compose logs -f jupyterlab
 | JupyterLab settings, workspace layouts, IPython history, login cookie secret | Docker volume `jupyterlab-tailscale_jupyter_state` (`/state`) | yes | yes |
 | Custom packages: the venv, the page's requirements, the deployed copy of `requirements.txt` with the record of its last install, and the last job log | Docker volume `jupyterlab-tailscale_custom_packages` (`/opt/custom`, read-only in `jupyterlab`) | yes | yes |
 | pip download cache of the package runner | Docker volume `jupyterlab-tailscale_pip_cache` | yes | yes |
+| AI token ledger (tokens and seconds per answer, for the budget) | Docker volume `jupyterlab-tailscale_ai_usage` | yes | yes (the budget count starts again) |
 | Settings | `<repo>/.env` | yes | no |
 | Anything else inside a container (e.g. `%pip install` from a notebook) | container filesystem | **no** | yes |
 
@@ -506,7 +522,7 @@ remembered by the browser). It works on phone, tablet and desktop widths and ref
 
 | Route | Content |
 | --- | --- |
-| `/` | Dashboard: CPU (usage, per core, load, temperature), memory and swap, disk (the filesystem holding the workspace), uptime, network totals and rates (physical interfaces, with `tailscale0` shown separately), active Jupyter kernels (name, state, connections), NVIDIA GPU (utilisation, memory, temperature, power). |
+| `/` | Dashboard: CPU (usage, per core, load, temperature), memory and swap, disk (the filesystem holding the workspace), uptime, network totals and rates (physical interfaces, with `tailscale0` shown separately), active Jupyter kernels (name, state, connections), NVIDIA GPU (utilisation, memory, temperature, power), and [AI](#ai-code-generation) tokens left and answer times (mean ± standard deviation) when AI is on. |
 | `/api/stats` | The same data as JSON. |
 | `/health` | `{"status": "ok", "jupyter": "reachable"}` — used by the container health check. |
 | `/dependencies` | The [Dependencies page](#dependencies-page). |
@@ -639,6 +655,72 @@ torch==2.14.0+cpu
   reinstall** on the page, which rebuilds the environment from both lists.
 - Kernels see new packages after a restart (*Kernel → Restart Kernel*).
 
+## AI code generation
+
+Notebooks can turn a request in plain language into Python code, with OpenAI or Anthropic models.
+It is off until `config.yaml` has an `ai:` section. The user guide, with every option and message,
+is [AI_MANUAL.md](AI_MANUAL.md).
+
+```python
+%%ai
+Load sales.csv, sum revenue per region and plot it as a bar chart.
+```
+
+- **`%%ai`** (a cell magic, loaded into every kernel): the answer streams into the cell's output and
+  the code goes into a **new cell below**. `--replace` puts it into this cell instead, `--print`
+  only shows it, `--var df` describes a variable (type, shape, columns, never its values),
+  `%%ai openai` and `--model` choose the provider and model. `%ai status` shows the providers, the
+  budget and the answer times; `from thebe_ai import ask` is the same as a function.
+- **The ✨ AI button** in the notebook toolbar (next to the cell type), in each cell's toolbar, and on
+  `Ctrl+Alt+G`: the whole selected cell is the request, and the cell is replaced by the code, with
+  the request kept as `# ai:` comments on top.
+- **Generated code is never run.** You read it and press Shift+Enter.
+
+Configuration, in `config.yaml` (the only place keys are entered; there is no screen for them):
+
+```yaml
+ai:
+  default: "claude"                # a plain %%ai; the others by name: %%ai openai
+  providers:
+    claude:
+      api: "anthropic"
+      model: "claude-sonnet-5"
+      api_key: "sk-ant-..."
+    openai:
+      api: "openai"
+      model: "gpt-5.4-mini"
+      api_key: "sk-..."
+      # base_url: "https://..."    # optional: a compatible endpoint or proxy
+  budget:
+    max_tokens: 1000000            # input + output tokens of all providers together; 0 = no limit
+    period: "month"                # month: starts again on the 1st (UTC); total: never
+  timeout: 60                      # seconds per answer
+  max_output_tokens: 2048          # the longest answer
+```
+
+Then run `./run.sh update` (or Deploy in the builder). Changing a key, a model or the budget works
+the same way; `enabled: false` (or removing the section) turns AI off and removes the gateway.
+
+**How it works.** The builder and `run.sh` write the section, with the keys, to `<repo>/.ai.json`
+(mode `0600`); the installer copies it to the `ai_config` secret, which only the `ai` container
+mounts. That container, the **AI gateway** ([stack/ai/gateway.py](stack/ai/gateway.py)), calls the
+providers with the official SDKs, streams the answers to the kernels, counts every answer's input
+and output tokens (the providers' own figures) and times it. Kernels and the dashboard reach it on
+the internal `ai` network with a random token; they never see an API key, and neither does the
+browser.
+
+**Token budget.** Before each request the gateway checks what is left of `max_tokens` in the current
+period and refuses the request when the budget is used up (or too small for the prompt), with a
+message that says when it starts again. An answer is capped at what is left. The count is exact
+once an answer is complete, so the last answer of a period can go over by a few tokens. The ledger
+(`usage.jsonl`, one line per answer: time, provider, model, tokens, seconds; never a prompt or an
+answer) lives in the `ai_usage` volume and survives updates and restarts.
+
+**On the Statistics page**, the *AI tokens* tile shows how much of the budget is left, and the *AI*
+card shows tokens left and used (input / output), the budget and when it starts again, the number
+of answers and failures, and the **mean and standard deviation of the answer times** (from the
+request to the last token, successful answers only), overall and per provider.
+
 ## Themes
 
 The dashboard, the Dependencies page and the builder window share one palette, taken from
@@ -747,6 +829,13 @@ container, so the password is never handled by the script.
   no workspace, no published port, read-only root filesystem, and no access to the password.
   Installed packages later run inside notebook kernels with the kernels' rights, so install only
   packages you trust.
+- **AI keys.** The API keys are entered only in `config.yaml` and reach only the `ai` container (a
+  Compose secret). Kernels and the dashboard talk to the gateway with a random token over an internal
+  network that `deps` is not on; no route returns a key, and errors and logs never contain one.
+  Anyone with the JupyterLab password can use the AI up to the budget, but cannot read the keys.
+  Prompts, and the descriptions `--var` adds, are sent to OpenAI or Anthropic. Generated code is
+  never run automatically; read it before running it (a pasted traceback or file header can steer
+  the model).
 - **Notebooks run arbitrary code** as the container user, with internet access and write access to
   `~/jupyter-workspace` — which is the point of JupyterLab. Anyone with the password can do the same.
 - **Residual LAN risk.** Docker publishes by destination address, not by interface. A device on the
@@ -835,6 +924,12 @@ the password hash means the secret is missing or damaged; run `update`.
 `deps (package runner)` row) and `logs --no-follow deps`; `restart` usually fixes it. If statistics
 are disabled, the page does not exist.
 
+**`%%ai` says AI is off, or the dashboard's AI card says the gateway is unavailable.** Check that
+`config.yaml` has an `ai:` section (`./run.sh check` shows it, keys masked) and run `./run.sh update`.
+`status` should list `ai (AI gateway)` as running; `logs --no-follow ai` shows why it stopped (a
+broken settings file makes it refuse to start with a message). Messages inside notebooks are
+explained in [AI_MANUAL.md](AI_MANUAL.md#7-troubleshooting).
+
 **An installed package cannot be imported in a notebook.** Restart the kernel. If the job failed,
 the log on the page shows why — a `ResolutionImpossible` error means the package needs a different
 version of something the image already pins.
@@ -892,11 +987,14 @@ It **keeps** `~/jupyter-workspace` and `<repo>/.env`. To delete the workspace as
 
 ```text
 setup-jupyterlab-tailscale.sh      the CLI (install, start, stop, restart, status, logs, update, uninstall)
-stack/Dockerfile                   base → jupyterlab and stats images
+stack/Dockerfile                   base → jupyterlab, stats and ai images (plus the cell button's build stages)
 stack/compose.yaml                 services, ports, secrets, volumes, health checks
 stack/compose.gpu.yaml             GPU override, used when a GPU is detected
 stack/compose.tls.yaml             HTTPS override, used when a valid certificate exists
 stack/jupyter/                     JupyterLab config and health check, kernel launcher, package runner, requirements and lock file
+stack/jupyter/kernel/thebe_ai.py   the %%ai magic, loaded into every kernel (a client of the AI gateway)
+stack/jupyter/labextension/        the AI button in the notebook and cell toolbars (TypeScript; built in the image)
+stack/ai/                          AI gateway: the API keys, token budget and answer times; requirements and lock file
 stack/stats/                       FastAPI dashboard and Dependencies page: app, TLS-aware launcher (serve.py), theme loader, templates, static assets, requirements and lock file
 stack/theme/                       zenobia's oya theme files (palette of the dashboard and the builder)
 builder.py                         optional PyQt6 builder (thin frontend over the script)
@@ -905,16 +1003,19 @@ run.py, run.sh                     headless runner: deploy and run from config.y
 thebe/                             Qt-free core shared by both: settings and validation, config.yaml,
                                    stack state (Tailscale, compose ps), theme tokens, the runner's CLI,
                                    imports.py (copying host directories into the workspace),
-                                   packages.py (checking requirements.txt with the package runner's rules)
+                                   packages.py (checking requirements.txt with the package runner's rules),
+                                   ai.py (the ai: section and .ai.json)
 requirements.txt                   optional: your Jupyter packages, installed on install/update (not in the repository)
 lib/venv.sh                        the project-local .venv bootstrap used by run.sh and run-builder.sh
 requirements-run.txt               PyYAML pin (run.sh and the builder)
 requirements-builder.txt           PyQt6 pins for the builder venv (includes requirements-run.txt)
 config.example.yaml                the default config.yaml, with explanations
+AI_MANUAL.md                       user guide of %%ai and the AI cell button
 tests/                             offscreen builder tests, config and headless runner tests
 verify_cuda.sh                     end-to-end check that notebooks can use the GPU with PyTorch
 plan.md                            implementation plan and progress
 config.yaml                        your configuration (created by run.sh or the builder, not committed)
 .env                               the installer's settings (written from config.yaml, not committed)
+.ai.json                           the AI settings with the keys (written from config.yaml, not committed)
 .venv/                             virtualenv of run.sh and the builder (not committed)
 ```

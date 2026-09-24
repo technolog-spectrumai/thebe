@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 
 # The Qt-free core, shared with run.py. Names the GUI does not use itself are imported too, so
 # builder.<name> keeps working for tests and older callers.
+from thebe.ai import ai_file, describe, save_ai_file
 from thebe.config import (  # noqa: F401
     Config, ConfigError, config_from_settings, effective_workspace, load_config, make_private, save_config,
     workspace_dir,
@@ -868,6 +869,11 @@ class MainWindow(QMainWindow):
         """The workspace the imports go to: the one the installer will mount."""
         return effective_workspace(self.config, self.paths.config_file, self._environ) or default_workspace()
 
+    def ai_problems(self) -> list[str]:
+        """The ai: section of config.yaml has no form: its problems are fixed in the file."""
+        return [f"{self.paths.config_file.name}: {p} Fix it in the file and restart the builder."
+                for p in self.config.ai_problems]
+
     def import_problems(self) -> list[str]:
         return plan_imports(self.import_values(), self.paths.config_file.parent, self.import_workspace())[1]
 
@@ -1197,7 +1203,7 @@ class MainWindow(QMainWindow):
             return
         self._refresh_packages()
         errors = (validate_settings(self.form_values(commit=True), self.themes or None) + self.import_problems()
-                  + check_requirements(self.requirements_path()).problems)
+                  + check_requirements(self.requirements_path()).problems + self.ai_problems())
         if errors:
             self._refuse(errors)
             return
@@ -1223,7 +1229,7 @@ class MainWindow(QMainWindow):
             self._set_busy(False)
             self._refuse([f"Docker is not usable: {self.docker_problem}."])
             return
-        errors = self.current_errors() + self.import_problems()
+        errors = self.current_errors() + self.import_problems() + self.ai_problems()
         if errors:
             self._set_busy(False)
             self._refuse(errors)
@@ -1251,11 +1257,20 @@ class MainWindow(QMainWindow):
             self._set_busy(False)
             self._fail(f"Could not save {self.paths.config_file}: {exc.strerror or exc}")
             return
+        try:
+            ai_on = save_ai_file(ai_file(self.paths.settings), config.ai)
+        except OSError as exc:
+            self._set_busy(False)
+            self._fail(f"Could not save {ai_file(self.paths.settings)}: {exc.strerror or exc}")
+            return
         self.config = config
         self.settings_values = values
         self._secrets.add(values["JUPYTER_PASSWORD"])
+        self._secrets.update(p.api_key for p in (config.ai.providers if config.ai else ()))
         self.log(f"# Configuration saved to {self.paths.config_file} (mode 0600)",
-                 f"# Settings saved to {self.paths.settings} (mode 0600)")
+                 f"# Settings saved to {self.paths.settings} (mode 0600)",
+                 f"# AI: {describe(config.ai)}"
+                 + (f"; settings saved to {ai_file(self.paths.settings)} (mode 0600)" if ai_on else ""))
         if config.imports:
             self._run_import()      # then install (_on_job_done)
         else:
