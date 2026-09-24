@@ -2,11 +2,12 @@
 """JupyterLab on Tailscale - a small PyQt6 builder.
 
 A thin GUI over setup-jupyterlab-tailscale.sh and its Docker Compose stack.
-It edits the settings .env next to the installer, runs the installer's
-install / start / restart / stop commands through QProcess, shows container
-state from `docker compose ps`, and opens the deployed pages in a browser.
-All real work stays in the installer and the Qt-free thebe package, so the
-CLI workflow is unchanged.
+It edits config.yaml (shared with the headless ./run.sh), writes the
+installer's settings .env from it, runs the installer's install / start /
+restart / stop commands through QProcess, shows container state from
+`docker compose ps`, and opens the deployed pages in a browser. All real work
+stays in the installer and the Qt-free thebe package, so the CLI workflow and
+run.py behave exactly the same.
 
 Start it with ./run-builder.sh, which keeps PyQt6 inside ./.venv.
 """
@@ -14,6 +15,7 @@ Start it with ./run-builder.sh, which keeps PyQt6 inside ./.venv.
 from __future__ import annotations
 
 import codecs
+import dataclasses
 import os
 import shlex
 import shutil
@@ -32,8 +34,11 @@ from PyQt6.QtWidgets import (
     QSpinBox, QVBoxLayout, QWidget,
 )
 
-# The Qt-free core. Names the GUI does not use itself are imported too, so
+# The Qt-free core, shared with run.py. Names the GUI does not use itself are imported too, so
 # builder.<name> keeps working for tests and older callers.
+from thebe.config import (  # noqa: F401
+    Config, ConfigError, config_from_settings, load_config, make_private, save_config, workspace_dir,
+)
 from thebe.settings import (  # noqa: F401
     APP_NAME, DEFAULTS, HTTPS_MODES, PAGES, PROJECT, REPO, SERVICES, TAILNET, BindProbe, Page, Paths,
     SettingsError, absolute_path, check_port, is_public_host, is_valid_hostname, load_settings_file,
@@ -422,7 +427,25 @@ class MainWindow(QMainWindow):
     # -- construction -------------------------------------------------------
 
     def _load_settings(self) -> tuple[dict[str, str], list[str]]:
-        return load_settings_file(self.paths.settings)
+        """The form's values from config.yaml, or from the installer's settings file until it exists.
+
+        Sets self.config (what Deploy saves, with the form's values) and self.config_problem (why
+        config.yaml is left alone: it exists but cannot be read as a whole).
+        """
+        path = self.paths.config_file
+        self.config_problem = ""
+        try:
+            self.config, problems = load_config(path)
+        except FileNotFoundError:
+            self.config, notes = config_from_settings(self.paths.settings)
+            return dict(self.config.settings), notes
+        except ConfigError as exc:
+            self.config = Config()
+            self.config_problem = (f"{exc}, so the form shows the defaults and Deploy will not rewrite it. "
+                                   "Fix it (or delete it) and restart the builder.")
+            return dict(self.config.settings), [self.config_problem]
+        # A setting with a problem keeps its default; say so instead of silently replacing it.
+        return dict(self.config.settings), [f"{path.name}: {problem} The form shows the default." for problem in problems]
 
     @staticmethod
     def _label(text: str = "", name: str = "", *, wrap: bool = False, selectable: bool = False) -> QLabel:
@@ -848,6 +871,8 @@ class MainWindow(QMainWindow):
             overrides["JLT_APP_DIR"] = str(self.paths.runtime_env.parent)
         if self._environ.get("JLT_WORKSPACE_DIR"):     # relative to where the builder was started
             overrides["JLT_WORKSPACE_DIR"] = str(absolute_path(self._environ["JLT_WORKSPACE_DIR"]))
+        elif workspace_dir(self.config, self.paths.config_file) is not None:
+            overrides["JLT_WORKSPACE_DIR"] = str(workspace_dir(self.config, self.paths.config_file))
         return child_environment(self._environ, {self.password_edit.text(), *self._secrets}, overrides)
 
     # -- status polling -------------------------------------------------------
@@ -979,19 +1004,33 @@ class MainWindow(QMainWindow):
             self._set_busy(False)
             self._refuse(errors)
             return
+        if self.config_problem:
+            self._set_busy(False)
+            self._fail(self.config_problem)
+            return
         values = self.form_values()
+        config = dataclasses.replace(self.config, settings={k: values[k] for k in DEFAULTS})
+        # The installer's settings first: they carry its own checks (lines it would refuse).
         try:
-            save_settings(self.paths.settings, values)
+            save_settings(self.paths.settings, config.settings)
         except SettingsError as exc:
             self._set_busy(False)
-            if exc.problems:      # lines the builder does not own, which the installer would refuse
+            if exc.problems:
                 self._refuse(exc.problems)
             else:
                 self._fail(str(exc))
             return
+        try:
+            save_config(self.paths.config_file, config)
+        except OSError as exc:
+            self._set_busy(False)
+            self._fail(f"Could not save {self.paths.config_file}: {exc.strerror or exc}")
+            return
+        self.config = config
         self.settings_values = values
         self._secrets.add(values["JUPYTER_PASSWORD"])
-        self.log(f"# Settings saved to {self.paths.settings} (mode 0600)")
+        self.log(f"# Configuration saved to {self.paths.config_file} (mode 0600)",
+                 f"# Settings saved to {self.paths.settings} (mode 0600)")
         self._run_installer("install")
 
     def stop(self, *_args: object) -> None:

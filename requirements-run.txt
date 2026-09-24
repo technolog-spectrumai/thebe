@@ -1,0 +1,3 @@
+# Dependencies of run.py and the thebe package (config.yaml). run.sh installs them into ./.venv
+# (never globally) with --only-binary=:all:; requirements-builder.txt includes this file.
+PyYAML==6.0.3

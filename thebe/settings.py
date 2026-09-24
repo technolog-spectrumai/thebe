@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping, NamedTuple
 
 REPO = Path(__file__).resolve().parent.parent
+CONFIG_NAME = "config.yaml"         # the builder's and run.py's configuration (thebe.config)
 APP_NAME = "JupyterLab on Tailscale"
 PROJECT = "jupyterlab-tailscale"          # Compose project name used by the installer
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
@@ -63,10 +64,15 @@ def absolute_path(value: str) -> Path:
 @dataclass(frozen=True)
 class Paths:
     installer: Path
-    settings: Path       # the installer's settings .env (0600) the builder edits
+    settings: Path       # the installer's settings .env (0600), written from the config
     runtime_env: Path    # APP_DIR/.env written by the installer (read-only here)
     theme_dir: Path
     display_font: Path
+    config: Path | None = None    # config.yaml; None: next to the settings file
+
+    @property
+    def config_file(self) -> Path:
+        return self.config or self.settings.with_name(CONFIG_NAME)
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] = os.environ) -> "Paths":
@@ -81,6 +87,7 @@ class Paths:
             runtime_env=absolute_path(app_dir) / ".env",
             theme_dir=REPO / "stack" / "theme",
             display_font=REPO / "stack" / "stats" / "static" / "orbitron-latin.woff2",
+            config=absolute_path(environ["JLT_CONFIG_FILE"]) if environ.get("JLT_CONFIG_FILE") else None,
         )
 
 

@@ -1,0 +1,23 @@
+# Thebe configuration, read by the builder (./run-builder.sh) and the headless runner (./run.sh).
+# Both check it and write the installer's settings file (.env) from it: edit this file, not the .env.
+# Deploy in the builder rewrites it (comments of your own are not kept). Keep it private (mode 600).
+
+jupyter:
+  # Password of JupyterLab and the dashboard: 8 to 128 characters, no single quote or backslash.
+  password: "TailLab-7mK9-vQ2x-N4pR!"
+  port: 8888
+
+stats:
+  # The statistics dashboard and the Dependencies page (HTTP Basic: this user and the password).
+  enabled: true
+  port: 8889
+  user: "jupyter"
+
+# Colours of the dashboard and the builder: a file name from stack/theme without .json.
+theme: "amazing"
+
+# auto: HTTPS on the Tailscale name when the tailnet allows it; off: plain HTTP.
+https: "auto"
+
+# The notebook workspace on this machine (/workspace in JupyterLab). Default: ~/jupyter-workspace.
+# workspace: "~/jupyter-workspace"

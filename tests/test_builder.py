@@ -769,6 +769,7 @@ class WindowTests(unittest.TestCase):
         """))
         self.installer.chmod(0o644)
         self.settings = root / "repo" / ".env"
+        self.config = root / "repo" / "config.yaml"      # Paths.config_file: next to the settings
         self.runtime = root / "app" / ".env"
         self.runtime.write_text(f"TS_IP='{TS_IP}'\nJUPYTER_PORT='8888'\nSTATS_PORT='8889'\nCOMPOSE_PROFILES='stats'\n")
         (self.state / "tailscale.json").write_text(tailscale_json())
@@ -1172,18 +1173,76 @@ class WindowTests(unittest.TestCase):
         self.wait_idle(window, 1)
         self.assertEqual(builder.parse_settings(self.settings.read_text())["HTTPS"], "off")
 
+        # Deploy wrote config.yaml, which the next window would read instead of the .env.
+        self.config.unlink()
         self.settings.write_text("JUPYTER_PASSWORD='Loaded-Pass-123'\n")
         window = self.window()
         window.deploy()
         self.wait_idle(window, 1)
         self.assertIn("HTTPS='auto'", self.settings.read_text().split("\n"))
 
+        self.config.unlink()
         self.settings.write_text("JUPYTER_PASSWORD='Loaded-Pass-123'\nHTTPS='on'\n")
         window = self.window()
         self.assertIn("HTTPS in the settings file must be one of: auto, off", window.error_label.text())
         window.deploy()
         self.assertIn("HTTPS", self.wait_refused(window))
         self.assertIn("HTTPS='on'", self.settings.read_text())
+
+    def installer_env(self):
+        text = (self.state / "installer.env").read_text()
+        return dict(item.split("=", 1) for item in text.split("\0") if "=" in item)
+
+    def test_config_yaml_is_the_source_and_deploy_writes_both_files(self):
+        self.config.write_text('jupyter:\n  password: "From-Config-123"\n  port: 9100\n'
+                               'stats:\n  enabled: false\n  port: 9101\ntheme: "market"\nworkspace: "ws"\n')
+        self.settings.write_text("JUPYTER_PASSWORD='From-Env-12345'\n# kept\n")
+        window = self.window()
+        self.assertEqual(window.password_edit.text(), "From-Config-123")
+        self.assertEqual((window.jupyter_port.value(), window.stats_port.value()), (9100, 9101))
+        self.assertFalse(window.stats_check.isChecked())
+        window.jupyter_port.setValue(9200)
+        window.deploy()
+        self.wait_idle(window, 1)
+        values = builder.parse_settings(self.settings.read_text())
+        self.assertEqual((values["JUPYTER_PASSWORD"], values["JUPYTER_PORT"], values["STATS_ENABLED"], values["THEME"]),
+                         ("From-Config-123", "9200", "0", "market"))
+        self.assertIn("# kept", self.settings.read_text())
+        config, problems = builder.load_config(self.config)
+        self.assertEqual(problems, [])
+        self.assertEqual(config.settings["JUPYTER_PORT"], "9200")
+        self.assertEqual(config.workspace, "ws")          # kept as written, resolved next to the file
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o600)
+        self.assertEqual(self.installer_env()["JLT_WORKSPACE_DIR"], str(self.config.parent / "ws"))
+        self.assertIn("Configuration saved to", window.log_view.toPlainText())
+
+    def test_a_first_deploy_creates_config_yaml_from_the_settings_file(self):
+        self.settings.write_text("JUPYTER_PASSWORD='Loaded-Pass-123'\nSTATS_ENABLED='no'\n")
+        window = self.window()
+        self.assertFalse(window.stats_check.isChecked())
+        window.deploy()
+        self.wait_idle(window, 1)
+        config, problems = builder.load_config(self.config)
+        self.assertEqual((problems, config.settings["JUPYTER_PASSWORD"], config.settings["STATS_ENABLED"]),
+                         ([], "Loaded-Pass-123", "0"))
+        self.assertNotIn("JLT_WORKSPACE_DIR", self.installer_env())
+
+    def test_config_problems_are_shown_and_an_unreadable_config_is_never_rewritten(self):
+        self.config.write_text("jupyter:\n  port: 80\nstats:\n  enabled: maybe\nextra: 1\n")
+        window = self.window()
+        self.assertEqual(window.banner.property("kind"), "error")
+        for text in ("jupyter.port", "stats.enabled", "'extra'"):
+            self.assertIn(text, window.banner.text())
+        self.assertEqual(window.jupyter_port.value(), 8888)
+
+        raw = b"jupyter: [unclosed\n"
+        self.config.write_bytes(raw)
+        window = self.window()
+        self.assertIn("not valid YAML", window.banner.text())
+        window.deploy()
+        self.assertIn("not valid YAML", self.wait_refused(window))
+        self.assertEqual(self.config.read_bytes(), raw)
+        self.assertEqual(self.calls("installer"), [])
 
     def test_statistics_disabled_is_saved(self):
         window = self.window()
