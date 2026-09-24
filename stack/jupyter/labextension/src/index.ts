@@ -1,5 +1,6 @@
 /**
- * "✨ AI" in the notebook cell toolbar (and Ctrl+Alt+G): the cell's text is the request.
+ * "✨ AI" in the notebook toolbar, in each cell's toolbar and on Ctrl+Alt+G: the text of the
+ * selected cell is the request.
  *
  * The button does no AI work itself and never sees an API key. It puts `%%ai --replace` in
  * front of the cell's text and runs the cell; the %%ai magic in the kernel (thebe_ai.py) asks
