@@ -42,6 +42,7 @@ class CliTests(unittest.TestCase):
                            REPO / "stack" / "stats" / "static" / "orbitron-latin.woff2")
         self.environ = {k: v for k, v in os.environ.items() if not k.startswith("JLT_")}
         self.environ["JUPYTER_PASSWORD"] = "leaked-from-the-shell"
+        self.environ["JLT_GPU"] = "on"                  # config.yaml's nvidia decides, not this
 
     def run_cli(self, *argv, environ=None):
         out, err = io.StringIO(), io.StringIO()
@@ -70,6 +71,14 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("JUPYTER_PASSWORD", env)
         self.assertNotIn("JLT_WORKSPACE_DIR", env)
         self.assertNotIn("NO_COLOR", env)               # a terminal, not a log panel
+        self.assertNotIn("JLT_GPU", env)
+
+    def test_nvidia_from_the_config(self):
+        self.config.write_text("nvidia: false\n")
+        code, out, err = self.run_cli("install")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(parse_settings(self.settings.read_text())["NVIDIA"], "0")
+        self.assertIn("NVIDIA GPU:  off", out)
 
     def test_the_first_config_comes_from_the_settings_file(self):
         self.settings.write_text("JUPYTER_PASSWORD='From-Env-1234'\nTHEME='bitter'\n# mine\n")

@@ -17,7 +17,7 @@ import yaml
 
 from thebe.settings import (
     DEFAULTS, HTTPS_MODES, SPACE_CHARS, absolute_path, check_port, has_control, load_settings_file,
-    normalize_bool, write_private_file,
+    normalize_bool, normalize_nvidia, write_private_file,
 )
 
 MAX_CONFIG_BYTES = 256 * 1024
@@ -70,6 +70,15 @@ def _as_https(value: object, where: str) -> tuple[str | None, str]:
     return None, f"{where} must be one of: {', '.join(HTTPS_MODES)}."
 
 
+def _as_nvidia(value: object, where: str) -> tuple[str | None, str]:
+    if isinstance(value, bool):
+        return ("1" if value else "0"), ""
+    nvidia = normalize_nvidia(str(value)) if isinstance(value, (int, str)) else None
+    if nvidia is None:
+        return None, f"{where} must be true, false or auto."
+    return nvidia, ""
+
+
 # YAML path -> installer setting. A missing entry keeps the default.
 SETTING_FIELDS: tuple[tuple[tuple[str, ...], str, Converter], ...] = (
     (("jupyter", "password"), "JUPYTER_PASSWORD", _as_text),
@@ -79,6 +88,7 @@ SETTING_FIELDS: tuple[tuple[tuple[str, ...], str, Converter], ...] = (
     (("stats", "user"), "STATS_USER", _as_text),
     (("theme",), "THEME", _as_text),
     (("https",), "HTTPS", _as_https),
+    (("nvidia",), "NVIDIA", _as_nvidia),
 )
 # Top-level keys that are not installer settings.
 OTHER_KEYS = ("workspace",)
@@ -191,6 +201,9 @@ def _number(value: str) -> str:
     return value if value.isdigit() and value.isascii() else _scalar(value)
 
 
+_NVIDIA_YAML = {"1": "true", "0": "false", "auto": "auto"}
+
+
 def render_config(config: Config) -> str:
     """config.yaml for `config`, with the explanations of the template."""
     s = config.settings
@@ -217,6 +230,10 @@ def render_config(config: Config) -> str:
         "",
         "# auto: HTTPS on the Tailscale name when the tailnet allows it; off: plain HTTP.",
         f"https: {_scalar(s['HTTPS'])}",
+        "",
+        "# NVIDIA GPU for the notebooks: true expects one (install and start fail when Docker cannot",
+        "# use it), false never uses one (for machines without NVIDIA), auto uses it when it works.",
+        f"nvidia: {_NVIDIA_YAML.get(s['NVIDIA'], _scalar(s['NVIDIA']))}",
         "",
         "# The notebook workspace on this machine (/workspace in JupyterLab). Default: ~/jupyter-workspace.",
         workspace,

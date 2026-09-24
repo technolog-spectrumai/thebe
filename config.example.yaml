@@ -19,5 +19,9 @@ theme: "amazing"
 # auto: HTTPS on the Tailscale name when the tailnet allows it; off: plain HTTP.
 https: "auto"
 
+# NVIDIA GPU for the notebooks: true expects one (install and start fail when Docker cannot
+# use it), false never uses one (for machines without NVIDIA), auto uses it when it works.
+nvidia: auto
+
 # The notebook workspace on this machine (/workspace in JupyterLab). Default: ~/jupyter-workspace.
 # workspace: "~/jupyter-workspace"
