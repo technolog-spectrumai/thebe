@@ -615,6 +615,9 @@ torch==2.14.0+cpu
   summary, the runner installs the file together with the page's list, in one `pip install`, so the two
   can never disagree. With statistics on, the running runner does it and the page shows the job live;
   with statistics off, a one-off runner container does.
+- **Option lines apply to both lists.** Because they are one `pip install`, an `--index-url`,
+  `--extra-index-url`, `--no-index` or `--find-links` line in either file applies to every package in
+  both; prefer `--extra-index-url` (as in the torch example) over replacing the index.
 - **Skipped when nothing changed.** The runner records what each job installed. A deploy with the same
   file, the same image and a finished last install checks with pip (offline, dry run) that nothing is
   missing and then skips the install. A changed file, a rebuilt image with other pins, a failed or
