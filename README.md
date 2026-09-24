@@ -294,6 +294,7 @@ The window follows the desktop's light or dark mode, using the same oya palette 
 | Services | A state dot and badge for JupyterLab and Statistics (Running, Starting, Unhealthy, Restarting, Stopped, Not deployed, Disabled), refreshed every 4 seconds, with the deployed URL and an **Open** button that starts the browser. |
 | Page links | Under Statistics: **Dependencies**, **Stats API** and **Health** open those pages directly, so no address has to be typed. Like Open, they are enabled while the container runs and always use the deployed address and port. |
 | Imported directories | Up to 7 host directories (path, **Browse…**, optional name) copied into the workspace on Deploy; see [Imported directories](#imported-directories). Only the filled rows and one empty row are shown; an empty row is an unused slot. The card lists what goes where and any problem (missing directory, same name twice, the workspace itself). |
+| Python packages | Shows the project's `requirements.txt` (packages preinstalled on Deploy; [three layers](#python-packages-three-layers)) and whether it is accepted. **Choose requirements.txt…** copies a pip requirements file you pick into its place: only a file the Dependencies page would accept, byte for byte (a real copy, no link), replacing an existing one only after asking. The next Deploy installs it. |
 | **Deploy / Update** | Validates, saves `config.yaml` and the installer's `.env`, copies the imported directories (`run.py import`, when any are set), then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
 | **Start / Restart** | `start` when nothing is running, otherwise `restart`. |
 | **Stop** | `stop` (`docker compose stop`). |
@@ -589,7 +590,7 @@ it is installed); see [the next section](#python-packages-three-layers).
 | Layer | Where it is declared | Installed | Changing it |
 | --- | --- | --- | --- |
 | **1. Base image** | `stack/jupyter/requirements.lock.txt` (JupyterLab, numpy, pandas, matplotlib, scipy, ipywidgets, …) | into the image, at build time | edit the lock and `update` (rebuilds the image) |
-| **2. Project `requirements.txt`** | `<repo>/requirements.txt` (optional; `JLT_REQUIREMENTS_FILE` elsewhere) | into the custom packages environment on every `install` / `update`, Deploy in the builder and `./run.sh install` / `update` | edit the file and deploy again — no image rebuild |
+| **2. Project `requirements.txt`** | `<repo>/requirements.txt` (optional; `JLT_REQUIREMENTS_FILE` elsewhere); in the builder, **Choose requirements.txt…** copies one in | into the custom packages environment on every `install` / `update`, Deploy in the builder and `./run.sh install` / `update` | edit the file and deploy again — no image rebuild |
 | **3. Dependencies page** | the page's editor (stored in the `custom_packages` volume) | into the same environment, when you press **Install / update** | on the page |
 
 Layers 2 and 3 are one environment — the virtualenv in the `custom_packages` volume that the
