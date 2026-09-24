@@ -687,7 +687,10 @@ class LauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="thebe-test-launcher-") as tmp:
             root = Path(tmp)
             shutil.copy2(REPO / "run-builder.sh", root / "run-builder.sh")
-            (root / "requirements-builder.txt").write_text("pip\n")      # already installed: no download
+            (root / "lib").mkdir()
+            shutil.copy2(REPO / "lib" / "venv.sh", root / "lib" / "venv.sh")
+            (root / "requirements-builder.txt").write_text("-r requirements-run.txt\n")
+            (root / "requirements-run.txt").write_text("pip\n")      # already installed: no download
             (root / "builder.py").write_text("import sys\nprint('launched', sys.argv[1:])\n")
             # What Ctrl+C during ensurepip leaves behind: a python, but no pip.
             subprocess.run([self.PYTHON, "-m", "venv", "--without-pip", str(root / ".venv")], check=True)
