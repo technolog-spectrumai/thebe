@@ -9,15 +9,15 @@ Every feature below carries one of three labels:
 
 | Label | Meaning |
 | --- | --- |
-| **[Demonstrated]** | Exists as code in `spike/` and was shown working in the spike: unit tests plus a real IPython 9.17 / ipykernel 7.3 kernel (the versions in Thebe's image), with a local stand-in for the OpenAI and Anthropic APIs. **Not** run with real API keys, and not inside a deployed Thebe. |
+| **[Demonstrated]** | Exists as code in `spike/` and was shown working in the spike: unit tests plus a real IPython 9.17 / ipykernel 7.3 kernel (the versions in Thebe's image), with a local stand-in for the OpenAI and Anthropic APIs. Where marked *(browser)*, also clicked through in JupyterLab 4.6.4 in headless Chromium. **Not** run with real API keys, and not inside a deployed Thebe. |
 | **[Feasible]** | The building blocks were checked (JupyterLab 4.6.4's own code, the SDKs), but the piece is not wired up. |
 | **[Proposed]** | A design only. Nothing exists yet. |
 
 ## 1. What it is meant to do
 
-You write what you want in plain language. The AI writes Python code, and that code appears in a
-**new cell below**. Nothing runs by itself: you read the code, change it if needed, and run it
-with **Shift+Enter**.
+You write what you want in plain language. The AI writes Python code, and that code appears in
+the notebook: in a **new cell below**, or, with the ✨ AI button, **in place of your prompt**.
+Nothing runs by itself: you read the code, change it if needed, and run it with **Shift+Enter**.
 
 ```python
 %%ai
@@ -48,11 +48,12 @@ plt.show()
 | `from thebe_ai import ask` (the same thing as a Python function) | **[Demonstrated]** |
 | The answer streams into the cell output while it is written | **[Demonstrated]** (against the stand-in API) |
 | Clear one-line errors (no key, key rejected, rate limit, timeout, no network) | **[Demonstrated]** |
-| The new cell appearing in JupyterLab's notebook | **[Feasible]** — JupyterLab 4.6.4's code inserts the cell below, unexecuted and marked untrusted; not clicked through in a browser |
+| The new cell appearing in JupyterLab's notebook, not run | **[Demonstrated]** *(browser)* |
+| ✨ AI button in the cell toolbar: the whole cell is the prompt, the cell becomes the code | **[Demonstrated]** *(browser)* in the spike; shipping it in Thebe's image is **[Proposed]** |
+| `Ctrl+Alt+G`: the same as the ✨ AI button | **[Feasible]** — declared by the spike extension, not pressed in the browser demo |
+| `%ai` available without `%load_ext thebe_ai` (kernel config) | **[Demonstrated]** *(browser)* in the spike; in Thebe **[Proposed]** |
 | API keys in `config.yaml` → Thebe hands them to JupyterLab | **[Proposed]** |
-| `%ai` available without `%load_ext thebe_ai` | **[Proposed]** |
-| A ✨ button on each cell that asks for a prompt | **[Proposed]**, not planned for the first version |
-| Chat sidebar, inline autocomplete, agents | Not planned (see ai_spike.md: use jupyter-ai if you want these) |
+| Chat sidebar, inline autocomplete, agents | Not planned (see §9 and ai_spike.md §5.1) |
 
 ## 3. Configuring API keys — **[Proposed]**
 
@@ -99,6 +100,40 @@ or the environment variables `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. Models can 
 %load_ext thebe_ai        # [Demonstrated] — in the proposed MVP this line would not be needed
 %ai status                # which providers are configured, keys shown as …1234
 ```
+
+### The ✨ AI button: the whole cell is the prompt — **[Demonstrated]** *(browser, spike only)*
+
+1. Type your request into an empty code cell, in plain language, without `%%ai`:
+
+   ```text
+   print pi to the console
+   ```
+
+2. Click **✨ AI** in the cell's toolbar (top right of the cell, next to the copy and move
+   buttons).
+3. The answer streams into the cell's output. When it is complete, **the cell's text is replaced
+   by the code**, with your prompt kept at the top as a comment:
+
+   ```python
+   # ai: print pi to the console
+   import math
+   print(math.pi)
+   ```
+
+4. **The code has not run.** The cell still shows the AI's answer as its output and the old run
+   number, but that belongs to the request, not to the new code. Read the code, then press
+   **Shift+Enter**.
+
+Good to know:
+
+- The button sends the **entire** cell. Use it on a cell that contains only your request.
+- If the cell already starts with `%%ai` (with options such as `openai` or `--var df`), the button
+  just runs it as it is, so the options apply.
+- Your prompt stays in the `# ai:` comment, so you can copy it back. Undo in the cell should also
+  work, but the spike did not test it.
+- The button does nothing on an empty cell or a Markdown cell.
+- Behind the scenes the button only puts `%%ai --replace` in front of your text and runs the cell.
+  The key stays in the kernel, and the browser never sees it.
 
 ### Asking for code — **[Demonstrated]**
 
@@ -181,6 +216,8 @@ ask("plot a sine wave", provider="openai", insert=True)   # also puts it in a ne
 ## 6. Limitations
 
 - Not available in a deployed Thebe yet (see the labels above).
+- After the ✨ AI button replaces a cell, its output and run number are still those of the
+  request (see above).
 - Produces code only: no chat, no autocomplete while typing, no automatic fixes.
 - The AI sees only your prompt and the `--var` descriptions: not your files, other cells or outputs.
 - Generated code can be wrong or unsafe. Read it before running it, especially anything that deletes
@@ -195,7 +232,8 @@ The messages below are the prototype's own **[Demonstrated]** wording.
 
 | Message | What to do |
 | --- | --- |
-| ``UsageError: Cell magic `%%ai` not found.`` | Run `%load_ext thebe_ai` first (in the spike). |
+| ``UsageError: Cell magic `%%ai` not found.`` | Run `%load_ext thebe_ai` first (in the spike). If this came from the ✨ AI button, the cell now starts with `%%ai --replace`: run the cell again after loading. |
+| No ✨ AI in the cell toolbar | The spike extension is not installed in that JupyterLab (see §8). `%%ai` still works without it. |
 | `No AI provider has an API key` | No key is configured (proposed: `config.yaml` → deploy → restart the kernel). |
 | `No AI provider named 'x' is configured` | Use one of the names `%ai status` lists. |
 | `the API key was rejected` | The key is wrong, revoked or for another provider. Replace it and redeploy. |
@@ -217,5 +255,27 @@ cd spike && /tmp/ai/bin/python -m unittest discover -s tests -v   # 11 tests, st
 /tmp/ai/bin/python kernel_demo.py                                  # a real kernel runs %%ai
 ```
 
+The browser demo (JupyterLab 4.6.4 + headless Chromium, with the ✨ AI button) needs Node to build
+the extension once. The steps are in ai_spike.md §11. It then runs as `python browser_demo.py`,
+checks both flows from the saved notebooks and stops JupyterLab again.
+
 With real keys, in a local Jupyter of your own (**[Feasible]**, not tried in the spike):
 `ANTHROPIC_API_KEY=… PYTHONPATH=…/spike jupyter lab`, then `%load_ext thebe_ai` in a notebook.
+
+## 9. What about jupyter-ai?
+
+[jupyter-ai](https://github.com/jupyterlab/jupyter-ai) is Project Jupyter's own AI extension (chat
+assistant, agents and an `%%ai` magic). The spike checked whether Thebe could ship it safely
+(details in ai_spike.md §5.1):
+
+- **The full jupyter-ai (chat assistant "Jupyternaut"):** not planned. Its assistant can run cells
+  and shell commands without asking, and it takes keys and extra code from files in the
+  workspace.
+- **Only its `%%ai` magic:** possible, but only through a Thebe wrapper
+  (`spike/jupyter_ai_hardened.py`, **[Demonstrated]**). Installed as is, it reads a `.env` file
+  from the notebook's folder before every request. The spike showed that such a file can send
+  your key to a different server without any sign.
+
+**If you use jupyter-ai yourself** (e.g. in the custom packages venv), never keep API keys in a
+`.env` file in the workspace, and do not open notebooks from folders you do not trust while a key
+is loaded.
