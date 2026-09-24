@@ -13,12 +13,23 @@ third-party packages here, and those can read every file the runner can. Bodies 
 Custom packages go into a virtualenv on the custom_packages volume:
   CUSTOM_DIR/venv              python -m venv --system-site-packages --without-pip
   CUSTOM_DIR/requirements.txt  saved from the page, validated first
+  CUSTOM_DIR/baseline.txt      the project's requirements.txt, handed over on every deploy
+  CUSTOM_DIR/baseline.json     what the last job installed from it (to skip unchanged deploys)
   CUSTOM_DIR/job.json          state of the last job (atomic writes)
   CUSTOM_DIR/job.log           output of the last job
   CUSTOM_DIR/tmp               TMPDIR for pip (the root filesystem is read-only)
-pip runs with --constraint /opt/constraints.txt (pip freeze of the image), so a package
-the image already has keeps its pinned version and is never installed a second time.
-Kernels add the venv's site-packages after the image's own (kernel_launcher.py).
+Every install job installs the baseline and the page's list together, in one pip run, so
+the two can never disagree. pip runs with --constraint /opt/constraints.txt (pip freeze of
+the image), so a package the image already has keeps its pinned version and is never
+installed a second time. Kernels add the venv's site-packages after the image's own
+(kernel_launcher.py).
+
+Besides the HTTP server (no arguments) the script has two commands for the installer:
+  deps_runner.py check           validate a requirements file on stdin (exit 2 on problems)
+  deps_runner.py baseline [--local]
+                                 make the environment match the requirements.txt on stdin:
+                                 through the running server, or with --local in a one-off
+                                 container when statistics (and so the server) are off
 
 Environment:
   STATS_USER, DEPS_TOKEN_FILE         Basic auth credentials
@@ -31,6 +42,9 @@ import binascii
 import contextlib
 import datetime
 import errno
+import fcntl
+import hashlib
+import http.client
 import http.server
 import importlib.metadata
 import json
@@ -56,7 +70,7 @@ REALM = "jupyterlab-tailscale dependency runner"
 
 CUSTOM_DIR = Path(os.environ.get("CUSTOM_DIR") or "/opt/custom")
 PIP_CACHE_DIR = Path(os.environ.get("PIP_CACHE_DIR") or "/var/cache/pip")
-CONSTRAINTS_FILE = Path("/opt/constraints.txt")
+CONSTRAINTS_FILE = Path(os.environ.get("CONSTRAINTS_FILE") or "/opt/constraints.txt")
 VENV_DIR = CUSTOM_DIR / "venv"
 VENV_PYTHON = VENV_DIR / "bin" / "python"
 PYTHON_TAG = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -65,8 +79,13 @@ REQUIREMENTS_FILE = CUSTOM_DIR / "requirements.txt"
 JOB_FILE = CUSTOM_DIR / "job.json"
 LOG_FILE = CUSTOM_DIR / "job.log"
 JOB_TMP_DIR = CUSTOM_DIR / "tmp"
+BASELINE_FILE = CUSTOM_DIR / "baseline.txt"
+BASELINE_STATE_FILE = CUSTOM_DIR / "baseline.json"
+LOCK_FILE = CUSTOM_DIR / ".job.lock"
+PYTHON_XY = f"{sys.version_info.major}.{sys.version_info.minor}"
 
-MAX_BODY_BYTES = 64 * 1024
+# A 64 KB requirements file as a JSON string (newlines escaped) needs more than 64 KB.
+MAX_BODY_BYTES = 192 * 1024
 MIN_TOKEN_LENGTH = 32
 # Seconds a connection may stay silent (request line, headers or body) before it is dropped,
 # so half-sent requests from the Compose network cannot pile up handler threads.
@@ -317,6 +336,40 @@ def has_requirements(text: str) -> bool:
     return any(not logical.split()[0].startswith("-") for _, logical in _logical_lines(numbered))
 
 
+def requirement_count(text: str) -> int:
+    """Lines naming a package (options such as --index-url do not count)."""
+    numbered = list(enumerate(text.split("\n"), start=1))
+    return sum(1 for _, logical in _logical_lines(numbered) if not logical.split()[0].startswith("-"))
+
+
+def text_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def constraints_digest() -> str:
+    """Changes when the image's pinned packages change (a rebuilt image with a new lock)."""
+    try:
+        return hashlib.sha256(CONSTRAINTS_FILE.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def read_baseline_state() -> dict:
+    """What the last finished job installed from baseline.txt ({} when nothing is known)."""
+    try:
+        data = json.loads(BASELINE_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 # --- small file helpers ----------------------------------------------------------------
 
 
@@ -423,6 +476,17 @@ class Sizes:
             values["free_bytes"] = values["total_bytes"] = None
         return values
 
+    @staticmethod
+    def measure() -> dict:
+        """The same numbers as snapshot(), measured now (for the command line)."""
+        values = {"venv_bytes": disk_usage(VENV_DIR), "cache_bytes": disk_usage(PIP_CACHE_DIR)}
+        try:
+            stats = os.statvfs(CUSTOM_DIR)
+            values.update(free_bytes=stats.f_bavail * stats.f_frsize, total_bytes=stats.f_blocks * stats.f_frsize)
+        except OSError:
+            values.update(free_bytes=None, total_bytes=None)
+        return values
+
     def refresh(self) -> None:
         with self._lock:
             if self._running:
@@ -470,6 +534,8 @@ class JobRunner:
         self._log_written = 0
         self._log_capped = False
         self._installed_cache: tuple[int, list] | None = None
+        self._lock_fd: int | None = None
+        self._job_baseline = ""
         self.job = self._load_job()
 
     # -- state --------------------------------------------------------------------------
@@ -563,13 +629,92 @@ class JobRunner:
                 self._maintenance = False
             self._sizes.refresh()
 
+    def save_baseline(self, text: str) -> bool:
+        """Store the project's requirements.txt; True when it differs from the stored one."""
+        with self._lock:
+            if self.job["status"] == "running" or self._maintenance:
+                raise Busy
+            if read_text_file(BASELINE_FILE) == text and BASELINE_FILE.exists():
+                return False
+            write_atomic(BASELINE_FILE, text.encode("utf-8"))
+            return True
+
+    def _record_baseline(self, ok: bool) -> None:
+        state = {
+            "sha256": self._job_baseline,
+            "constraints": constraints_digest(),
+            "python": PYTHON_XY,
+            "ok": ok,
+            "finished_at": utc_now(),
+        }
+        try:
+            write_atomic(BASELINE_STATE_FILE, (json.dumps(state, indent=1) + "\n").encode("utf-8"))
+        except OSError as exc:
+            log.error("cannot write %s: %s", BASELINE_STATE_FILE, exc)
+
+    def baseline_check(self, text: str) -> tuple[bool, str]:
+        """(up to date, why): may a deploy skip the install for this requirements.txt?
+
+        Skipped only when the last job installed exactly this text with the same image and
+        finished, the venv works, and pip (offline, dry run) has nothing left to install.
+        """
+        if not has_requirements(text):
+            return True, "requirements.txt lists no packages; nothing extra to install"
+        state = read_baseline_state()
+        if not state.get("sha256") or state.get("sha256") == text_digest(""):
+            return False, "first install of requirements.txt"
+        if state.get("sha256") != text_digest(text):
+            return False, "requirements.txt changed since the last install"
+        if state.get("constraints") != constraints_digest() or state.get("python") != PYTHON_XY:
+            return False, "the image's own packages changed since the last install"
+        if not state.get("ok"):
+            return False, "the last install did not finish"
+        env = self.job_env()
+        problem = self._venv_problem(env)
+        if problem:
+            return False, problem
+        if not self._baseline_satisfied(env):
+            return False, "packages from requirements.txt are missing from the environment"
+        return True, "requirements.txt is unchanged and already installed"
+
+    @staticmethod
+    def _baseline_satisfied(env: dict) -> bool:
+        """pip's own answer, offline: would installing baseline.txt change anything?"""
+        argv = [str(VENV_PYTHON), "-m", "pip", "install", "--dry-run", "--no-index", "--quiet", "--report", "-",
+                "--disable-pip-version-check", "--no-input", "--constraint", str(CONSTRAINTS_FILE),
+                "-r", str(BASELINE_FILE)]
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=JOB_TMP_DIR, timeout=300,
+                                    check=False, stdin=subprocess.DEVNULL)
+            report = json.loads(result.stdout) if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return False
+        return isinstance(report, dict) and not report.get("install")
+
     def start(self, action: str) -> dict:
         with self._lock:
             if self.job["status"] == "running" or self._maintenance or self._shutting_down:
                 raise Busy
-            # Truncate the log before the new job id is visible, so a reader never gets
-            # the previous job's output under the new id.
-            self._log_handle = open(LOG_FILE, "wb", buffering=0)
+            # Across processes too: a one-off `deps_runner.py baseline --local` container and
+            # the server share the volume, and only one pip may change the venv at a time.
+            lock_fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(lock_fd)
+                raise Busy from None
+            try:
+                # What this job installs from the project's requirements.txt. Marked unfinished
+                # now, so a job killed with its container never counts as installed.
+                self._job_baseline = text_digest(read_text_file(BASELINE_FILE))
+                self._record_baseline(False)
+                # Truncate the log before the new job id is visible, so a reader never gets
+                # the previous job's output under the new id.
+                self._log_handle = open(LOG_FILE, "wb", buffering=0)
+            except BaseException:
+                os.close(lock_fd)
+                raise
+            self._lock_fd = lock_fd
             self._log_written = 0
             self._log_capped = False
             self.job = {
@@ -720,12 +865,18 @@ class JobRunner:
             if self._log_handle is not None:
                 self._log_handle.close()
                 self._log_handle = None
+            self._record_baseline(job["status"] == "succeeded")
             self._installed_cache = None
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)          # releases the flock
+                self._lock_fd = None
             self._sizes.refresh()
             log.info("job %s (%s) finished: %s", job["id"], action, status)
 
-    def _run_steps(self, action: str) -> tuple[str, int | None, str]:
-        env = {
+    @staticmethod
+    def job_env() -> dict:
+        """The environment of every pip run: the shared download cache, TMPDIR on the volume."""
+        return {
             "PATH": f"{VENV_DIR}/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOME": "/tmp",
             "LANG": "C.UTF-8",
@@ -735,6 +886,9 @@ class JobRunner:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         }
+
+    def _run_steps(self, action: str) -> tuple[str, int | None, str]:
+        env = self.job_env()
         self._write_log(f"==> {'Reset & reinstall' if action == 'reset' else 'Install / update'} started {utc_now()}\n")
 
         if action == "reset" and VENV_DIR.exists():
@@ -763,33 +917,31 @@ class JobRunner:
             if code != 0:
                 return "failed", code, f"Creating the environment failed (exit status {code})"
 
-        try:
-            text = REQUIREMENTS_FILE.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            text = ""
-        if not has_requirements(text):
-            self._write_log("==> The requirements list is empty; the environment is ready.\n")
+        # The project's requirements.txt (baseline) and the page's list, in one pip run.
+        files = [path for path in (BASELINE_FILE, REQUIREMENTS_FILE) if has_requirements(read_text_file(path))]
+        if not files:
+            self._write_log("==> The requirements lists are empty; the environment is ready.\n")
             return "succeeded", 0, "No packages requested; the environment is ready"
+        names = " and ".join("requirements.txt of the project" if path == BASELINE_FILE else "the page's list"
+                             for path in files)
+        self._write_log(f"==> Installing {names}\n")
 
         self._set_message("Running pip")
-        code = self._command(
-            [
-                str(VENV_PYTHON),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--no-input",
-                "--progress-bar",
-                "off",
-                "--constraint",
-                str(CONSTRAINTS_FILE),
-                "-r",
-                str(REQUIREMENTS_FILE),
-            ],
-            env,
-            JOB_TMP_DIR,
-        )
+        argv = [
+            str(VENV_PYTHON),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--progress-bar",
+            "off",
+            "--constraint",
+            str(CONSTRAINTS_FILE),
+        ]
+        for path in files:
+            argv += ["-r", str(path)]
+        code = self._command(argv, env, JOB_TMP_DIR)
         if self._cancelled():
             return "cancelled", code, "Cancelled; packages installed before the cancel are kept"
         if code != 0:
@@ -933,7 +1085,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if length < 0:
             raise HttpError(400, "invalid Content-Length")
         if length > MAX_BODY_BYTES:
-            raise HttpError(413, "request body larger than 64 KB")
+            raise HttpError(413, "request body larger than 192 KB")
         if length == 0:
             if required:
                 raise HttpError(400, "a JSON body is required")
@@ -1013,10 +1165,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             requirements = REQUIREMENTS_FILE.read_text(encoding="utf-8", errors="replace")
         except FileNotFoundError:
             requirements = ""
+        baseline = read_text_file(BASELINE_FILE)
+        applied = read_baseline_state()
         return 200, {
             "python": platform.python_version(),
             "job": self.runner.job_copy(),
             "requirements": requirements,
+            # The project's requirements.txt as last deployed; read-only here.
+            "baseline": {
+                "text": baseline,
+                "packages": requirement_count(baseline),
+                "installed": bool(applied.get("ok")) and applied.get("sha256") == text_digest(baseline),
+                "finished_at": applied.get("finished_at"),
+            },
             "installed": self.runner.installed(),
             "sizes": self.sizes.snapshot(),
             "constraints_count": _constraints_count(),
@@ -1069,6 +1230,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HttpError(409, "a job is running; save after it has finished", job=self.runner.job_copy()) from None
         return 200, {"requirements": text, "saved_at": utc_now()}
 
+    def put_baseline(self, _query):
+        """The project's requirements.txt from a deploy (deps_runner.py baseline); not proxied
+        by the dashboard, so the page cannot change it."""
+        body = self._read_json(required=True)
+        text = body.get("text")
+        if not isinstance(text, str):
+            raise HttpError(400, "text must be a string")
+        text = normalize_requirements(text)
+        errors = validate_requirements(text)
+        if errors:
+            raise HttpError(400, "invalid requirements", errors=errors)
+        try:
+            changed = self.runner.save_baseline(text)
+        except Busy:
+            raise HttpError(409, "a job is running; try again after it has finished", job=self.runner.job_copy()) from None
+        up_to_date, reason = self.runner.baseline_check(text)
+        return 200, {"changed": changed, "up_to_date": up_to_date, "reason": reason}
+
     def post_job(self, _query):
         body = self._read_json(required=True)
         action = body.get("action")
@@ -1102,6 +1281,7 @@ ROUTES = {
     ("GET", "/state"): Handler.state,
     ("GET", "/log"): Handler.log_chunk,
     ("PUT", "/requirements"): Handler.put_requirements,
+    ("PUT", "/baseline"): Handler.put_baseline,
     ("POST", "/jobs"): Handler.post_job,
     ("POST", "/cancel"): Handler.post_cancel,
     ("POST", "/cache/clear"): Handler.post_cache_clear,
@@ -1130,11 +1310,240 @@ class Server(http.server.ThreadingHTTPServer):
     request_queue_size = 32
 
 
-def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s", stream=sys.stderr)
-    Handler.username = (os.environ.get("STATS_USER") or "jupyter").encode("utf-8")
-    Handler.password = read_token(os.environ.get("DEPS_TOKEN_FILE") or "/run/secrets/deps_token")
+# --- command line: the installer's side of a deploy ------------------------------------
 
+BUSY_WAIT_LIMIT = 2 * 3600       # seconds a deploy waits for a job started on the page
+
+
+def _say(text: str) -> None:
+    print(f"==> {text}", flush=True)
+
+
+def _human(count) -> str:
+    if count is None:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if count < 1024 or unit == "TB":
+            return f"{count:.0f} {unit}" if unit == "B" else f"{count:.1f} {unit}"
+        count /= 1024
+    return f"{count:.1f} TB"
+
+
+def _say_sizes(sizes: dict | None) -> None:
+    if sizes:
+        _say(f"Custom packages {_human(sizes.get('venv_bytes'))}, download cache {_human(sizes.get('cache_bytes'))}, "
+             f"free disk {_human(sizes.get('free_bytes'))}")
+
+
+def _read_stdin_requirements() -> tuple[str, list[str]]:
+    """The requirements.txt on stdin, normalized, and the problems the page would report."""
+    data = sys.stdin.buffer.read(MAX_REQUIREMENTS_BYTES + 1)
+    if len(data) > MAX_REQUIREMENTS_BYTES:
+        return "", [f"The file is larger than {MAX_REQUIREMENTS_BYTES // 1024} KB."]
+    try:
+        text = normalize_requirements(data.decode("utf-8"))
+    except UnicodeDecodeError:
+        return "", ["The file is not UTF-8 text."]
+    problems = [f"line {e['line']}: {e['message']}" if e["line"] else e["message"] for e in validate_requirements(text)]
+    return text, problems
+
+
+def _refuse(problems: list[str]) -> int:
+    print("requirements.txt is not accepted (the Dependencies page's rules):", file=sys.stderr)
+    for problem in problems:
+        print(f"  {problem}", file=sys.stderr)
+    return 2
+
+
+def cli_check() -> int:
+    """Validate a requirements.txt on stdin before a deploy recreates anything."""
+    text, problems = _read_stdin_requirements()
+    if problems:
+        return _refuse(problems)
+    count = requirement_count(text)
+    _say(f"requirements.txt: {count} package line(s), accepted" if count else "requirements.txt lists no packages")
+    return 0
+
+
+class _ErrorLines:
+    """pip's error lines from a log, to name the failing requirement at the end."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self._partial = ""
+        self._in_conflict = False
+
+    def feed(self, text: str) -> None:
+        text = self._partial + text
+        *complete, self._partial = text.split("\n")
+        for line in complete:
+            if line.startswith("ERROR:"):
+                self.lines.append(line)
+                self._in_conflict = False
+            elif line.strip() == "The conflict is caused by:":
+                self.lines.append(line.strip())
+                self._in_conflict = True
+            elif self._in_conflict:
+                if line.strip():
+                    self.lines.append("  " + line.strip())
+                else:
+                    self._in_conflict = False
+
+
+def _finish(job: dict, errors: _ErrorLines, sizes: dict | None) -> int:
+    if job.get("status") == "succeeded":
+        _say("Packages from requirements.txt are installed. Restart running kernels to use new ones.")
+        _say_sizes(sizes)
+        return 0
+    _say(f"Installing requirements.txt ended: {job.get('status')}: {job.get('message')}")
+    for line in errors.lines[-15:]:
+        print(f"    {line}", flush=True)
+    _say("pip resolves and builds everything before it changes the environment, so a failed install keeps "
+         "the packages installed before. The full log is on the Dependencies page (and in job.log).")
+    _say_sizes(sizes)
+    return 1
+
+
+class _Api:
+    """HTTP to the runner in this container, as the dashboard talks to it."""
+
+    def __init__(self) -> None:
+        username = (os.environ.get("STATS_USER") or "jupyter").encode("utf-8")
+        token = read_token(os.environ.get("DEPS_TOKEN_FILE") or "/run/secrets/deps_token")
+        self._auth = "Basic " + base64.b64encode(username + b":" + token).decode("ascii")
+
+    def call(self, method: str, path: str, body: dict | None = None, timeout: float = 30) -> tuple[int, dict]:
+        connection = http.client.HTTPConnection("127.0.0.1", PORT, timeout=timeout)
+        try:
+            headers = {"Authorization": self._auth, "Accept": "application/json"}
+            data = None
+            if body is not None:
+                data = json.dumps(body).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+            connection.request(method, path, body=data, headers=headers)
+            response = connection.getresponse()
+            payload = json.loads(response.read() or b"{}")
+            return response.status, payload if isinstance(payload, dict) else {}
+        finally:
+            connection.close()
+
+    def call_when_free(self, method: str, path: str, body: dict | None = None, timeout: float = 30) -> tuple[int, dict]:
+        """Like call(), but waits while a job (e.g. one started on the page) runs."""
+        waited = 0.0
+        while True:
+            status, payload = self.call(method, path, body, timeout)
+            if status != 409 or waited >= BUSY_WAIT_LIMIT:
+                return status, payload
+            if waited == 0:
+                _say("A package job started on the Dependencies page is running; waiting for it to finish…")
+            time.sleep(3)
+            waited += 3
+
+
+def _baseline_remote(api: _Api, text: str) -> int:
+    status, body = api.call_when_free("PUT", "/baseline", {"text": text}, timeout=600)
+    if status == 400:
+        return _refuse([f"line {e.get('line')}: {e.get('message')}" for e in body.get("errors", [])] or [body.get("error", "")])
+    if status != 200:
+        _say(f"The package runner did not take requirements.txt: {body.get('error', status)}")
+        return 1
+    _say(f"requirements.txt: {body.get('reason')}")
+    if body.get("up_to_date"):
+        _say_sizes(api.call("GET", "/state")[1].get("sizes"))
+        return 0
+    status, body = api.call_when_free("POST", "/jobs", {"action": "install"})
+    if status != 202:
+        _say(f"The package runner did not start the install: {body.get('error', status)}")
+        return 1
+    job_id = body["job"]["id"]
+    errors, offset = _ErrorLines(), 0
+    try:
+        while True:
+            status, chunk = api.call("GET", f"/log?offset={offset}")
+            if status != 200 or chunk.get("job_id") != job_id:
+                break
+            text = chunk.get("text", "")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            errors.feed(text)
+            offset = chunk.get("next_offset", offset)
+            if not chunk.get("running") and not text:
+                break
+            if not text:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        api.call("POST", "/cancel")
+        _say("Interrupted; the install job was cancelled.")
+        return 130
+    state = api.call("GET", "/state")[1]
+    job = state.get("job") or {}
+    if job.get("id") != job_id:
+        job = {"status": "unknown", "message": "another job started meanwhile"}
+    return _finish(job, errors, state.get("sizes"))
+
+
+def _baseline_local(text: str) -> int:
+    """With statistics off there is no server: run the same job in this one-off container."""
+    prepare_dirs()
+    runner = JobRunner(Sizes())
+    try:
+        runner.save_baseline(text)
+    except Busy:
+        _say("Another package job is running; try again when it has finished.")
+        return 1
+    up_to_date, reason = runner.baseline_check(text)
+    _say(f"requirements.txt: {reason}")
+    if up_to_date:
+        _say_sizes(Sizes.measure())
+        return 0
+    try:
+        runner.start("install")
+    except Busy:
+        _say("Another package job holds the environment; try again when it has finished.")
+        return 1
+
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+    errors, offset = _ErrorLines(), 0
+
+    def pump() -> None:
+        nonlocal offset
+        with contextlib.suppress(FileNotFoundError), open(LOG_FILE, "rb") as handle:
+            handle.seek(offset)
+            data = handle.read()
+            offset += len(data)
+            text = data.decode("utf-8", errors="replace")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            errors.feed(text)
+
+    try:
+        while runner._thread is not None and runner._thread.is_alive():
+            pump()
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        runner.shutdown()
+    pump()
+    return _finish(runner.job_copy(), errors, Sizes.measure())
+
+
+def cli_baseline(local: bool) -> int:
+    """Make the custom environment match the project's requirements.txt (stdin)."""
+    text, problems = _read_stdin_requirements()
+    if problems:
+        return _refuse(problems)
+    if local:
+        return _baseline_local(text)
+    try:
+        return _baseline_remote(_Api(), text)
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        _say(f"The package runner in this container does not answer ({type(exc).__name__}: {exc}).")
+        return 1
+
+
+def prepare_dirs() -> None:
     try:
         CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
         JOB_TMP_DIR.mkdir(exist_ok=True)
@@ -1143,6 +1552,22 @@ def main() -> int:
         probe.unlink()
     except OSError as exc:
         raise SystemExit(f"deps: refusing to start: {CUSTOM_DIR} is not writable: {exc.strerror or exc}") from None
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if args:
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s", stream=sys.stderr)
+        if args == ["check"]:
+            return cli_check()
+        if args[0] == "baseline" and args[1:] in ([], ["--local"]):
+            return cli_baseline(local=args[1:] == ["--local"])
+        print("usage: deps_runner.py [check | baseline [--local]]", file=sys.stderr)
+        return 2
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s", stream=sys.stderr)
+    Handler.username = (os.environ.get("STATS_USER") or "jupyter").encode("utf-8")
+    Handler.password = read_token(os.environ.get("DEPS_TOKEN_FILE") or "/run/secrets/deps_token")
+    prepare_dirs()
     # Stage 1 images created an empty site-packages mount point here; it is unused now.
     with contextlib.suppress(OSError):
         (CUSTOM_DIR / "site-packages").rmdir()
