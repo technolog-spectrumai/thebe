@@ -18,7 +18,7 @@ payload), or with --replace into this cell (the request kept as # ai: comments o
 --var NAME adds a short description of a notebook variable (type, shape, column names and types,
 or dictionary keys), never its values.
 
-The AI button in the cell toolbar (the thebe-ai-cell JupyterLab extension) puts
+The AI button in the notebook and cell toolbars (the thebe-ai-cell JupyterLab extension) puts
 "%%ai --replace" in front of the cell's text and runs the cell: the same code path.
 
 Standard library only (and IPython for the magic), so it works in every kernel of the image.

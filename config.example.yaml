@@ -34,7 +34,7 @@ nvidia: auto
 #     name: "lab-tools"
 import_dirs: []
 
-# AI code generation in notebooks: the %%ai magic and the AI button in the cell toolbar.
+# AI code generation in notebooks: the %%ai magic and the AI button in the toolbars.
 # The keys are read from this file on install and update (Deploy in the builder) only. They
 # reach the AI gateway container, never notebooks or the browser. The budget counts the input
 # and output tokens of all providers together; the Statistics page shows how much is left.

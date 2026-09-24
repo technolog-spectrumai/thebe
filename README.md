@@ -82,7 +82,7 @@ internet access (for notebooks, `pip` and the AI providers' APIs):
 
 The three images start from `python:3.13-slim-trixie` and install exactly the versions in
 `stack/*/requirements.lock.txt` (every transitive package pinned, wheels only). The AI button in
-the cell toolbar is a small TypeScript JupyterLab extension, built with Node in a separate build
+the notebook and cell toolbars is a small TypeScript JupyterLab extension, built with Node in a separate build
 stage (`node:22-trixie-slim`, exact versions from `package-lock.json`, no install scripts); only the
 built files (about 60 KB) go into the JupyterLab image. All containers run
 as a non-root user whose uid/gid match yours, with all Linux capabilities dropped,
@@ -671,8 +671,9 @@ Load sales.csv, sum revenue per region and plot it as a bar chart.
   only shows it, `--var df` describes a variable (type, shape, columns, never its values),
   `%%ai openai` and `--model` choose the provider and model. `%ai status` shows the providers, the
   budget and the answer times; `from thebe_ai import ask` is the same as a function.
-- **The AI button** in each cell's toolbar (and `Ctrl+Alt+G`): the whole cell is the request, and
-  the cell is replaced by the code, with the request kept as `# ai:` comments on top.
+- **The ✨ AI button** in the notebook toolbar (next to the cell type), in each cell's toolbar, and on
+  `Ctrl+Alt+G`: the whole selected cell is the request, and the cell is replaced by the code, with
+  the request kept as `# ai:` comments on top.
 - **Generated code is never run.** You read it and press Shift+Enter.
 
 Configuration, in `config.yaml` (the only place keys are entered; there is no screen for them):
@@ -992,7 +993,7 @@ stack/compose.gpu.yaml             GPU override, used when a GPU is detected
 stack/compose.tls.yaml             HTTPS override, used when a valid certificate exists
 stack/jupyter/                     JupyterLab config and health check, kernel launcher, package runner, requirements and lock file
 stack/jupyter/kernel/thebe_ai.py   the %%ai magic, loaded into every kernel (a client of the AI gateway)
-stack/jupyter/labextension/        the AI button in the cell toolbar (TypeScript; built in the image)
+stack/jupyter/labextension/        the AI button in the notebook and cell toolbars (TypeScript; built in the image)
 stack/ai/                          AI gateway: the API keys, token budget and answer times; requirements and lock file
 stack/stats/                       FastAPI dashboard and Dependencies page: app, TLS-aware launcher (serve.py), theme loader, templates, static assets, requirements and lock file
 stack/theme/                       zenobia's oya theme files (palette of the dashboard and the builder)

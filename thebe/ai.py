@@ -204,7 +204,7 @@ def parse_ai(value: object) -> tuple[AiConfig | None, list[str]]:
 def render_ai(ai: AiConfig | None, scalar: Callable[[str], str]) -> list[str]:
     """config.yaml lines for the ai: section (a commented example when there is none)."""
     head = [
-        "# AI code generation in notebooks: the %%ai magic and the AI button in the cell toolbar.",
+        "# AI code generation in notebooks: the %%ai magic and the AI button in the toolbars.",
         "# The keys are read from this file on install and update (Deploy in the builder) only. They",
         "# reach the AI gateway container, never notebooks or the browser. The budget counts the input",
         "# and output tokens of all providers together; the Statistics page shows how much is left.",

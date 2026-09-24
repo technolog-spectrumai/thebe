@@ -6,7 +6,8 @@ it if needed, and run it with **Shift+Enter**.
 
 There are two ways to ask:
 
-- **The ✨ AI button** in the toolbar of a cell (or **Ctrl+Alt+G**): the whole cell is the request,
+- **The ✨ AI button** in the notebook toolbar, in the toolbar of each cell, or **Ctrl+Alt+G**: the
+  whole selected cell is the request,
   and the cell is replaced by the code.
 - **The `%%ai` magic**: the request goes below a `%%ai` line, and the code goes into a new cell below.
 
@@ -73,7 +74,8 @@ ai:
    print pi to the console
    ```
 
-2. Click **✨ AI** in the cell's toolbar (top right of the cell), or press **Ctrl+Alt+G**.
+2. With that cell selected, click **✨ AI** in the notebook toolbar (next to the cell type, *Code*),
+   or the ✨ AI in the cell's own toolbar (top right of the cell), or press **Ctrl+Alt+G**.
 3. The answer streams into the cell's output. Then **the cell's text is replaced by the code**, with
    your request kept as comments on top:
 
@@ -205,5 +207,5 @@ The **Statistics** page (the dashboard) shows:
 | `--var df: no such variable in the notebook. …` | Run the cell that defines it first. |
 | `the answer was cut off at the output token limit …` | Raise `max_output_tokens`, ask for less, or check the budget. |
 | ``UsageError: Cell magic `%%ai` not found.`` | Restart the kernel (*Kernel → Restart Kernel*). Kernels started before an update may not have it. |
-| No ✨ AI in the cell toolbar | Reload the page after an update. In a JupyterLab terminal, `jupyter labextension list` should show `thebe-ai-cell … enabled OK`. |
+| No ✨ AI in the toolbars | Reload the page after an update. In a JupyterLab terminal, `jupyter labextension list` should show `thebe-ai-cell … enabled OK`. |
 | `run.sh` or the builder refuse to deploy, naming an `ai.` setting | Fix that line in `config.yaml`; `./run.sh check` lists every problem. |
