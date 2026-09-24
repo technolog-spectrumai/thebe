@@ -7,7 +7,8 @@ from nowhere else.
 Everything runs in Docker. The only host dependencies are **Docker Engine**, the **Docker Compose
 v2 plugin** and **Tailscale**. Python, JupyterLab, FastAPI and every library live inside locally
 built images; nothing is installed on the host with `pip`, and no systemd user service is used. An
-optional PyQt6 builder window keeps its own dependencies in a project-local `.venv`.
+optional PyQt6 builder window and a headless runner (`./run.sh`, for servers without a display)
+share one `config.yaml` and keep their own dependencies in a project-local `.venv`.
 
 ```text
  tablet ──(Tailscale, WireGuard)──► 100.x.y.z:8888  ──► container "jupyterlab"  (JupyterLab)
@@ -28,6 +29,7 @@ optional PyQt6 builder window keeps its own dependencies in a project-local `.ve
 - [Connecting by name over HTTPS](#connecting-by-name-over-https)
 - [Credentials and settings](#credentials-and-settings)
 - [Graphical builder](#graphical-builder)
+- [Headless runner and config.yaml](#headless-runner-and-configyaml)
 - [Commands](#commands)
 - [Persistence](#persistence)
 - [Statistics dashboard](#statistics-dashboard)
@@ -49,7 +51,8 @@ Compose there.
 
 | Piece | Location | Notes |
 | --- | --- | --- |
-| Settings (password, ports, stats on/off) | `<repo>/.env` | Created with defaults on first install, mode `0600`, gitignored. |
+| Configuration of the builder and `run.sh` | `<repo>/config.yaml` | What you edit when you use the builder or `run.sh`; they write `.env` from it. Mode `0600`, gitignored. See [config.yaml](#headless-runner-and-configyaml). |
+| Settings (password, ports, stats on/off) | `<repo>/.env` | The installer's input. Created with defaults on first install, mode `0600`, gitignored. |
 | Stack sources | `<repo>/stack/` | `Dockerfile`, `compose.yaml`, `compose.gpu.yaml`, `compose.tls.yaml`, `jupyter/`, `stats/`, `theme/`. |
 | Deployed stack (app dir) | `~/.local/share/jupyterlab-tailscale/` | A copy of `stack/` plus generated files; Compose project directory. |
 | Runtime variables | `~/.local/share/jupyterlab-tailscale/.env` | Generated on every deploy: Tailscale IP and name, URL scheme, TLS state, ports, profiles, uid/gid. **No secrets.** |
@@ -247,10 +250,11 @@ JupyterLab UI is turned off.
 
 ## Graphical builder
 
-`builder.py` is an optional PyQt6 window over the same script and the same settings file. It is a
-thin frontend: every action it takes is `setup-jupyterlab-tailscale.sh install | start | restart |
-stop`, plus a read-only `docker compose ps` for the status badges. The command line keeps working
-exactly as before, and both can be used side by side.
+`builder.py` is an optional PyQt6 window over the same script. It is a thin frontend: it edits
+[`config.yaml`](#headless-runner-and-configyaml) (shared with `./run.sh`), writes the installer's
+`.env` from it, and every action it takes is `setup-jupyterlab-tailscale.sh install | start | restart
+| stop`, plus a read-only `docker compose ps` for the status badges. The command line keeps working
+exactly as before, and all of them can be used side by side.
 
 ### Installing and launching
 
@@ -259,9 +263,9 @@ exactly as before, and both can be used side by side.
 ```
 
 - The first start creates `.venv` in the repository with `/usr/bin/python3` and installs the pinned
-  wheels from `requirements-builder.txt` (PyQt6 6.11.0, PyQt6-Qt6 6.11.2, PyQt6-sip 13.12.0; about
-  95 MB to download). Nothing is installed globally — `rm -rf .venv` removes every builder
-  dependency.
+  wheels from `requirements-builder.txt` (PyQt6 6.11.0, PyQt6-Qt6 6.11.2, PyQt6-sip 13.12.0, and
+  PyYAML 6.0.3 from `requirements-run.txt`; about 95 MB to download). Nothing is installed globally —
+  `rm -rf .venv` removes every builder dependency. `run.sh` uses the same venv.
 - Later starts reuse the venv. It is rebuilt only when the pins or the Python version change.
   Another interpreter can be chosen with `PYTHON=/path/to/python3 ./run-builder.sh`.
 - Ubuntu/Debian need `python3-venv`, and X11 sessions need `libxcb-cursor0` for Qt
@@ -280,7 +284,7 @@ The window follows the desktop's light or dark mode, using the same oya palette 
 | Username: jupyter | The fixed statistics username (`STATS_USER`), shown read-only. |
 | Services | A state dot and badge for JupyterLab and Statistics (Running, Starting, Unhealthy, Restarting, Stopped, Not deployed, Disabled), refreshed every 4 seconds, with the deployed URL and an **Open** button that starts the browser. |
 | Page links | Under Statistics: **Dependencies**, **Stats API** and **Health** open those pages directly, so no address has to be typed. Like Open, they are enabled while the container runs and always use the deployed address and port. |
-| **Deploy / Update** | Validates, saves the settings, then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
+| **Deploy / Update** | Validates, saves `config.yaml` and the installer's `.env`, then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
 | **Start / Restart** | `start` when nothing is running, otherwise `restart`. |
 | **Stop** | `stop` (`docker compose stop`). |
 | Output | Read-only log of every command and its output. |
@@ -313,10 +317,14 @@ could not be issued, it says so; the services keep using HTTP by name.
 
 ### Configuration and security notes
 
-- The builder edits `<repo>/.env` — the same file the script reads. It writes it atomically with mode
-  `0600`, keeps comments and unknown lines, and honours `JLT_SETTINGS_FILE` and `JLT_APP_DIR`. It
-  keeps the `THEME` setting ([Themes](#themes)) and writes `THEME='amazing'` when none is set; its
-  window uses that theme's colours and heading font.
+- The builder reads `config.yaml` (until it exists: `<repo>/.env`) and on Deploy writes both, each
+  atomically with mode `0600`. In `.env` it keeps comments and unknown lines. It honours
+  `JLT_CONFIG_FILE`, `JLT_SETTINGS_FILE` and `JLT_APP_DIR`, and passes the configured `workspace` to
+  the script. Settings the form does not show (`theme`, `https`, `stats.user`, `workspace`) are kept
+  as they are in `config.yaml`; the window uses the theme's colours and heading font.
+- A `config.yaml` that cannot be read as a whole (not YAML, not UTF-8) is never rewritten: the form
+  shows the defaults and Deploy is refused until the file is fixed or deleted. A single wrong
+  setting is reported and shown with its default.
 - It reads the deployed `~/.local/share/jupyterlab-tailscale/.env` only to build the Open URLs, so
   they always point at what is actually running.
 - Commands run through Qt's `QProcess` with argument lists; no shell is involved. The password never
@@ -330,15 +338,64 @@ could not be issued, it says so; the services keep using HTTP by name.
 
 | Builder | Command line |
 | --- | --- |
-| Edit fields + **Deploy / Update** | edit `.env`, then `./setup-jupyterlab-tailscale.sh install` (or `update` to also refresh the base image) |
-| **Start / Restart** | `./setup-jupyterlab-tailscale.sh start` / `restart` |
-| **Stop** | `./setup-jupyterlab-tailscale.sh stop` |
-| Services badges | `./setup-jupyterlab-tailscale.sh status` |
+| Edit fields + **Deploy / Update** | edit `config.yaml`, then `./run.sh install` (or `update`); without `config.yaml`: edit `.env`, then `./setup-jupyterlab-tailscale.sh install` |
+| **Start / Restart** | `./run.sh start` / `restart` (or the script's `start` / `restart`) |
+| **Stop** | `./run.sh stop` |
+| Services badges | `./run.sh status` |
 | **Open** and page links | the URLs printed by `status` |
 | polkit dialog | `sudo ./setup-jupyterlab-tailscale.sh host-setup <tailscale-ip> <port> [<port>]` |
 
-The builder's offscreen test suite runs with
+The test suite (the builder offscreen, the config and the headless runner without Qt) runs with
 `QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests`.
+
+## Headless runner and config.yaml
+
+`./run.sh` deploys and runs the stack from `config.yaml` without a window — on a server, over SSH, or
+from a script. It is the builder without the GUI: both use the Qt-free `thebe` package to load and
+check `config.yaml` and to write the installer's `.env`, and both hand the real work to
+`setup-jupyterlab-tailscale.sh`.
+
+```bash
+./run.sh                 # install: check config.yaml, write .env, build and start (the default)
+./run.sh check           # check config.yaml and show what would be deployed; changes nothing
+./run.sh start           # also: restart, stop, status, update, logs [...], uninstall [...]
+./run.sh init            # create config.yaml (from .env, else the defaults) if it is missing
+./run.sh --config /path/other.yaml install
+```
+
+- The first start creates `.venv` (shared with the builder, [lib/venv.sh](lib/venv.sh)) and installs
+  PyYAML from `requirements-run.txt`. No display, Qt or X11 library is needed.
+- When `config.yaml` is missing, `install`, `update`, `start` and `restart` create it from the current
+  `.env` (or the defaults) and carry on. `install` is idempotent, like the script's.
+- `install`, `update`, `start` and `restart` refuse an invalid configuration with a list of problems
+  (exit code 2) before anything is written. Otherwise they write `.env` and run the script's command
+  in the terminal, so `sudo` can ask for the host step; the script's exit code is passed on.
+- `stop`, `status`, `logs` and `uninstall` pass through unchanged, with the configured workspace.
+
+`config.yaml` (template: [config.example.yaml](config.example.yaml)) holds the deployment settings:
+
+```yaml
+jupyter:
+  password: "TailLab-7mK9-vQ2x-N4pR!"   # JUPYTER_PASSWORD
+  port: 8888                            # JUPYTER_PORT
+stats:
+  enabled: true                         # STATS_ENABLED
+  port: 8889                            # STATS_PORT
+  user: "jupyter"                       # STATS_USER
+theme: "amazing"                        # THEME
+https: "auto"                           # HTTPS: auto | off
+# workspace: "~/jupyter-workspace"      # JLT_WORKSPACE_DIR; relative paths start at config.yaml's directory
+```
+
+- A missing setting uses its default. The rules are the script's ([Credentials and
+  settings](#credentials-and-settings)); unknown keys are reported, so a typo does not go unnoticed.
+- Text values are best quoted: unquoted YAML turns `12345678` into a number and `off` into false (the
+  runner accepts `https: off`, but refuses a password that is not text).
+- The file holds the password, so it is kept at mode `0600` (a wider mode is narrowed with a note).
+- Location: `JLT_CONFIG_FILE`, else next to the settings file (`<repo>/config.yaml`). An exported
+  `JLT_WORKSPACE_DIR` wins over `workspace`, as it does for the script.
+- `config.yaml` is the source; `.env` is generated from it. If you use only the script, keep editing
+  `.env` — but the builder and `run.sh` overwrite it from `config.yaml` on their next run.
 
 ## Commands
 
@@ -703,10 +760,17 @@ stack/stats/                       FastAPI dashboard and Dependencies page: app,
 stack/theme/                       zenobia's oya theme files (palette of the dashboard and the builder)
 builder.py                         optional PyQt6 builder (thin frontend over the script)
 run-builder.sh                     creates .venv with the pinned PyQt6 and starts the builder
-requirements-builder.txt           PyQt6 pins for the builder venv
-tests/test_builder.py              offscreen tests for the builder
+run.py, run.sh                     headless runner: deploy and run from config.yaml without the GUI
+thebe/                             Qt-free core shared by both: settings and validation, config.yaml,
+                                   stack state (Tailscale, compose ps), theme tokens, the runner's CLI
+lib/venv.sh                        the project-local .venv bootstrap used by run.sh and run-builder.sh
+requirements-run.txt               PyYAML pin (run.sh and the builder)
+requirements-builder.txt           PyQt6 pins for the builder venv (includes requirements-run.txt)
+config.example.yaml                the default config.yaml, with explanations
+tests/                             offscreen builder tests, config and headless runner tests
 verify_cuda.sh                     end-to-end check that notebooks can use the GPU with PyTorch
 plan.md                            implementation plan and progress
-.env                               your settings (created by install or the builder, not committed)
-.venv/                             builder virtualenv (created by run-builder.sh, not committed)
+config.yaml                        your configuration (created by run.sh or the builder, not committed)
+.env                               the installer's settings (written from config.yaml, not committed)
+.venv/                             virtualenv of run.sh and the builder (not committed)
 ```
