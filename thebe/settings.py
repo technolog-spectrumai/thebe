@@ -32,6 +32,7 @@ DEFAULTS = {
     "STATS_USER": "jupyter",
     "THEME": "amazing",
     "HTTPS": "auto",       # auto: HTTPS by MagicDNS name when the tailnet allows it; off: plain HTTP
+    "NVIDIA": "auto",      # 1: expect an NVIDIA GPU (fail without it); 0: never use one; auto: when it works
 }
 HTTPS_MODES = ("auto", "off")
 
@@ -236,6 +237,10 @@ def load_settings_file(path: Path) -> tuple[dict[str, str], list[str]]:
     if enabled is None:
         notes.append(f"STATS_ENABLED in {name} is not 1/0, true/false, yes/no or on/off; statistics are off.")
     values["STATS_ENABLED"] = enabled or "0"
+    nvidia = normalize_nvidia(values["NVIDIA"])
+    if nvidia is None:
+        notes.append(f"NVIDIA in {name} is not auto, 1 or 0; auto is used.")
+    values["NVIDIA"] = nvidia or "auto"
     return values, notes
 
 
@@ -323,6 +328,11 @@ def normalize_bool(value: str) -> str | None:
     return _BOOLEANS.get(str(value).lower())
 
 
+def normalize_nvidia(value: str) -> str | None:
+    """'auto', '1' or '0' for the spellings the installer accepts (auto in any case, the switches)."""
+    return "auto" if str(value).lower() == "auto" else normalize_bool(value)
+
+
 def check_port(value: object, label: str) -> tuple[int | None, str | None]:
     text = str(value).strip()
     if not _PORT_TEXT.fullmatch(text):
@@ -359,6 +369,8 @@ def validate_settings(values: Mapping[str, str], themes: Iterable[str] | None = 
     # A missing key means auto, like the installer; the builder writes HTTPS='auto' on save.
     if values.get("HTTPS", "auto") not in HTTPS_MODES:
         errors.append(f"HTTPS in the settings file must be one of: {', '.join(HTTPS_MODES)}.")
+    if normalize_nvidia(values.get("NVIDIA", "auto")) is None:
+        errors.append("NVIDIA in the settings file must be auto, 1 or 0.")
     return errors
 
 

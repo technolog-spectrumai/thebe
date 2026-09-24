@@ -31,11 +31,12 @@ class ParseTests(unittest.TestCase):
         config, problems = parse(
             'jupyter:\n  password: "Pass-word-123"\n  port: 9000\n'
             'stats:\n  enabled: false\n  port: "9001"\n  user: "stats.user"\n'
-            'theme: "market"\nhttps: "off"\nworkspace: "~/nb"\n')
+            'theme: "market"\nhttps: "off"\nnvidia: false\nworkspace: "~/nb"\n')
         self.assertEqual(problems, [])
         self.assertEqual(config.settings, {
             "JUPYTER_PASSWORD": "Pass-word-123", "JUPYTER_PORT": "9000", "STATS_ENABLED": "0",
-            "STATS_PORT": "9001", "STATS_USER": "stats.user", "THEME": "market", "HTTPS": "off"})
+            "STATS_PORT": "9001", "STATS_USER": "stats.user", "THEME": "market", "HTTPS": "off",
+            "NVIDIA": "0"})
         self.assertEqual(config.workspace, "~/nb")
 
     def test_yaml_spellings_of_switches(self):
@@ -45,6 +46,15 @@ class ParseTests(unittest.TestCase):
             self.assertEqual((config.settings["STATS_ENABLED"], problems), (want, []), text)
         config, problems = parse("https: off\n")         # YAML 1.1 reads a bare off as false
         self.assertEqual((config.settings["HTTPS"], problems), ("off", []))
+
+    def test_nvidia_spellings(self):
+        for text, want in (("true", "1"), ("false", "0"), ("auto", "auto"), ("AUTO", "auto"), ("on", "1"),
+                           ("off", "0"), ("'yes'", "1"), ("1", "1"), ("0", "0")):
+            config, problems = parse(f"nvidia: {text}\n")
+            self.assertEqual((config.settings["NVIDIA"], problems), (want, []), text)
+        for text in ("2", "maybe", "[true]"):
+            config, problems = parse(f"nvidia: {text}\n")
+            self.assertEqual((config.settings["NVIDIA"], problems), ("auto", ["nvidia must be true, false or auto."]))
 
     def test_wrong_values_keep_the_default_and_are_reported(self):
         config, problems = parse(
@@ -107,6 +117,11 @@ class RenderTests(unittest.TestCase):
         config = cfg.Config()
         config.settings.update(STATS_ENABLED="0", HTTPS="off", JUPYTER_PORT="9999")
         self.assertEqual(parse(cfg.render_config(config))[0], config)
+        for nvidia in ("1", "0", "auto"):
+            config.settings["NVIDIA"] = nvidia
+            self.assertIn(f"nvidia: {dict(auto='auto').get(nvidia, 'true' if nvidia == '1' else 'false')}\n",
+                          cfg.render_config(config))
+            self.assertEqual(parse(cfg.render_config(config)), (config, []))
 
     def test_the_example_file_is_the_rendered_default(self):
         self.assertEqual((REPO / "config.example.yaml").read_text(), cfg.render_config(cfg.Config()))
@@ -145,6 +160,17 @@ class FileTests(unittest.TestCase):
         self.assertIn("was mode 644", cfg.make_private(self.path))
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         self.assertEqual(cfg.make_private(self.path), "")
+
+    def test_the_nvidia_setting_in_the_settings_file(self):
+        from thebe.settings import load_settings_file, validate_settings
+        settings = self.dir / ".env"
+        for text, want, notes in (("TRUE", "1", 0), ("off", "0", 0), ("Auto", "auto", 0), ("maybe", "auto", 1)):
+            settings.write_text(f"NVIDIA='{text}'\n")
+            values, found = load_settings_file(settings)
+            self.assertEqual((values["NVIDIA"], len(found)), (want, notes), text)
+        self.assertIn("NVIDIA in the settings file must be auto, 1 or 0.",
+                      validate_settings(dict(DEFAULTS, NVIDIA="maybe")))
+        self.assertEqual(validate_settings(dict(DEFAULTS, NVIDIA="1")), [])
 
     def test_config_from_settings(self):
         settings = self.dir / ".env"

@@ -220,6 +220,7 @@ STATS_PORT='8889'
 STATS_USER='jupyter'
 THEME='amazing'
 HTTPS='auto'
+NVIDIA='auto'
 ```
 
 To change something, edit the file (or use the [builder](#graphical-builder)) and apply it:
@@ -240,6 +241,9 @@ To change something, edit the file (or use the [builder](#graphical-builder)) an
   [Themes](#themes). Changing it recreates only the `stats` container.
 - **`HTTPS`:** `auto` (default) serves HTTPS by the Tailscale name when the tailnet allows it, `off`
   keeps plain HTTP; see [Connecting by name over HTTPS](#connecting-by-name-over-https).
+- **`NVIDIA`:** `auto` (default) uses an NVIDIA GPU when Docker can hand it to the containers, `1`
+  expects one (install and start stop when it is not usable), `0` never uses one; see
+  [GPU support](#gpu-support).
 
 The script parses this file itself; it is never executed as shell code. JupyterLab only ever sees
 the argon2 hash. The plain password reaches the `stats` container as a mounted secret file, never
@@ -282,6 +286,7 @@ The window follows the desktop's light or dark mode, using the same oya palette 
 | Enable FastAPI statistics | `STATS_ENABLED`. Unticking it and deploying stops and removes the statistics and package-runner containers and closes the statistics firewall port. |
 | Statistics port | `STATS_PORT`, default 8889 (disabled while statistics are off). |
 | Username: jupyter | The fixed statistics username (`STATS_USER`), shown read-only. |
+| NVIDIA GPU: Expect an NVIDIA GPU | `NVIDIA` ([GPU support](#gpu-support)). Ticked: the notebooks get the GPU, and Deploy and Start stop with the reason when it is not usable. Unticked: never use a GPU. Until it is clicked, `auto` is kept (the box shows whether `nvidia-smi` exists). An exported `JLT_GPU` is ignored here. |
 | Services | A state dot and badge for JupyterLab and Statistics (Running, Starting, Unhealthy, Restarting, Stopped, Not deployed, Disabled), refreshed every 4 seconds, with the deployed URL and an **Open** button that starts the browser. |
 | Page links | Under Statistics: **Dependencies**, **Stats API** and **Health** open those pages directly, so no address has to be typed. Like Open, they are enabled while the container runs and always use the deployed address and port. |
 | **Deploy / Update** | Validates, saves `config.yaml` and the installer's `.env`, then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
@@ -384,6 +389,7 @@ stats:
   user: "jupyter"                       # STATS_USER
 theme: "amazing"                        # THEME
 https: "auto"                           # HTTPS: auto | off
+nvidia: auto                            # NVIDIA: true | false | auto
 # workspace: "~/jupyter-workspace"      # JLT_WORKSPACE_DIR; relative paths start at config.yaml's directory
 ```
 
@@ -412,7 +418,7 @@ https: "auto"                           # HTTPS: auto | off
 | `host-setup <ip> <port> [<port>] [--cert <name> <gid>]`, `host-teardown` | Root-only helpers, normally run for you through `sudo` (or polkit from the builder). |
 
 Environment overrides: `JLT_SETTINGS_FILE` (settings file), `JLT_APP_DIR` (app dir),
-`JLT_WORKSPACE_DIR` (notebook workspace), `JLT_GPU=auto|on|off`.
+`JLT_WORKSPACE_DIR` (notebook workspace), `JLT_GPU=auto|on|off` (overrides `NVIDIA` for one run).
 
 Plain Compose commands work too, from the app dir:
 
@@ -563,16 +569,25 @@ stats`).
 
 ## GPU support
 
-With `JLT_GPU=auto` (the default) the installer enables GPU access when `nvidia-smi -L` works on the
-host and Docker has the NVIDIA runtime or a CDI specification, and it verifies that with a test
-container. When enabled, `compose.gpu.yaml` gives `jupyterlab` and `stats` `gpus: all`:
+The `NVIDIA` setting (`nvidia:` in `config.yaml`, the **NVIDIA GPU** checkbox in the builder) says
+whether to expect an NVIDIA GPU:
+
+| Value | install / update | start |
+| --- | --- | --- |
+| `auto` (default) | GPU access when `nvidia-smi -L` works on the host and Docker has the NVIDIA runtime or a CDI specification, verified with a test container; otherwise (or when the test fails) without GPU, with a warning. | Checks the GPU with a test container first; when that fails, starts without the GPU this time (warning), and checks again on the next start. |
+| `1` / `true` / ticked | Expects the GPU: stops with the reason when the test container cannot use it. | Stops with the reason when the test container cannot use it. |
+| `0` / `false` / unticked | Never uses a GPU and never checks — for machines without NVIDIA, or while the driver or container toolkit is broken. | Same. |
+
+When enabled, `compose.gpu.yaml` gives `jupyterlab` and `stats` `gpus: all`:
 
 - `jupyterlab` gets the `compute,utility` driver capabilities, so CUDA libraries installed from the
   Dependencies page (e.g. PyTorch with CUDA) can use the GPU.
 - `stats` gets `utility` only, which is enough for the GPU statistics.
 - `deps` gets no GPU; installing packages does not need one.
 
-Force it with `JLT_GPU=on ./setup-jupyterlab-tailscale.sh update` or disable it with `JLT_GPU=off`.
+For one run of the script, `JLT_GPU=on|off|auto ./setup-jupyterlab-tailscale.sh update` overrides the
+setting (the builder and `run.sh` ignore an exported `JLT_GPU`: their setting decides). `status`
+shows the deployed mode.
 
 ### Verifying PyTorch on the GPU
 
@@ -729,6 +744,15 @@ the new one.
 **The dashboard shows "No NVIDIA GPU visible".** Check `nvidia-smi` on the host and
 `docker info | grep -i runtime`; then `JLT_GPU=on ./setup-jupyterlab-tailscale.sh update` to see
 why the GPU test fails.
+
+**Start fails with `failed to fulfil mount request: open /run/nvidia-persistenced/socket: no such file or
+directory`.** The NVIDIA container toolkit (its CDI specification) mounts the socket of
+`nvidia-persistenced`, and that daemon is not running — typically after a reboot or a driver update.
+Start it and keep it on at boot: `sudo systemctl enable --now nvidia-persistenced`. Or regenerate the
+CDI specification without it: `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` (the
+script names the file it found). With `NVIDIA='auto'`, `start` notices this with its test container
+and starts without the GPU meanwhile; to run without NVIDIA for good, untick **NVIDIA GPU** in the
+builder, set `nvidia: false` in `config.yaml` or `NVIDIA='0'` in `.env`, and deploy again.
 
 **"No space left on device".** Use **Clear download cache** on the Dependencies page, or **Reset &
 reinstall** with fewer packages; `docker builder prune` removes Docker's build cache (for all

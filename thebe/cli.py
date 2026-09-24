@@ -111,7 +111,9 @@ def installer_environment(paths: Paths, config: Config | None, environ: Mapping[
         secrets = [config.settings["JUPYTER_PASSWORD"]]
     else:
         secrets = []
-    return child_environment(environ, secrets, overrides, plain=False)
+    env = child_environment(environ, secrets, overrides, plain=False)
+    env.pop("JLT_GPU", None)          # config.yaml's nvidia decides, not a stray export
+    return env
 
 
 def run_installer(paths: Paths, command: str, args: Sequence[str], env: Mapping[str, str]) -> int:
@@ -140,6 +142,7 @@ def show_config(paths: Paths, config: Config, environ: Mapping[str, str], say: O
         ("Statistics", stats),
         ("Theme", s["THEME"]),
         ("HTTPS", s["HTTPS"]),
+        ("NVIDIA GPU", {"1": "expected", "0": "off", "auto": "auto (used when it works)"}.get(s["NVIDIA"], s["NVIDIA"])),
         ("Workspace", str(workspace) if workspace else "~/jupyter-workspace (the installer's default)"),
     )
     for label, value in rows:
