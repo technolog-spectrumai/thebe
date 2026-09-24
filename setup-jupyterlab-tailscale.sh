@@ -1211,6 +1211,7 @@ runtime_env_content() {
     "TLS_NAME='${tls_name}'" \
     "TLS_NOT_AFTER='${tls_not_after}'" \
     "TLS_DIR='${TLS_DIR}'" \
+    "AI_ENABLED='${AI_ENABLED:-0}'" \
     "AI_CONFIG_HASH='${AI_CONFIG_HASH:-}'"
 }
 

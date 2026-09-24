@@ -167,7 +167,9 @@ services:
       # The Dependencies page proxies to the runner; it copes with the runner being down.
       DEPS_INTERNAL_URL: http://deps:8890
       DEPS_TOKEN_FILE: /run/secrets/deps_token
-      # The AI tile (token budget, answer times) reads the gateway's /status; it copes with AI off.
+      # The AI tile (token budget, answer times) reads the gateway's /status. AI_ENABLED='0' (no
+      # ai: section in config.yaml) shows AI as off instead of as unreachable.
+      AI_ENABLED: "${AI_ENABLED:-0}"
       AI_INTERNAL_URL: http://ai:8891
       AI_TOKEN_FILE: /run/secrets/ai_token
       HOST_NAME: "${HOST_NAME:-}"

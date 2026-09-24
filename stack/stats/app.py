@@ -13,6 +13,8 @@ Environment (set by compose.yaml, and compose.tls.yaml for HTTPS):
   JLT_TLS_CERT                           the certificate serve.py loaded; the footer shows its
                                          name and expiry (unset: plain HTTP)
   DEPS_INTERNAL_URL, DEPS_TOKEN_FILE     deps runner behind the Dependencies page and its token
+  AI_ENABLED, AI_INTERNAL_URL,           the AI gateway (token budget, answer times) and its
+  AI_TOKEN_FILE                          token; AI_ENABLED=0: config.yaml has no ai: section
   HOST_NAME, HOST_PROC, HOST_SYS         host identity and the read-only /proc and /sys mounts
   WORKSPACE_DIR                          filesystem whose usage is reported
   THEME                                  theme file under theme/ without .json (default amazing)
@@ -35,6 +37,7 @@ from fastapi.staticfiles import StaticFiles
 import hoststats
 import pages
 import theme
+from aiapi import AiClient
 from cache import RefreshingValue
 from depsapi import DepsClient
 from gpustats import GpuReader
@@ -107,6 +110,17 @@ except ConfigError as exc:
     DEPS_TOKEN, _deps_problem = b"", f"runner token: {exc}"
     log.warning("Dependencies page disabled: %s", _deps_problem)
 
+# The AI gateway's token, shared with jupyterlab. Without it only the AI figures are missing.
+AI_ENABLED = (os.environ.get("AI_ENABLED") or "0") == "1"
+AI_INTERNAL_URL = os.environ.get("AI_INTERNAL_URL", "http://ai:8891")
+try:
+    AI_TOKEN = read_password_file(os.environ.get("AI_TOKEN_FILE") or "/run/secrets/ai_token")
+    _ai_problem = None
+except ConfigError as exc:
+    AI_TOKEN, _ai_problem = b"", f"AI gateway token: {exc}"
+    if AI_ENABLED:
+        log.warning("AI figures disabled: %s", _ai_problem)
+
 # Colours of every page, generated once from theme/<THEME>.json. An unknown or broken theme
 # logs one warning and falls back to Amazing Moon: the dashboard always starts.
 THEME = theme.load_theme(os.environ.get("THEME") or theme.DEFAULT_THEME, BASE_DIR / "theme")
@@ -124,6 +138,7 @@ sampler = hoststats.Sampler(interval=2.0)
 gpu_reader = GpuReader()
 jupyter_client = JupyterClient(JUPYTER_INTERNAL_URL, PASSWORD)
 deps_client = DepsClient(DEPS_INTERNAL_URL, USERNAME, DEPS_TOKEN, unavailable_reason=_deps_problem)
+ai_client = AiClient(AI_INTERNAL_URL, AI_TOKEN, enabled=AI_ENABLED, unavailable_reason=_ai_problem)
 
 
 def _kernels_error(message: str) -> dict:
@@ -147,6 +162,13 @@ gpu = RefreshingValue(
     wait=2.0,
     placeholder=_gpu_error("Checking for NVIDIA GPUs…"),
     on_error=lambda exc: _gpu_error(f"GPU check failed ({type(exc).__name__})"),
+)
+ai_status = RefreshingValue(
+    ai_client.status,
+    ttl=5.0,
+    wait=2.0,
+    placeholder={"available": False, "enabled": AI_ENABLED, "error": "Checking the AI gateway…"},
+    on_error=lambda exc: {"available": False, "enabled": AI_ENABLED, "error": f"AI check failed ({type(exc).__name__})"},
 )
 jupyter_health = RefreshingValue(
     lambda: jupyter_reachable(JUPYTER_INTERNAL_URL),
@@ -238,12 +260,14 @@ for _item in pages.NAV_ITEMS:
 @api.get("/api/stats")
 async def stats() -> JSONResponse:
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    local, kernel_data, gpu_data = await asyncio.gather(
+    local, kernel_data, gpu_data, ai_data = await asyncio.gather(
         asyncio.to_thread(_local_stats),
         kernels.get(),
         gpu.get(),
+        ai_status.get(),
     )
-    return JSONResponse({"generated_at": generated_at, **local, "kernels": kernel_data, "gpu": gpu_data})
+    return JSONResponse({"generated_at": generated_at, **local, "kernels": kernel_data, "gpu": gpu_data,
+                         "ai": ai_data})
 
 
 @api.get("/health")

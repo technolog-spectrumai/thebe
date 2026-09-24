@@ -115,6 +115,20 @@
               <p class="tile__meta" data-part="meta">&nbsp;</p>
             </div>
           </article>
+
+          <article class="tile" id="tile-ai">
+            <div class="tile__inner">
+              <span class="tile__icon">{{ icon_sparkle }}</span>
+              <div class="tile__text">
+                <p class="tile__value"><span data-part="value">—</span><span class="tile__unit" data-part="unit"></span></p>
+                <p class="tile__label">AI tokens</p>
+              </div>
+            </div>
+            <div class="tile__foot">
+              <div class="meter meter--sm" role="meter" aria-label="AI token budget used" aria-valuemin="0" aria-valuemax="100"><div class="meter__fill"></div></div>
+              <p class="tile__meta" data-part="meta">&nbsp;</p>
+            </div>
+          </article>
         </section>
 
         <div class="cards">
@@ -201,6 +215,53 @@
                   <p class="empty__title">No running kernels</p>
                   <p class="empty__text">Open a notebook in JupyterLab to start one.</p>
                   <a class="btn btn--ghost" id="kernels-open" href="{{ jupyter_url }}" target="_blank" rel="noopener noreferrer" hidden>{{ icon_external }}Open JupyterLab</a>
+                </div>
+              </div>
+            </section>
+
+            <!-- Filled from /api/stats "ai": the AI gateway's token budget and answer times. -->
+            <section class="card" aria-labelledby="ai-title">
+              <div class="card__body">
+                <div class="card__head">
+                  <h2 class="section-title" id="ai-title">{{ icon_sparkle }}AI</h2>
+                  <span class="pill pill--idle" id="ai-pill">Checking…</span>
+                </div>
+                <p class="note note--caution" id="ai-error" hidden>{{ icon_alert }}<span class="note__text"></span></p>
+                <div class="stack" id="ai-details" hidden>
+                  <div class="usage">
+                    <div class="usage__head"><span class="usage__label" id="ai-budget-label">Token budget</span><span class="usage__value" id="ai-budget-value">—</span></div>
+                    <div class="meter" role="meter" aria-label="AI token budget used" aria-valuemin="0" aria-valuemax="100" id="ai-meter"><div class="meter__fill"></div></div>
+                  </div>
+                  <ul class="rows">
+                    <li class="row"><span class="row__key">Left</span><span class="row__value" id="ai-left">—</span></li>
+                    <li class="row"><span class="row__key">Used</span><span class="row__value" id="ai-used">—</span></li>
+                    <li class="row"><span class="row__key">Input / output</span><span class="row__value" id="ai-split">—</span></li>
+                    <li class="row"><span class="row__key">Budget</span><span class="row__value" id="ai-limit">—</span></li>
+                    <li class="row"><span class="row__key">Starts again</span><span class="row__value" id="ai-reset">—</span></li>
+                  </ul>
+                  <div class="stat-strip">
+                    <div class="stat"><p class="stat__label">Answers</p><p class="stat__value" id="ai-answers">—</p></div>
+                    <div class="stat"><p class="stat__label">Failed</p><p class="stat__value" id="ai-failed">—</p></div>
+                    <div class="stat"><p class="stat__label">Mean time</p><p class="stat__value" id="ai-mean">—</p></div>
+                    <div class="stat"><p class="stat__label">Standard deviation</p><p class="stat__value" id="ai-stdev">—</p></div>
+                  </div>
+                  <div class="table-wrap">
+                    <table class="table">
+                      <caption class="visually-hidden">AI answers per provider</caption>
+                      <thead>
+                        <tr>
+                          <th scope="col">Provider</th>
+                          <th scope="col" class="num">Answers</th>
+                          <th scope="col" class="num hide-sm">Tokens</th>
+                          <th scope="col" class="num">Mean</th>
+                          <th scope="col" class="num">Std dev</th>
+                        </tr>
+                      </thead>
+                      <tbody id="ai-rows"></tbody>
+                    </table>
+                  </div>
+                  <p class="caption">Times are from the request to the last token, for answers that succeeded.
+                    The budget and keys are set in config.yaml (ai: section).</p>
                 </div>
               </div>
             </section>

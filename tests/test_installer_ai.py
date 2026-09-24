@@ -85,6 +85,7 @@ class InstallerAiTests(unittest.TestCase):
         self.assertEqual(self.runtime_env(1, 0)["COMPOSE_PROFILES"], "'stats'")
         self.assertEqual(self.runtime_env(0, 0)["COMPOSE_PROFILES"], "''")
         self.assertEqual(self.runtime_env(1, 1)["AI_CONFIG_HASH"], f"'{'a' * 64}'")
+        self.assertEqual((self.runtime_env(1, 1)["AI_ENABLED"], self.runtime_env(1, 0)["AI_ENABLED"]), ("'1'", "'0'"))
 
     def test_deploy_order_and_the_other_commands_know_the_ai_profile(self):
         text = INSTALLER.read_text()
