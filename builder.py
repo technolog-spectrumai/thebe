@@ -5,7 +5,8 @@ A thin GUI over setup-jupyterlab-tailscale.sh and its Docker Compose stack.
 It edits the settings .env next to the installer, runs the installer's
 install / start / restart / stop commands through QProcess, shows container
 state from `docker compose ps`, and opens the deployed pages in a browser.
-All real work stays in the installer, so the CLI workflow is unchanged.
+All real work stays in the installer and the Qt-free thebe package, so the
+CLI workflow is unchanged.
 
 Start it with ./run-builder.sh, which keeps PyQt6 inside ./.venv.
 """
@@ -13,23 +14,15 @@ Start it with ./run-builder.sh, which keeps PyQt6 inside ./.venv.
 from __future__ import annotations
 
 import codecs
-import errno
-import ipaddress
-import json
 import os
-import re
 import shlex
 import shutil
 import signal
-import socket
-import string
 import sys
-import tempfile
-import unicodedata
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, NamedTuple
+from typing import Callable, Iterable, Mapping
 
 from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QPalette
@@ -39,42 +32,21 @@ from PyQt6.QtWidgets import (
     QSpinBox, QVBoxLayout, QWidget,
 )
 
-REPO = Path(__file__).resolve().parent
-APP_NAME = "JupyterLab on Tailscale"
-PROJECT = "jupyterlab-tailscale"          # Compose project name used by the installer
-TAILNET = ipaddress.ip_network("100.64.0.0/10")
-
-# Settings .env keys and their defaults (the installer uses the same ones).
-DEFAULTS = {
-    "JUPYTER_PASSWORD": "TailLab-7mK9-vQ2x-N4pR!",
-    "JUPYTER_PORT": "8888",
-    "STATS_ENABLED": "1",
-    "STATS_PORT": "8889",
-    "STATS_USER": "jupyter",
-    "THEME": "amazing",
-    "HTTPS": "auto",       # auto: HTTPS by MagicDNS name when the tailnet allows it; off: plain HTTP
-}
-HTTPS_MODES = ("auto", "off")
-
-SERVICES = (("jupyterlab", "JupyterLab"), ("stats", "Statistics"))
-
-
-class Page(NamedTuple):
-    label: str
-    service: str       # compose service that serves it
-    port_key: str      # key in the runtime .env holding the published port
-    path: str
-
-
-# Every page the stack serves, in one table. The first page of a service is
-# the one its Open button uses; the others get a link under that service, so
-# nobody has to type an address into the tablet's or laptop's browser.
-PAGES = (
-    Page("JupyterLab", "jupyterlab", "JUPYTER_PORT", "/lab"),
-    Page("Statistics", "stats", "STATS_PORT", "/"),
-    Page("Dependencies", "stats", "STATS_PORT", "/dependencies"),
-    Page("Stats API", "stats", "STATS_PORT", "/api/stats"),
-    Page("Health", "stats", "STATS_PORT", "/health"),
+# The Qt-free core. Names the GUI does not use itself are imported too, so
+# builder.<name> keeps working for tests and older callers.
+from thebe.settings import (  # noqa: F401
+    APP_NAME, DEFAULTS, HTTPS_MODES, PAGES, PROJECT, REPO, SERVICES, TAILNET, BindProbe, Page, Paths,
+    SettingsError, absolute_path, check_port, is_public_host, is_valid_hostname, load_settings_file,
+    normalize_bool, occupied_port_errors, parse_settings, password_problems, probe_bind, read_text,
+    render_settings, save_settings, settings_line_problems, validate_settings, write_private_file,
+)
+from thebe.stack import (  # noqa: F401
+    CHILD_ENV_EXTRA, MASK, TailscaleStatus, child_environment, clean_line, magicdns_name, mask_secrets,
+    page_url, parse_compose_ps, parse_tailscale_status, root_step_from_line, service_state, service_url,
+)
+from thebe.theme import (  # noqa: F401
+    BUILTIN_COLORS, QSS_TEMPLATE, TOKEN_NAMES, available_themes, build_stylesheet, contrast,
+    load_theme, load_theme_colors, mix, theme_tokens,
 )
 
 KILL_GRACE_MS = 10_000
@@ -84,721 +56,12 @@ PROBE_TIMEOUT_MS = 15_000      # a wedged dockerd/tailscaled must not hang the G
 LOG_MAX_BLOCKS = 4000
 LOG_FLUSH_MS = 80              # output reaches the log in batches, not per chunk
 MAX_LINE_CHARS = 4096          # longer output lines are cut
-MASK = "********"
 ACTIVE_STATES = ("running", "restarting", "paused")    # containers Stop still has to stop
 
-# Added to every child environment: plain, uncoloured, unbuffered output.
-CHILD_ENV_EXTRA = {
-    "NO_COLOR": "1",
-    "TERM": "dumb",
-    "PYTHONUNBUFFERED": "1",
-    "COMPOSE_ANSI": "never",
-    "BUILDKIT_PROGRESS": "plain",
-}
-
-
-def absolute_path(value: str) -> Path:
-    return Path(value).expanduser().absolute()
-
-
-@dataclass(frozen=True)
-class Paths:
-    installer: Path
-    settings: Path       # settings .env the builder edits (0600)
-    runtime_env: Path    # APP_DIR/.env written by the installer (read-only here)
-    theme_dir: Path
-    display_font: Path
-
-    @classmethod
-    def from_environment(cls, environ: Mapping[str, str] = os.environ) -> "Paths":
-        home = Path(environ.get("HOME") or Path.home())
-        settings = environ.get("JLT_SETTINGS_FILE") or str(REPO / ".env")
-        app_dir = environ.get("JLT_APP_DIR") or str(home / ".local/share/jupyterlab-tailscale")
-        return cls(
-            installer=REPO / "setup-jupyterlab-tailscale.sh",
-            # Absolute: the installer runs with REPO as its working directory,
-            # so a relative override would name a different file there.
-            settings=absolute_path(settings),
-            runtime_env=absolute_path(app_dir) / ".env",
-            theme_dir=REPO / "stack" / "theme",
-            display_font=REPO / "stack" / "stats" / "static" / "orbitron-latin.woff2",
-        )
-
 
 # --------------------------------------------------------------------------
-# Settings file
+# Theme: the oya tokens (thebe.theme) as a Qt palette and fonts
 # --------------------------------------------------------------------------
-
-# The installer's bash patterns use glibc's [[:space:]] and [[:cntrl:]]. In a
-# UTF-8 locale (C.UTF-8 and en_US.UTF-8 agree) they are exactly these; the
-# child environment makes sure the installer runs in one (child_environment).
-SPACE_CHARS = "\t\n\v\f\r               　"
-_EXTRA_CONTROL = frozenset("  ")     # glibc counts the line/paragraph separators as control
-
-_ASSIGNMENT = re.compile(rf"^[{re.escape(SPACE_CHARS)}]*([A-Za-z_][A-Za-z0-9_]*)[{re.escape(SPACE_CHARS)}]*=(.*)$",
-                         re.DOTALL)
-
-
-class EnvLine(NamedTuple):
-    key: str = ""        # '' for blank, comment and unreadable lines
-    value: str = ""
-    problem: str = ""    # why the installer rejects the line; the value is unusable then
-
-
-def _parse_line(line: str) -> EnvLine:
-    """One .env line, read exactly like the installer's read_env_file."""
-    line = line.removesuffix("\n").removesuffix("\r")
-    if not line.strip(SPACE_CHARS) or line.lstrip(SPACE_CHARS).startswith("#"):
-        return EnvLine()
-    match = _ASSIGNMENT.match(line)
-    if match is None:
-        return EnvLine(problem="expected KEY=value")
-    key, raw = match.group(1), match.group(2).strip(SPACE_CHARS)
-    # Quotes count only around the whole value: KEY='v' # note is an error there too.
-    if len(raw) >= 2 and raw[0] in "'\"" and raw[-1] == raw[0]:
-        return EnvLine(key, raw[1:-1])
-    if raw[:1] in ("'", '"'):
-        return EnvLine(key, problem=f"the value of {key} has no closing quote")
-    return EnvLine(key, raw)
-
-
-def parse_settings(text: str) -> dict[str, str]:
-    """All readable assignments in an .env text; a later duplicate wins, like the installer."""
-    values: dict[str, str] = {}
-    for line in text.split("\n"):
-        parsed = _parse_line(line)
-        if parsed.key and not parsed.problem:
-            values[parsed.key] = parsed.value
-    return values
-
-
-def settings_line_problems(text: str) -> list[str]:
-    """Lines the installer refuses, by line number only (a value may be the password)."""
-    problems = []
-    for number, line in enumerate(text.split("\n"), 1):
-        problem = _parse_line(line).problem
-        if problem:
-            problems.append(f"line {number}: {problem}")
-    return problems
-
-
-def _has_control(text: str) -> bool:
-    return any(unicodedata.category(ch) == "Cc" or ch in _EXTRA_CONTROL for ch in text)
-
-
-def _assignment(key: str, value: str) -> str:
-    # Single quotes make the value literal for Compose and the installer's
-    # parser alike, so a value must not contain one. (The message never
-    # includes the value: it may be the password.)
-    if "'" in value or _has_control(value):
-        raise ValueError(f"{key} contains a single quote or a control character")
-    return f"{key}='{value}'"
-
-
-def render_settings(existing: str, values: Mapping[str, str]) -> str:
-    """Rewrite known keys in place, keep every other line, append missing keys."""
-    lines = existing.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    out, seen = [], set()
-    for line in lines:
-        key = _parse_line(line).key
-        if key in values:        # a known key with broken quoting is rewritten too
-            out.append(_assignment(key, str(values[key])))
-            seen.add(key)
-        else:
-            out.append(line.rstrip("\r"))
-    out.extend(_assignment(k, str(v)) for k, v in values.items() if k not in seen)
-    return "\n".join(out) + "\n"
-
-
-def write_private_file(path: Path, text: str) -> None:
-    """Atomically replace `path` with `text`, mode 0600 from the first byte."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # mkstemp creates the file 0600, so the secret is never world-readable,
-    # not even for the instant before a chmod.
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
-    os.chmod(path, 0o600)
-
-
-def read_text(path: Path) -> str:
-    """The file as UTF-8 ('' when missing).
-
-    Raises UnicodeDecodeError instead of replacing bytes: a rewrite would
-    otherwise change a Latin-1 password behind the masked field.
-    """
-    try:
-        return path.read_bytes().decode("utf-8")
-    except FileNotFoundError:
-        return ""
-
-
-def available_themes(theme_dir: Path) -> list[str]:
-    """Theme names the installer accepts: regular files (not symlinks) with a valid name."""
-    try:
-        return sorted(p.stem for p in theme_dir.glob("*.json")
-                      if _THEME_NAME.fullmatch(p.stem) and p.is_file() and not p.is_symlink())
-    except OSError:
-        return []
-
-
-# --------------------------------------------------------------------------
-# Validation (kept identical to the installer's rules)
-# --------------------------------------------------------------------------
-
-_USER = re.compile(r"[A-Za-z0-9._-]{1,32}")
-_PORT_TEXT = re.compile(r"[1-9][0-9]{0,4}")   # no sign, no leading zero (bash would read octal)
-# A full MagicDNS name as the installer accepts it: two or more lower-case labels.
-_HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
-_GID_TEXT = re.compile(r"[1-9][0-9]{0,9}")
-_NUMERIC_LABEL = re.compile(r"[0-9]+|0[xX][0-9a-fA-F]*")
-MAX_GID = 4294967294                          # 4294967295 is (gid_t)-1, "no group"
-
-
-def is_valid_hostname(name: str) -> bool:
-    return len(name) <= 253 and _HOSTNAME.fullmatch(name) is not None
-
-
-def is_public_host(host: str) -> bool:
-    """A Tailscale IPv4 address or a valid DNS name, as the deployed PUBLIC_HOST may be."""
-    if _NUMERIC_LABEL.fullmatch(host.rsplit(".", 1)[-1]):
-        # A browser reads a name ending in a number as an IPv4 address (1.2.3 and 1.0x2 too):
-        # only a real address inside the tailnet range counts then.
-        try:
-            return ipaddress.ip_address(host) in TAILNET
-        except ValueError:
-            return False
-    return is_valid_hostname(host)
-
-
-def password_problems(password: str) -> list[str]:
-    problems = []
-    if not 8 <= len(password) <= 128:
-        problems.append("The password must be 8 to 128 characters long.")
-    if "'" in password:
-        problems.append("The password may not contain a single quote (').")
-    if "\\" in password:
-        problems.append("The password may not contain a backslash (\\).")
-    if _has_control(password):
-        problems.append("The password may not contain control characters such as tabs or line breaks.")
-    if password != password.strip(SPACE_CHARS):
-        problems.append("The password may not start or end with whitespace.")
-    return problems
-
-
-_BOOLEANS = {"1": "1", "true": "1", "yes": "1", "on": "1", "0": "0", "false": "0", "no": "0", "off": "0"}
-
-
-def normalize_bool(value: str) -> str | None:
-    """'1' or '0' for the spellings the installer accepts (1/0, true/false, yes/no, on/off)."""
-    return _BOOLEANS.get(str(value).lower())
-
-
-def check_port(value: object, label: str) -> tuple[int | None, str | None]:
-    text = str(value).strip()
-    if not _PORT_TEXT.fullmatch(text):
-        return None, f"The {label} port must be a whole number from 1024 to 65535."
-    port = int(text)
-    if port < 1024:
-        return None, f"The {label} port {port} is privileged; use 1024 to 65535."
-    if port > 65535:
-        return None, f"The {label} port {port} is out of range; use 1024 to 65535."
-    return port, None
-
-
-def validate_settings(values: Mapping[str, str], themes: Iterable[str] | None = None) -> list[str]:
-    """Static checks of a settings mapping; returns human-readable problems."""
-    errors = password_problems(values.get("JUPYTER_PASSWORD", ""))
-    ports = {}
-    for key, label in (("JUPYTER_PORT", "JupyterLab"), ("STATS_PORT", "statistics")):
-        port, problem = check_port(values.get(key, ""), label)
-        if problem:
-            errors.append(problem)
-        else:
-            ports[key] = port
-    # Different even when statistics are off: enabling them later must not
-    # silently collide with JupyterLab.
-    if len(ports) == 2 and ports["JUPYTER_PORT"] == ports["STATS_PORT"]:
-        errors.append(f"JupyterLab and statistics need different ports (both are {ports['STATS_PORT']}).")
-    if normalize_bool(values.get("STATS_ENABLED", "1")) is None:
-        errors.append("STATS_ENABLED must be 1 or 0 (true/false, yes/no, on/off also work).")
-    if not _USER.fullmatch(values.get("STATS_USER", "")):
-        errors.append("STATS_USER must be 1 to 32 letters, digits, dots, underscores or hyphens.")
-    theme_names = list(themes) if themes is not None else None
-    if theme_names and values.get("THEME", "") not in theme_names:
-        errors.append(f"THEME in the settings file must be one of: {', '.join(theme_names)}.")
-    # A missing key means auto, like the installer; the builder writes HTTPS='auto' on save.
-    if values.get("HTTPS", "auto") not in HTTPS_MODES:
-        errors.append(f"HTTPS in the settings file must be one of: {', '.join(HTTPS_MODES)}.")
-    return errors
-
-
-BindProbe = Callable[[str, int], None]
-
-
-def probe_bind(ip: str, port: int) -> None:
-    """Raise OSError when (ip, port) cannot be bound right now."""
-    # Deliberately without SO_REUSEADDR, so any socket holding the port counts.
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((ip, port))
-
-
-def occupied_port_errors(ip: str, wanted: Iterable[tuple[str, int]],
-                         published: Mapping[str, Iterable[int]] | None = None,
-                         bind: BindProbe = probe_bind) -> list[str]:
-    """Problems for wanted (service, port) pairs that are taken on the Tailscale address.
-
-    `published` maps each of this project's services to the ports it
-    publishes now. A service may keep its own port (an Update re-publishes
-    it), but not take over another service's: Compose recreates one service
-    at a time, so the old holder would still have the port.
-    """
-    names = dict(SERVICES)
-    holders = {port: service for service, ports in (published or {}).items() for port in ports}
-    errors = []
-    for service, port in wanted:
-        label = names.get(service, service)
-        try:
-            bind(ip, port)
-        except OSError as exc:
-            if exc.errno == errno.EADDRINUSE:
-                holder = holders.get(port)
-                if holder is None:
-                    errors.append(f"Port {port} ({label}) is already in use on {ip}.")
-                elif holder != service:
-                    errors.append(f"Port {port} ({label}) is still published by the {names.get(holder, holder)} "
-                                  "container. Press Stop first, then Deploy.")
-            elif exc.errno == errno.EADDRNOTAVAIL:
-                return [f"The Tailscale address {ip} is not assigned to this machine."]
-            else:
-                errors.append(f"Port {port} ({label}) cannot be checked on {ip}: {exc.strerror or exc}.")
-    return errors
-
-
-# --------------------------------------------------------------------------
-# Parsing command output
-# --------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class TailscaleStatus:
-    ip: str = ""
-    problem: str = ""
-    name: str = ""       # full MagicDNS name ('' when MagicDNS is off or the name is unusable)
-
-
-_TAILSCALE_STATES = {
-    "NeedsLogin": "Tailscale is logged out (run: sudo tailscale up)",
-    "NeedsMachineAuth": "Tailscale is waiting for this machine to be approved",
-    "Stopped": "Tailscale is stopped (run: tailscale up)",
-    "Starting": "Tailscale is still starting",
-    "NoState": "Tailscale has no state yet",
-}
-
-
-def _load_json(text: str) -> object:
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except ValueError:
-        # Merged stderr can put a warning in front of the document.
-        start, end = text.find("{"), text.rfind("}")
-        if 0 <= start < end:
-            try:
-                return json.loads(text[start:end + 1])
-            except ValueError:
-                pass
-    return None
-
-
-def parse_tailscale_status(text: str) -> TailscaleStatus:
-    data = _load_json(text)
-    if not isinstance(data, dict) or "BackendState" not in data:
-        return TailscaleStatus(problem="Tailscale status could not be read")
-    state = str(data.get("BackendState") or "")
-    if state != "Running":
-        return TailscaleStatus(problem=_TAILSCALE_STATES.get(state, f"Tailscale is not connected ({state or 'unknown'})"))
-    node = data.get("Self") if isinstance(data.get("Self"), dict) else {}
-    for address in node.get("TailscaleIPs") or []:
-        try:
-            ip = ipaddress.ip_address(str(address))
-        except ValueError:
-            continue
-        if ip.version == 4 and ip in TAILNET:
-            return TailscaleStatus(ip=str(ip), name=magicdns_name(data))
-    return TailscaleStatus(problem="Tailscale runs but has no IPv4 address in 100.64.0.0/10")
-
-
-def magicdns_name(data: Mapping) -> str:
-    """This machine's MagicDNS name from `tailscale status --json`, the way the installer reads it."""
-    tailnet = data.get("CurrentTailnet") if isinstance(data.get("CurrentTailnet"), dict) else {}
-    node = data.get("Self") if isinstance(data.get("Self"), dict) else {}
-    if tailnet.get("MagicDNSEnabled") is not True or not isinstance(node.get("DNSName"), str):
-        return ""
-    name = node["DNSName"].lower().removesuffix(".")
-    return name if is_valid_hostname(name) else ""
-
-
-def parse_compose_ps(text: str, project: str = PROJECT) -> dict[str, dict]:
-    """`docker compose ps -a --format json` (JSON Lines or an array) -> per-service info."""
-    loaded = _load_json(text) if text.lstrip().startswith("[") else None
-    if isinstance(loaded, list):
-        records = loaded
-    else:
-        records = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line.startswith(("{", "[")):    # skip warnings sharing the channel
-                continue
-            try:
-                record = json.loads(line)
-            except ValueError:                     # e.g. "[+] Running 2/2"
-                continue
-            records.extend(record if isinstance(record, list) else [record])
-    services: dict[str, dict] = {}
-    for record in records:
-        if not isinstance(record, dict) or not record.get("Service"):
-            continue
-        if record.get("Project") not in (None, "", project):
-            continue
-        ports = set()
-        for publisher in record.get("Publishers") or []:
-            try:
-                if int(publisher.get("PublishedPort") or 0) > 0:
-                    ports.add(int(publisher["PublishedPort"]))
-            except (AttributeError, TypeError, ValueError):
-                continue
-        info = {"state": str(record.get("State", "")).lower(),
-                "health": str(record.get("Health", "")).lower(), "ports": ports}
-        previous = services.get(record["Service"])
-        if previous is None or previous["state"] != "running":
-            services[record["Service"]] = info
-    return services
-
-
-def service_state(entry: Mapping | None, *, disabled: bool = False) -> tuple[str, str]:
-    """(label, kind) for a service; kind is success, caution, warn or muted."""
-    if entry is None:
-        return ("Disabled", "muted") if disabled else ("Not deployed", "muted")
-    state, health = entry.get("state", ""), entry.get("health", "")
-    if state == "running":
-        if health == "healthy":
-            return "Running", "success"
-        if health == "unhealthy":
-            return "Unhealthy", "warn"
-        return "Starting", "caution"
-    if state == "restarting":
-        return "Restarting", "warn"
-    if state == "paused":
-        return "Paused", "caution"
-    return "Stopped", "muted"
-
-
-# host-setup <ts-ip> <port> [<port>] [--cert <fqdn> <gid>] | host-teardown. The pattern only
-# admits the characters; root_step_from_line applies the installer's exact rules.
-_ROOT_STEP = re.compile(
-    r"ROOT_STEP_REQUIRED: (host-setup 100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?: [1-9][0-9]{3,4}){1,2}"
-    r"(?: --cert [a-z0-9.-]{1,253} [1-9][0-9]{0,9})?|host-teardown)")
-
-
-def root_step_from_line(line: str) -> list[str] | None:
-    """Installer arguments for pkexec when `line` is a valid ROOT_STEP_REQUIRED line."""
-    match = _ROOT_STEP.fullmatch(line.strip())
-    if match is None:
-        return None
-    args = match.group(1).split(" ")
-    if args[0] == "host-setup":
-        try:
-            if ipaddress.ip_address(args[1]) not in TAILNET:
-                return None
-        except ValueError:
-            return None
-        ports = args[2:]
-        if "--cert" in ports:
-            # The certificate for the full MagicDNS name, readable by the group of the desktop user.
-            ports, (name, gid) = ports[:ports.index("--cert")], ports[ports.index("--cert") + 1:]
-            if not is_valid_hostname(name) or not _GID_TEXT.fullmatch(gid) or not 1 <= int(gid) <= MAX_GID:
-                return None
-        if not all(1024 <= int(port) <= 65535 for port in ports) or len(set(ports)) != len(ports):
-            return None
-    return args
-
-
-def page_url(runtime: Mapping[str, str], page: Page) -> str:
-    """URL of a page from the deployed runtime .env, or '' when it is not usable.
-
-    PUBLIC_SCHEME and PUBLIC_HOST say how the stack is reached (https with the MagicDNS name
-    when a certificate is in use). Older runtime files have neither and mean http://<TS_IP>;
-    an empty value counts as unset, like ${PUBLIC_HOST:-...} in Compose.
-    """
-    scheme = runtime.get("PUBLIC_SCHEME") or "http"
-    host = runtime.get("PUBLIC_HOST") or runtime.get("TS_IP", "")
-    port = runtime.get(page.port_key, "")
-    if scheme not in ("http", "https") or not is_public_host(host):
-        return ""
-    if check_port(port, page.label)[1]:
-        return ""
-    return f"{scheme}://{host}:{int(port)}{page.path}"
-
-
-def service_url(runtime: Mapping[str, str], service: str) -> str:
-    return next((page_url(runtime, p) for p in PAGES if p.service == service), "")
-
-
-def mask_secrets(text: str, secrets: Iterable[str]) -> str:
-    # Very short strings are skipped: masking every "a" would wreck the log,
-    # and a valid password is at least 8 characters anyway.
-    for secret in sorted({s for s in secrets if len(s) >= 4}, key=len, reverse=True):
-        text = text.replace(secret, MASK)
-    return text
-
-
-# --------------------------------------------------------------------------
-# Theme: zenobia's oya tokens (stack/theme/<THEME>.json) mapped onto Qt
-# --------------------------------------------------------------------------
-
-# amazing.json's colours, used when the theme file is missing or incomplete.
-BUILTIN_COLORS = {
-    "primary-bg-light": "#f2f3f5", "header-bg-light": "#1d2333", "appbar-bg-light": "#252c3e",
-    "appbar-text-light": "#e4e7ef", "bubble-bg-light": "#e8e9ec", "footer-bg-light": "#1d2333",
-    "footer-text-light": "#e4e7ef", "text-main-light": "#0f1114", "accent-light": "#2f3d63",
-    "warn-light": "#d94a4a", "success-light": "#4a8f7a", "sunken-light": "#e1e2e5",
-    "link-light": "#2a4b8f", "primary-bg-dark": "#0a0c11", "header-bg-dark": "#0f1420",
-    "appbar-bg-dark": "#151b29", "appbar-text-dark": "#cfd4df", "bubble-bg-dark": "#191f2d",
-    "footer-bg-dark": "#0f1420", "footer-text-dark": "#cfd4df", "text-main-dark": "#d3d7e0",
-    "accent-dark": "#4f5fa1", "warn-dark": "#ff4455", "caution-light": "#a07800",
-    "caution-dark": "#f0a820", "success-dark": "#5fa38c", "sunken-dark": "#141821",
-    "link-dark": "#5f7fc9", "accent-1": "#4f5fa1", "accent-2": "#2f3d63",
-}
-
-TOKEN_NAMES = (
-    "window_bg", "card_bg", "card_border", "input_bg", "text", "muted", "accent", "on_accent",
-    "header_bg", "header_text", "success", "caution", "warn", "log_bg", "link",
-    # derived
-    "accent_text", "accent_hover", "input_border", "divider", "button_hover", "disabled_text",
-    "disabled_bg", "success_bg", "caution_bg", "warn_bg", "accent_bg", "header_muted",
-    "header_ok", "header_warn", "header_caution", "scroll_handle",
-)
-
-_HEX = re.compile(r"#(?:[0-9a-fA-F]{3}){1,2}")
-_THEME_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
-
-
-def _rgb(color: str) -> tuple[int, int, int]:
-    value = color.lstrip("#")
-    if len(value) == 3:
-        value = "".join(ch * 2 for ch in value)
-    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
-
-
-def mix(a: str, b: str, amount: float) -> str:
-    """`a` moved `amount` (0..1) of the way towards `b`."""
-    return "#%02x%02x%02x" % tuple(round(x + (y - x) * amount) for x, y in zip(_rgb(a), _rgb(b)))
-
-
-def contrast(a: str, b: str) -> float:
-    """WCAG 2.1 contrast ratio."""
-    def luminance(color: str) -> float:
-        channels = [c / 255 for c in _rgb(color)]
-        r, g, b_ = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b_
-    high, low = sorted((luminance(a), luminance(b)), reverse=True)
-    return (high + 0.05) / (low + 0.05)
-
-
-# The colours a theme file must define: the same list as stack/stats/theme.py (caution is optional).
-_THEME_MODE_KEYS = ("primary-bg", "bubble-bg", "sunken", "header-bg", "appbar-bg", "appbar-text",
-                    "footer-bg", "footer-text", "text-main", "accent", "link", "warn", "success")
-REQUIRED_COLORS = tuple(f"{key}-{mode}" for mode in ("light", "dark") for key in _THEME_MODE_KEYS) + ("accent-1", "accent-2")
-_FONT_NAME = re.compile(r"[A-Za-z0-9 _-]{1,64}")
-MAX_THEME_BYTES = 256 * 1024
-
-
-def load_theme(theme_dir: Path, name: str) -> tuple[dict[str, str], str]:
-    """(colours, heading font) of <theme_dir>/<name>.json, or Amazing Moon's when it is not usable.
-
-    The dashboard's rules (stack/stats/theme.py): the whole file or nothing. A partly valid file
-    is not merged with the built-in colours, so the GUI and the dashboard never disagree. Like
-    the installer, a symlinked theme is refused.
-    """
-    fallback = (dict(BUILTIN_COLORS), "Orbitron")
-    if not _THEME_NAME.fullmatch(name or ""):
-        return fallback
-    path = theme_dir / f"{name}.json"
-    try:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_THEME_BYTES:
-            return fallback
-        data = json.loads(path.read_bytes().decode("utf-8"))    # strict UTF-8: a BOM is refused
-    except (OSError, ValueError, RecursionError):
-        return fallback
-    colors = data.get("colors") if isinstance(data, dict) else None
-    if (not isinstance(colors, dict)
-            or not all(isinstance(value, str) and _HEX.fullmatch(value) for value in colors.values())
-            or any(key not in colors for key in REQUIRED_COLORS)):
-        return fallback
-    font = data.get("font", "")
-    font = font.strip() if isinstance(font, str) else ""
-    return dict(colors), font if _FONT_NAME.fullmatch(font) else ""
-
-
-def load_theme_colors(theme_dir: Path, name: str) -> dict[str, str]:
-    return load_theme(theme_dir, name)[0]
-
-
-def theme_tokens(colors: Mapping[str, str], mode: str) -> dict[str, str]:
-    """Qt colour tokens for 'light' or 'dark' from an oya colour table."""
-    c = {**BUILTIN_COLORS, **colors}
-    m = "dark" if mode == "dark" else "light"
-    window_bg, card_bg = c[f"primary-bg-{m}"], c[f"bubble-bg-{m}"]
-    text, accent, link = c[f"text-main-{m}"], c[f"accent-{m}"], c[f"link-{m}"]
-    header_bg, header_text = c[f"appbar-bg-{m}"], c[f"appbar-text-{m}"]
-    success, warn = c[f"success-{m}"], c[f"warn-{m}"]
-    caution = colors.get(f"caution-{m}") or ("#f0a820" if m == "dark" else "#a07800")
-    # oya borders cards with accent-2 in light mode and accent-1 in dark mode.
-    card_border = c["accent-1"] if m == "dark" else c["accent-2"]
-
-    def best(options: Iterable[str], background: str) -> str:
-        return max(options, key=lambda color: contrast(color, background))
-
-    return {
-        "window_bg": window_bg, "card_bg": card_bg, "card_border": card_border,
-        "input_bg": window_bg, "text": text, "muted": mix(text, window_bg, 0.40),
-        # Text on accent buttons: in light mode the same choice as the dashboard's --on-accent
-        # (a light accent such as market's orange needs the dark text colour); dark mode may use white.
-        "accent": accent,
-        "on_accent": best((window_bg, text), accent) if m == "light" else best((window_bg, "#ffffff"), accent),
-        "header_bg": header_bg, "header_text": header_text,
-        "success": success, "caution": caution, "warn": warn,
-        "log_bg": c[f"sunken-{m}"], "link": link,
-        # Small accent text: oya's dark accent is only ~2.7:1 on cards, so the
-        # (brighter) link colour takes over where it reads better.
-        "accent_text": best((accent, link), card_bg),
-        "accent_hover": mix(accent, "#ffffff", 0.12),
-        "input_border": mix(card_border, card_bg, 0.45),
-        "divider": mix(card_border, card_bg, 0.65),
-        "button_hover": mix(card_bg, text, 0.08),
-        "disabled_text": mix(text, card_bg, 0.60),
-        "disabled_bg": mix(card_bg, window_bg, 0.50),
-        "success_bg": mix(card_bg, success, 0.15),
-        "caution_bg": mix(card_bg, caution, 0.15),
-        "warn_bg": mix(card_bg, warn, 0.15),
-        "accent_bg": mix(card_bg, accent, 0.12),
-        "header_muted": mix(header_text, header_bg, 0.32),
-        "header_ok": best((c["success-light"], c["success-dark"]), header_bg),
-        "header_warn": best((c["warn-light"], c["warn-dark"]), header_bg),
-        "header_caution": best((c["caution-light"], c["caution-dark"]), header_bg),
-        "scroll_handle": mix(text, card_bg, 0.70),
-    }
-
-
-QSS_TEMPLATE = """
-QMainWindow, QWidget#root, QScrollArea#page { background: $window_bg; border: none; }
-QWidget { color: $text; font-size: 14px; }
-QLabel, QCheckBox { background: transparent; }
-QToolTip { background: $card_bg; color: $text; border: 1px solid $card_border; padding: 4px 8px; }
-
-QFrame#header { background: $header_bg; border: none; }
-QLabel#title { color: $header_text; font-size: 22px; font-weight: 700; $display_font }
-QLabel#headerEyebrow { color: $header_muted; font-size: 10px; font-weight: 700; letter-spacing: 2px; $display_font }
-QLabel#headerMeta { color: $header_muted; font-size: 13px; }
-QLabel#headerMeta[state="ok"] { color: $header_text; }
-QLabel#headerMeta[state="problem"] { color: $header_warn; }
-QLabel#headerDot { border-radius: 4px; background: $header_muted; }
-QLabel#headerDot[state="ok"] { background: $header_ok; }
-QLabel#headerDot[state="problem"] { background: $header_warn; }
-QLabel#headerDot[state="pending"] { background: $header_caution; }
-
-QFrame#card { background: $card_bg; border: 1px solid $card_border; border-radius: 16px; }
-QFrame#divider { background: $divider; border: none; min-height: 1px; max-height: 1px; }
-QLabel#eyebrow { color: $accent_text; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; $display_font }
-QLabel#fieldLabel { color: $muted; font-size: 13px; font-weight: 600; }
-QLabel#hint { color: $muted; font-size: 12px; }
-QLabel#errorText { color: $warn; font-size: 13px; font-weight: 600; }
-QLabel#serviceName { font-size: 15px; font-weight: 700; }
-QLabel#url { color: $link; font-size: 13px; }
-QLabel#url[kind="muted"] { color: $muted; }
-
-QLineEdit, QSpinBox {
-    background: $input_bg; color: $text; border: 1px solid $input_border; border-radius: 10px;
-    padding: 7px 10px; selection-background-color: $accent; selection-color: $on_accent;
-}
-QLineEdit { lineedit-password-character: 8226; }
-QLineEdit:focus, QSpinBox:focus { border: 1px solid $accent_text; }
-QLineEdit:disabled, QSpinBox:disabled { color: $disabled_text; background: $disabled_bg; border: 1px solid $divider; }
-
-QCheckBox { spacing: 10px; padding: 2px 0; }
-QCheckBox:disabled { color: $disabled_text; }
-QCheckBox::indicator { width: 16px; height: 16px; border-radius: 5px; border: 1px solid $input_border; background: $input_bg; }
-QCheckBox::indicator:hover { border: 1px solid $accent_text; }
-QCheckBox::indicator:checked { background: $accent; border: 1px solid $accent; }
-QCheckBox::indicator:disabled { background: $disabled_bg; border: 1px solid $divider; }
-QCheckBox::indicator:checked:disabled { background: $disabled_text; border: 1px solid $disabled_text; }
-
-QPushButton {
-    background: transparent; color: $text; border: 1px solid $input_border; border-radius: 10px;
-    padding: 8px 18px; font-weight: 600;
-}
-QPushButton:hover { background: $button_hover; border: 1px solid $card_border; }
-QPushButton:pressed { background: $accent_bg; }
-QPushButton:disabled { color: $disabled_text; background: transparent; border: 1px solid $divider; }
-QPushButton#primaryButton { background: $accent; color: $on_accent; border: 1px solid $accent; padding: 8px 26px; }
-QPushButton#primaryButton:hover { background: $accent_hover; border: 1px solid $accent_hover; }
-QPushButton#primaryButton:disabled { background: $disabled_bg; color: $disabled_text; border: 1px solid $divider; }
-QPushButton#smallButton { padding: 5px 14px; font-size: 13px; }
-QPushButton#linkButton { background: transparent; border: none; color: $accent_text; padding: 6px 8px; }
-QPushButton#linkButton:hover { color: $text; }
-QPushButton#linkButton:disabled { color: $disabled_text; }
-
-QLabel#dot { border-radius: 5px; background: $disabled_text; }
-QLabel#dot[kind="success"] { background: $success; }
-QLabel#dot[kind="caution"] { background: $caution; }
-QLabel#dot[kind="warn"] { background: $warn; }
-QLabel#badge {
-    border-radius: 9px; padding: 3px 10px; font-size: 12px; font-weight: 700;
-    color: $muted; background: $log_bg; border: 1px solid $divider;
-}
-QLabel#badge[kind="success"] { color: $success; background: $success_bg; border: 1px solid $success; }
-QLabel#badge[kind="caution"] { color: $caution; background: $caution_bg; border: 1px solid $caution; }
-QLabel#badge[kind="warn"] { color: $warn; background: $warn_bg; border: 1px solid $warn; }
-
-QLabel#banner {
-    border-radius: 10px; padding: 8px 14px; font-size: 13px; font-weight: 600;
-    color: $text; background: $accent_bg; border: 1px solid $divider;
-}
-QLabel#banner[kind="success"] { color: $success; background: $success_bg; border: 1px solid $success; }
-QLabel#banner[kind="error"] { color: $warn; background: $warn_bg; border: 1px solid $warn; }
-QLabel#banner[kind="busy"] { color: $caution; background: $caution_bg; border: 1px solid $caution; }
-
-QPlainTextEdit#log {
-    background: $log_bg; color: $text; border: 1px solid $divider; border-radius: 12px; padding: 8px;
-    font-family: "$mono_family"; font-size: 12px;
-    selection-background-color: $accent; selection-color: $on_accent;
-}
-QScrollBar:vertical { background: transparent; width: 10px; margin: 4px 2px 4px 0; }
-QScrollBar:horizontal { background: transparent; height: 10px; margin: 0 4px 2px 4px; }
-QScrollBar::handle:vertical { background: $scroll_handle; border-radius: 4px; min-height: 28px; }
-QScrollBar::handle:horizontal { background: $scroll_handle; border-radius: 4px; min-width: 28px; }
-QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-"""
-
-
-def build_stylesheet(tokens: Mapping[str, str], display_family: str = "", mono_family: str = "monospace") -> str:
-    # substitute() raises KeyError on a missing token, which the tests rely on.
-    display = f'font-family: "{display_family}";' if display_family else ""
-    return string.Template(QSS_TEMPLATE).substitute(tokens, display_font=display, mono_family=mono_family)
-
 
 def build_palette(tokens: Mapping[str, str]) -> QPalette:
     """Fusion paints some parts (placeholders, selections, dialogs) from the palette."""
@@ -834,34 +97,6 @@ def load_display_family(font_file: Path) -> str:
 # --------------------------------------------------------------------------
 # Running commands
 # --------------------------------------------------------------------------
-
-_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
-
-
-def clean_line(text: str) -> str:
-    """Strip ANSI sequences and keep only the last state of a '\\r' progress line."""
-    text = text.rstrip("\r\n")
-    if "\r" in text:
-        text = text.rsplit("\r", 1)[-1]
-    return _ANSI.sub("", text)
-
-
-def child_environment(base: Mapping[str, str], secrets: Iterable[str] = (),
-                      overrides: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for child processes. It never carries the password."""
-    env = dict(base)
-    env.update(CHILD_ENV_EXTRA)
-    env.update(overrides or {})
-    env.pop("JUPYTER_PASSWORD", None)
-    # The installer checks the password with bash, which counts bytes and
-    # classifies only ASCII in the C locale. A UTF-8 locale makes its rules
-    # the ones password_problems() mirrors.
-    ctype = (env.get("LC_ALL") or env.get("LC_CTYPE") or env.get("LANG") or "").lower()
-    if "utf-8" not in ctype and "utf8" not in ctype:
-        env["LC_ALL"] = "C.UTF-8"
-    secrets = [s for s in secrets if len(s) >= 4]
-    return {k: v for k, v in env.items() if not any(s in v or s in k for s in secrets)}
-
 
 @dataclass(frozen=True)
 class RunResult:
@@ -1187,29 +422,7 @@ class MainWindow(QMainWindow):
     # -- construction -------------------------------------------------------
 
     def _load_settings(self) -> tuple[dict[str, str], list[str]]:
-        name = self.paths.settings.name
-        try:
-            text = read_text(self.paths.settings)
-        except OSError as exc:
-            return dict(DEFAULTS), [f"Could not read {self.paths.settings}: {exc.strerror or exc}."]
-        except UnicodeDecodeError:
-            return dict(DEFAULTS), [f"{self.paths.settings} is not UTF-8 text, so the form shows the defaults and "
-                                    "Deploy will not rewrite it. Convert it to UTF-8 (or delete it) and restart the builder."]
-        values = dict(DEFAULTS)
-        values.update({k: v for k, v in parse_settings(text).items() if k in DEFAULTS})
-        notes = [f"{name} {problem}; the installer rejects this line." for problem in settings_line_problems(text)]
-        # The form cannot show an invalid port or switch; say so instead of
-        # silently replacing it.
-        for key in ("JUPYTER_PORT", "STATS_PORT"):
-            if check_port(values[key], key)[1]:
-                notes.append(f"{key} in {name} is not a valid port; the form shows {DEFAULTS[key]}.")
-                values[key] = DEFAULTS[key]
-        enabled = normalize_bool(values["STATS_ENABLED"])
-        if enabled is None:
-            # Off is the safe reading: it opens no port the user did not clearly ask for.
-            notes.append(f"STATS_ENABLED in {name} is not 1/0, true/false, yes/no or on/off; the form shows statistics off.")
-        values["STATS_ENABLED"] = enabled or "0"
-        return values, notes
+        return load_settings_file(self.paths.settings)
 
     @staticmethod
     def _label(text: str = "", name: str = "", *, wrap: bool = False, selectable: bool = False) -> QLabel:
@@ -1768,26 +981,13 @@ class MainWindow(QMainWindow):
             return
         values = self.form_values()
         try:
-            text = render_settings(read_text(self.paths.settings), {k: values[k] for k in DEFAULTS})
-        except UnicodeDecodeError:
+            save_settings(self.paths.settings, values)
+        except SettingsError as exc:
             self._set_busy(False)
-            self._fail(f"{self.paths.settings} is not UTF-8 text; the builder will not rewrite it. "
-                       "Convert it to UTF-8 (or delete it), then restart the builder.")
-            return
-        except (OSError, ValueError) as exc:
-            self._set_busy(False)
-            self._fail(f"Could not read {self.paths.settings}: {getattr(exc, 'strerror', None) or exc}")
-            return
-        problems = settings_line_problems(text)
-        if problems:          # lines the builder does not own, which the installer would refuse
-            self._set_busy(False)
-            self._refuse([f"{self.paths.settings}, {p}: fix or delete that line." for p in problems])
-            return
-        try:
-            write_private_file(self.paths.settings, text)
-        except OSError as exc:
-            self._set_busy(False)
-            self._fail(f"Could not save {self.paths.settings}: {getattr(exc, 'strerror', None) or exc}")
+            if exc.problems:      # lines the builder does not own, which the installer would refuse
+                self._refuse(exc.problems)
+            else:
+                self._fail(str(exc))
             return
         self.settings_values = values
         self._secrets.add(values["JUPYTER_PASSWORD"])
