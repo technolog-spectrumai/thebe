@@ -1590,6 +1590,18 @@ class WindowTests(unittest.TestCase):
         self.assertEqual((again.import_rows[1].path.text(), again.import_rows[1].name.text()), (str(other), "tools-2"))
         self.assertEqual([row.widget.isVisibleTo(again) for row in again.import_rows[:4]], [True, True, True, False])
 
+    def test_a_requirements_txt_the_runner_refuses_blocks_deploy(self):
+        requirements = self.state.parent / "requirements.txt"
+        requirements.write_text("numpy\n-r other.txt\n")
+        window = self.window(environ=dict(os.environ, JLT_REQUIREMENTS_FILE=str(requirements)))
+        window.deploy()
+        self.assertIn("requirements.txt line 2: --requirement is not allowed", self.wait_refused(window))
+        self.assertEqual(self.calls("installer"), [])
+        requirements.write_text("numpy\n")
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertEqual(self.installer_env()["JLT_REQUIREMENTS_FILE"], str(requirements))
+
     def test_a_failed_import_stops_the_deploy(self):
         root = self.state.parent
         tools = root / "host" / "tools"

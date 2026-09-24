@@ -43,6 +43,7 @@ from thebe.config import (  # noqa: F401
 from thebe.imports import (  # noqa: F401
     IMPORT_DIR, MAX_IMPORT_DIRS, ImportDir, default_workspace, plan_imports,
 )
+from thebe.packages import check_requirements, requirements_file
 from thebe.settings import (  # noqa: F401
     APP_NAME, DEFAULTS, HTTPS_MODES, PAGES, PROJECT, REPO, SERVICES, TAILNET, BindProbe, Page, Paths,
     SettingsError, absolute_path, check_port, is_public_host, is_valid_hostname, load_settings_file,
@@ -1116,7 +1117,8 @@ class MainWindow(QMainWindow):
         """Validate, re-detect Tailscale, refresh `compose ps`, check ports, save .env, run `install`."""
         if self._busy:
             return
-        errors = validate_settings(self.form_values(commit=True), self.themes or None) + self.import_problems()
+        errors = (validate_settings(self.form_values(commit=True), self.themes or None) + self.import_problems()
+                  + check_requirements(requirements_file(self._environ)).problems)
         if errors:
             self._refuse(errors)
             return
