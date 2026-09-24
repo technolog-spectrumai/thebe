@@ -128,7 +128,7 @@ class BaselineTests(RunnerCase):
         for text in ("", "# only comments\n\n", "--no-index\n"):
             code, out, err = self.run_cli("baseline", "--local", stdin=text)
             self.assertEqual(code, 0, err)
-            self.assertIn("lists no packages; nothing extra to install", out)
+            self.assertIn("requirements.txt: lists no packages; nothing extra to install", out)
         self.assertFalse((self.root / "custom" / "venv").exists())
         self.assertIsNone(self.job_id())
 
@@ -136,7 +136,7 @@ class BaselineTests(RunnerCase):
         text = self.requirements("alpha", "beta==1.0")
         code, out, err = self.run_cli("baseline", "--local", stdin=text)
         self.assertEqual(code, 0, out + err)
-        self.assertIn("first install of requirements.txt", out)
+        self.assertIn("requirements.txt: first install", out)
         self.assertIn("Packages from requirements.txt are installed", out)
         self.assertIn("Custom packages", out)                              # sizes and free disk
         # alpha at the version the "image" pins (2.0 exists); the real image already has its pins.
@@ -152,7 +152,7 @@ class BaselineTests(RunnerCase):
 
         code, out, err = self.run_cli("baseline", "--local", stdin=text + "gamma\n")
         self.assertEqual(code, 0, out + err)
-        self.assertIn("requirements.txt changed", out)
+        self.assertIn("requirements.txt: changed since the last install", out)
         self.assertNotEqual(self.job_id(), first)
         self.assertEqual(self.installed(), {"alpha": "1.0", "beta": "1.0", "gamma": "1.0"})
 

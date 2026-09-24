@@ -659,12 +659,12 @@ class JobRunner:
         finished, the venv works, and pip (offline, dry run) has nothing left to install.
         """
         if not has_requirements(text):
-            return True, "requirements.txt lists no packages; nothing extra to install"
+            return True, "lists no packages; nothing extra to install"
         state = read_baseline_state()
         if not state.get("sha256") or state.get("sha256") == text_digest(""):
-            return False, "first install of requirements.txt"
+            return False, "first install"
         if state.get("sha256") != text_digest(text):
-            return False, "requirements.txt changed since the last install"
+            return False, "changed since the last install"
         if state.get("constraints") != constraints_digest() or state.get("python") != PYTHON_XY:
             return False, "the image's own packages changed since the last install"
         if not state.get("ok"):
@@ -674,8 +674,8 @@ class JobRunner:
         if problem:
             return False, problem
         if not self._baseline_satisfied(env):
-            return False, "packages from requirements.txt are missing from the environment"
-        return True, "requirements.txt is unchanged and already installed"
+            return False, "some of its packages are missing from the environment"
+        return True, "unchanged and already installed"
 
     @staticmethod
     def _baseline_satisfied(env: dict) -> bool:
