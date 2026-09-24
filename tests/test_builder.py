@@ -1219,6 +1219,33 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.installer_env()["JLT_WORKSPACE_DIR"], str(self.config.parent / "ws"))
         self.assertIn("Configuration saved to", window.log_view.toPlainText())
 
+    def test_deploy_keeps_the_ai_section_and_writes_its_file(self):
+        key = "sk-ant-api03-Builder-Key-9876"
+        self.config.write_text(f'ai:\n  providers:\n    claude:\n      api: anthropic\n'
+                               f'      model: claude-sonnet-5\n      api_key: "{key}"\n'
+                               f'  budget:\n    max_tokens: 5000\n')
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 1)
+        config, problems = builder.load_config(self.config)
+        self.assertEqual((problems, config.ai.providers[0].api_key, config.ai.max_tokens), ([], key, 5000))
+        ai_json = self.settings.with_name(".ai.json")
+        self.assertEqual(json.loads(ai_json.read_text())["providers"]["claude"]["api_key"], key)
+        self.assertEqual(stat.S_IMODE(ai_json.stat().st_mode), 0o600)
+        log = window.log_view.toPlainText()
+        self.assertIn("# AI: on, default claude", log)
+        self.assertNotIn(key, log)
+
+    def test_a_broken_ai_section_refuses_deploy_and_is_never_rewritten(self):
+        raw = 'ai:\n  providers:\n    claude:\n      api: anthropic\n      model: claude-sonnet-5\n'
+        self.config.write_text(raw)
+        window = self.window()
+        window.deploy()
+        self.assertIn("ai.providers.claude.api_key must be set", self.wait_refused(window))
+        self.assertEqual(self.config.read_text(), raw)
+        self.assertFalse(self.settings.with_name(".ai.json").exists())
+        self.assertEqual(self.calls("installer"), [])
+
     def test_a_first_deploy_creates_config_yaml_from_the_settings_file(self):
         self.settings.write_text("JUPYTER_PASSWORD='Loaded-Pass-123'\nSTATS_ENABLED='no'\n")
         window = self.window()
