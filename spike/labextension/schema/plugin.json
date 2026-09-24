@@ -1,0 +1,13 @@
+{
+  "title": "Thebe AI cell button (spike)",
+  "description": "Adds a button to the cell toolbar that turns the cell's text into a %%ai prompt.",
+  "jupyter.lab.toolbars": {
+    "Cell": [{ "name": "thebe-ai", "command": "thebe-ai:cell-prompt", "label": "✨ AI", "rank": 5 }]
+  },
+  "jupyter.lab.shortcuts": [
+    { "command": "thebe-ai:cell-prompt", "keys": ["Ctrl Alt G"], "selector": ".jp-Notebook" }
+  ],
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}

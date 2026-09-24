@@ -1,0 +1,27 @@
+{
+  "name": "thebe-ai-cell",
+  "version": "0.0.1",
+  "description": "SPIKE: a cell-toolbar button that sends the whole cell as a prompt to the %%ai magic.",
+  "license": "BSD-3-Clause",
+  "private": true,
+  "keywords": ["jupyter", "jupyterlab", "jupyterlab-extension"],
+  "files": ["lib/**/*.js", "schema/*.json"],
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc && jupyter labextension build ."
+  },
+  "dependencies": {
+    "@jupyterlab/application": "^4.6.0",
+    "@jupyterlab/notebook": "^4.6.0"
+  },
+  "devDependencies": {
+    "@jupyter/builder": "^1.2.3",
+    "typescript": "~5.9.0"
+  },
+  "jupyterlab": {
+    "extension": true,
+    "outputDir": "thebe_ai_cell/labextension",
+    "schemaDir": "schema"
+  }
+}
