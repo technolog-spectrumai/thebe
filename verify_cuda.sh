@@ -390,7 +390,7 @@ fi
 requests="$(docker inspect -f '{{json .HostConfig.DeviceRequests}}' "$JUPYTER")"
 if [[ "$requests" == null || "$requests" == '[]' ]]; then
   bad 'the jupyterlab container was started without GPU access'
-  die 1 "enable it with: JLT_GPU=on $INSTALLER update"
+  die 1 "enable it: set NVIDIA='1' in the settings file (builder: tick NVIDIA GPU), then run: $INSTALLER update"
 fi
 good 'jupyterlab container has a GPU device request'
 if container_gpu="$(docker exec "$JUPYTER" nvidia-smi -L 2>/dev/null | head -n 1)" && [[ -n "$container_gpu" ]]; then
