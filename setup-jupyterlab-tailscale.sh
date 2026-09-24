@@ -28,6 +28,7 @@ readonly DEFAULT_NVIDIA='auto'
 readonly -a SETTINGS_KEYS=(JUPYTER_PASSWORD JUPYTER_PORT STATS_ENABLED STATS_PORT STATS_USER THEME HTTPS NVIDIA)
 readonly JUPYTER_IMAGE="${PROJECT}/jupyterlab:local"
 readonly STATS_IMAGE="${PROJECT}/stats:local"
+readonly AI_IMAGE="${PROJECT}/ai:local"
 readonly SYSCTL_FILE='/etc/sysctl.d/60-jupyterlab-tailscale.conf'
 readonly NONLOCAL_BIND_PROC='/proc/sys/net/ipv4/ip_nonlocal_bind'
 readonly ROOT_STATE_DIR='/var/lib/jupyterlab-tailscale'
@@ -113,6 +114,9 @@ APP_DIR="$(absolute_path "${JLT_APP_DIR:-${ACCOUNT_HOME}/.local/share/${PROJECT}
 WORKSPACE_DIR="$(absolute_path "${JLT_WORKSPACE_DIR:-${ACCOUNT_HOME}/jupyter-workspace}")"
 # Optional Jupyter packages for the custom packages environment (the Dependencies page's venv).
 REQUIREMENTS_FILE="$(absolute_path "${JLT_REQUIREMENTS_FILE:-${SCRIPT_DIR}/requirements.txt}")"
+# AI settings with the API keys (JSON), next to the settings file. run.sh and the builder write it
+# from config.yaml's ai: section, and delete it when AI is off.
+AI_FILE="${SETTINGS_FILE%/*}/.ai.json"
 # JLT_TLS_DIR is for tests only. The root helpers never take paths from the caller's
 # environment, so they always use the default.
 if [[ "$EUID" -eq 0 ]]; then
@@ -550,7 +554,7 @@ require_stack() {
   for name in Dockerfile compose.yaml compose.gpu.yaml compose.tls.yaml; do
     [[ -f "$STACK_DIR/$name" ]] || die "Missing $STACK_DIR/$name; is the repository complete?"
   done
-  for name in jupyter stats theme; do
+  for name in jupyter stats ai theme; do
     [[ -d "$STACK_DIR/$name" ]] || die "Missing $STACK_DIR/$name/; is the repository complete?"
   done
 }
@@ -1141,7 +1145,7 @@ sync_stack() {
   for name in Dockerfile compose.yaml compose.gpu.yaml compose.tls.yaml; do
     install -m 644 -- "$STACK_DIR/$name" "$APP_DIR/$name"
   done
-  for name in jupyter stats theme; do
+  for name in jupyter stats ai theme; do
     # Build the new tree next to the old one and swap, so a failed copy never leaves half a tree.
     tmp="$(mktemp -d "$APP_DIR/.sync-${name}.XXXXXX")"
     if ! copy_tree "$STACK_DIR/$name" "$tmp"; then
@@ -1178,6 +1182,9 @@ runtime_env_content() {
   if [[ "$STATS_ENABLED" == 1 ]]; then
     profiles='stats'
   fi
+  if [[ "${AI_ENABLED:-0}" == 1 ]]; then
+    profiles="${profiles:+${profiles},}ai"
+  fi
   if [[ "$USE_TLS" == 1 ]]; then
     tls_name="$TS_NAME"
     tls_not_after="$CERT_NOT_AFTER"
@@ -1203,7 +1210,8 @@ runtime_env_content() {
     "TLS='${USE_TLS}'" \
     "TLS_NAME='${tls_name}'" \
     "TLS_NOT_AFTER='${tls_not_after}'" \
-    "TLS_DIR='${TLS_DIR}'"
+    "TLS_DIR='${TLS_DIR}'" \
+    "AI_CONFIG_HASH='${AI_CONFIG_HASH:-}'"
 }
 
 # Dies unless the HTTPS values are safe to write into the single-quoted runtime .env.
@@ -1236,6 +1244,7 @@ write_runtime_env() {
   is_valid_theme_name "$THEME" || die "Refusing to write an invalid theme name: $(printf '%q' "$THEME")"
   [[ "$GPU_MODE" == auto || "$GPU_MODE" == 1 || "$GPU_MODE" == 0 ]] ||
     die "Refusing to write an invalid GPU mode: $(printf '%q' "$GPU_MODE")"
+  [[ "${AI_CONFIG_HASH:-}" =~ ^([0-9a-f]{64})?$ ]] || die 'Refusing to write an invalid AI settings hash.'
   validate_https_values
   write_file_atomic "$APP_DIR/.env" 600 "$(runtime_env_content "$1")"$'\n'
 }
@@ -1361,6 +1370,45 @@ ensure_runner_token() {
   TOKEN_CHANGED=1
 }
 
+# The AI gateway's settings: the content of AI_FILE, or {} (no keys) when AI is off.
+ai_config_content() {
+  if [[ -e "$AI_FILE" || -L "$AI_FILE" ]]; then
+    [[ -f "$AI_FILE" && -r "$AI_FILE" ]] || die "$AI_FILE is not a readable file."
+    printf '%s\n' "$(<"$AI_FILE")"
+  else
+    printf '{}\n'
+  fi
+}
+
+# The AI gateway's secrets: ai_config (the ai: section with the API keys, for the ai container
+# only) and ai_token (random, shared with jupyterlab and stats, created once). Sets AI_ENABLED,
+# AI_CONFIG_HASH (in the runtime .env, so a changed ai_config recreates the ai container: Compose
+# does not notice a changed secret file) and AI_TOKEN_CHANGED.
+ensure_ai_secrets() {
+  local dir="$APP_DIR/secrets" file="$APP_DIR/secrets/ai_token" content token=''
+  AI_ENABLED=0
+  AI_TOKEN_CHANGED=0
+  install -d -m 700 -- "$dir"
+  content="$(ai_config_content)"$'\n'
+  if [[ -f "$AI_FILE" ]]; then
+    AI_ENABLED=1
+  fi
+  write_file_atomic "$dir/ai_config" 600 "$content"
+  AI_CONFIG_HASH="$(printf '%s' "$content" | sha256sum)"
+  AI_CONFIG_HASH="${AI_CONFIG_HASH%% *}"
+  if [[ -f "$file" ]]; then
+    token="$(<"$file")"
+  fi
+  if [[ "$token" =~ ^[0-9a-f]{64}$ ]]; then
+    chmod 600 -- "$file"
+    return 0
+  fi
+  token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die 'Could not generate the AI gateway token.'
+  write_file_atomic "$file" 600 "$token"
+  AI_TOKEN_CHANGED=1
+}
+
 print_summary() {
   local mode="$1" gpu="$2" cmd base
   cmd="$(script_cmd)"
@@ -1393,6 +1441,11 @@ print_summary() {
     printf '  Packages:    no %s; the Dependencies page adds packages\n' "$REQUIREMENTS_FILE"
   fi
   printf '  GPU:         %s (NVIDIA %s)\n' "$([[ "$gpu" == 1 ]] && printf 'enabled' || printf 'not used')" "$GPU_MODE"
+  if [[ "$AI_ENABLED" == 1 ]]; then
+    printf '  AI:          on (%%%%ai and the AI cell button; token budget on the Statistics page)\n'
+  else
+    printf '  AI:          off (no ai: section in config.yaml)\n'
+  fi
   printf '  Address:     %s\n' "$TS_IP"
   if [[ -n "$TS_NAME" ]]; then
     printf '  Name:        %s\n' "$TS_NAME"
@@ -1439,6 +1492,7 @@ deploy() {
   info "Copying $STACK_DIR to $APP_DIR"
   sync_stack
   ensure_runner_token
+  ensure_ai_secrets
 
   GPU_MODE="$(gpu_mode)"
   case "$GPU_MODE" in
@@ -1504,11 +1558,15 @@ deploy() {
     info 'Statistics disabled: removing the stats and deps containers if they exist.'
     compose rm -s -f stats deps || warn 'Could not remove the stats and deps containers.'
   fi
+  if [[ "$AI_ENABLED" != 1 ]]; then
+    info 'AI off (no ai: section in config.yaml): removing the ai container if it exists.'
+    compose rm -s -f ai || warn 'Could not remove the ai container.'
+  fi
 
   local up_args=(up -d --remove-orphans --wait --wait-timeout 300)
-  if [[ "$HASH_CHANGED" == 1 || "$TOKEN_CHANGED" == 1 ]]; then
-    # Secret file contents are not part of Compose's config hash, so a new password or runner
-    # token would otherwise keep the old containers (still bound to the old files).
+  if [[ "$HASH_CHANGED" == 1 || "$TOKEN_CHANGED" == 1 || "$AI_TOKEN_CHANGED" == 1 ]]; then
+    # Secret file contents are not part of Compose's config hash, so a new password or token
+    # would otherwise keep the old containers (still bound to the old files).
     up_args+=(--force-recreate)
   fi
   info 'Starting containers and waiting until they are healthy...'
@@ -1544,6 +1602,10 @@ load_runtime_env() {
   DEPLOYED_STATS_ENABLED=0
   if [[ ",${RUNTIME_ENV[COMPOSE_PROFILES]:-}," == *,stats,* ]]; then
     DEPLOYED_STATS_ENABLED=1
+  fi
+  DEPLOYED_AI_ENABLED=0
+  if [[ ",${RUNTIME_ENV[COMPOSE_PROFILES]:-}," == *,ai,* ]]; then
+    DEPLOYED_AI_ENABLED=1
   fi
   DEPLOYED_GPU=0
   if [[ "${RUNTIME_ENV[COMPOSE_FILE]:-}" == *compose.gpu.yaml* ]]; then
@@ -1633,6 +1695,15 @@ settings_drift_warning() {
     current="$(<"$APP_DIR/secrets/jupyter_password")"
   fi
   [[ "$current" == "$JUPYTER_PASSWORD" ]] || differences+=('JUPYTER_PASSWORD changed')
+  # Only when the file can be read (update reports a broken one), and not for a deployment from
+  # before the AI setting that still has no AI file.
+  if [[ -e "$AI_FILE" || -n "${RUNTIME_ENV[AI_CONFIG_HASH]:-}" ]] &&
+    [[ ! -e "$AI_FILE" || (-f "$AI_FILE" && -r "$AI_FILE") ]]; then
+    current="$(ai_config_content)"$'\n'
+    current="$(printf '%s' "$current" | sha256sum)"
+    [[ "${current%% *}" == "${RUNTIME_ENV[AI_CONFIG_HASH]:-}" ]] ||
+      differences+=("AI settings ($AI_FILE, from config.yaml's ai: section) changed")
+  fi
   ((${#differences[@]} > 0)) || return 0
   message="Settings in $SETTINGS_FILE differ from what is deployed:"
   for item in "${differences[@]}"; do
@@ -2361,8 +2432,9 @@ cmd_stop() {
   require_docker
   info 'Stopping containers...'
   # --profile stats also stops stats and deps containers left over from before statistics
-  # were disabled. A running package install in deps is cancelled and shown as interrupted.
-  compose --profile stats stop || die 'docker compose stop failed; see the output above.'
+  # were disabled (--profile ai the same for the ai container). A running package install in
+  # deps is cancelled and shown as interrupted.
+  compose --profile stats --profile ai stop || die 'docker compose stop failed; see the output above.'
 }
 
 cmd_restart() {
@@ -2390,6 +2462,7 @@ published_ports() {
 service_label() {
   case "$1" in
     deps) printf 'deps (package runner)\n' ;;
+    ai) printf 'ai (AI gateway)\n' ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
@@ -2398,8 +2471,8 @@ show_containers() {
   local output name service state health ports error
   local -a expected=(jupyterlab)
   local -A seen=()
-  # --profile stats: also list stats/deps containers left over after statistics were disabled.
-  if ! output="$(compose --profile stats ps -a --format '{{.Name}}|{{.Service}}|{{.State}}|{{.Health}}|{{.Ports}}' 2>/dev/null)"; then
+  # --profile stats/ai: also list containers left over after statistics or AI were disabled.
+  if ! output="$(compose --profile stats --profile ai ps -a --format '{{.Name}}|{{.Service}}|{{.State}}|{{.Health}}|{{.Ports}}' 2>/dev/null)"; then
     warn "'docker compose ps' failed in $APP_DIR."
     return 0
   fi
@@ -2417,6 +2490,7 @@ show_containers() {
     fi
   done <<<"$output"
   [[ "$DEPLOYED_STATS_ENABLED" == 1 ]] && expected+=(deps stats)
+  [[ "$DEPLOYED_AI_ENABLED" == 1 ]] && expected+=(ai)
   for service in "${expected[@]}"; do
     if [[ -z "${seen[$service]:-}" ]]; then
       printf "  %-22s no container -> run '%s start'\n" "$(service_label "$service")" "$(script_cmd)"
@@ -2561,7 +2635,7 @@ cmd_logs() {
 
 remove_project_resources() {
   local volumes image
-  if is_installed && compose --profile stats down --remove-orphans --volumes --rmi all; then
+  if is_installed && compose --profile stats --profile ai down --remove-orphans --volumes --rmi all; then
     return 0
   fi
   info 'Removing the Compose project by name (app dir files missing or unusable)...'
@@ -2575,7 +2649,7 @@ remove_project_resources() {
     # shellcheck disable=SC2086 # volume names never contain whitespace
     docker volume rm $volumes >/dev/null || warn 'Some volumes could not be removed.'
   fi
-  for image in "$JUPYTER_IMAGE" "$STATS_IMAGE"; do
+  for image in "$JUPYTER_IMAGE" "$STATS_IMAGE" "$AI_IMAGE"; do
     if docker image inspect "$image" >/dev/null 2>&1; then
       docker image rm "$image" >/dev/null || warn "Could not remove image $image."
     fi

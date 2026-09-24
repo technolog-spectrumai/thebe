@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# One Dockerfile, two images: target `jupyterlab` (notebook server, also used by the `deps`
-# package runner) and target `stats` (dashboard). The build context is the app dir, i.e. a
+# One Dockerfile, three images: target `jupyterlab` (notebook server, also used by the `deps`
+# package runner), target `stats` (dashboard) and target `ai` (AI gateway). The build context is the app dir, i.e. a
 # copy of stack/; compose.yaml picks the target for each service.
 
 ARG PYTHON_IMAGE=python:3.13-slim-trixie
@@ -115,3 +115,23 @@ WORKDIR /srv/stats
 EXPOSE 8889
 # serve.py starts uvicorn on 8889, with TLS when compose.tls.yaml sets JLT_TLS_CERT/JLT_TLS_KEY.
 CMD ["python", "/srv/stats/serve.py"]
+
+
+FROM base AS ai
+
+RUN --mount=type=bind,source=ai/requirements.lock.txt,target=/tmp/requirements.lock.txt \
+    pip install --no-cache-dir --only-binary=:all: --root-user-action=ignore \
+        -r /tmp/requirements.lock.txt
+
+# Symbolic mode for the same reason as for /srv/jupyter above.
+COPY --chmod=u=rwX,go=rX ai/gateway.py ai/healthcheck.py /srv/ai/
+
+# The ai_usage volume at /var/lib/thebe-ai starts with the ownership of this directory.
+RUN mkdir -p /var/lib/thebe-ai && chown jupyter:jupyter /var/lib/thebe-ai
+
+USER jupyter
+RUN test -r /srv/ai/gateway.py && test -r /srv/ai/healthcheck.py && test -w /var/lib/thebe-ai \
+ && python -c 'import anthropic, openai'
+WORKDIR /srv/ai
+EXPOSE 8891
+CMD ["python", "/srv/ai/gateway.py"]

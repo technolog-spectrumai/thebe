@@ -1,5 +1,5 @@
-# JupyterLab, the statistics dashboard and its package runner, published only on the
-# Tailscale IPv4. Every ${...} value comes from the .env next to this file, written by
+# JupyterLab, the statistics dashboard and its package runner, and the AI gateway, the first
+# two published only on the Tailscale IPv4. Every ${...} value comes from the .env next to this file, written by
 # setup-jupyterlab-tailscale.sh. Passwords never pass through interpolation: they are
 # files under ./secrets/, mounted as Compose secrets.
 name: jupyterlab-tailscale
@@ -37,8 +37,16 @@ services:
       JUPYTERLAB_SETTINGS_DIR: /state/lab/user-settings
       JUPYTERLAB_WORKSPACES_DIR: /state/lab/workspaces
       IPYTHONDIR: /state/ipython
+      # The %%ai magic in the kernels (and so the AI cell button) asks the AI gateway, never a
+      # provider: the API keys stay in the ai container. With AI off the magic says so.
+      AI_GATEWAY_URL: http://ai:8891
+      AI_TOKEN_FILE: /run/secrets/ai_token
     secrets:
       - jupyter_hashed_password
+      - ai_token
+    networks:
+      - default
+      - ai
     volumes:
       # Long syntax so a missing host directory is an error; the short syntax would
       # let the daemon create it owned by root. The :? guard matters: an empty source
@@ -159,6 +167,9 @@ services:
       # The Dependencies page proxies to the runner; it copes with the runner being down.
       DEPS_INTERNAL_URL: http://deps:8890
       DEPS_TOKEN_FILE: /run/secrets/deps_token
+      # The AI tile (token budget, answer times) reads the gateway's /status; it copes with AI off.
+      AI_INTERNAL_URL: http://ai:8891
+      AI_TOKEN_FILE: /run/secrets/ai_token
       HOST_NAME: "${HOST_NAME:-}"
       # zenobia theme file under /srv/stats/theme (stack/theme), without .json. Environment
       # only: switching themes recreates this container, nothing is rebuilt.
@@ -170,6 +181,10 @@ services:
     secrets:
       - jupyter_password
       - deps_token
+      - ai_token
+    networks:
+      - default
+      - ai
     volumes:
       - type: bind
         source: /proc
@@ -209,6 +224,64 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # AI gateway: the only container with the AI API keys (secret ai_config). It calls OpenAI and
+  # Anthropic for the %%ai magic, counts the tokens against the budget and times the answers.
+  # Only jupyterlab and stats share its network, with the ai_token; deps (where pip runs the
+  # build scripts of third-party packages) cannot reach it. No published port.
+  ai:
+    image: jupyterlab-tailscale/ai:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ai
+      args:
+        JLT_UID: "${JLT_UID:-1000}"
+        JLT_GID: "${JLT_GID:-1000}"
+    # Enabled by COMPOSE_PROFILES in .env when config.yaml has an ai: section.
+    profiles:
+      - ai
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - "/tmp:size=16m"
+    environment:
+      AI_CONFIG_FILE: /run/secrets/ai_config
+      AI_TOKEN_FILE: /run/secrets/ai_token
+      AI_DATA_DIR: /var/lib/thebe-ai
+      HOME: /tmp
+      # Changes with the AI settings, so Compose recreates this container after an update that
+      # changed them (it does not notice a changed secret file by itself).
+      AI_CONFIG_HASH: "${AI_CONFIG_HASH:-}"
+    secrets:
+      - ai_config
+      - ai_token
+    volumes:
+      # usage.jsonl: tokens and seconds of every answer (never a prompt), for the budget.
+      - ai_usage:/var/lib/thebe-ai
+    networks:
+      - ai
+    healthcheck:
+      # /health requires the bearer token like every route; the script sends it.
+      test: ["CMD", "python", "/srv/ai/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      start_interval: 2s
+      retries: 3
+    # Answers being written are finished (and counted) before the gateway exits.
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 # File secrets are read-only bind mounts at /run/secrets/<name>. Compose ignores
 # uid/gid/mode for them, so the files keep their host owner (the desktop user, same uid
 # as the container user) and mode 0600.
@@ -220,6 +293,18 @@ secrets:
   # Random credential between stats and deps, created once by the installer.
   deps_token:
     file: ./secrets/deps_token
+  # config.yaml's ai: section with the API keys, for the ai container only; {} when AI is off.
+  ai_config:
+    file: ./secrets/ai_config
+  # Random credential for the AI gateway, shared with jupyterlab and stats; created once.
+  ai_token:
+    file: ./secrets/ai_token
+
+networks:
+  default:
+  # The AI gateway's network: ai, jupyterlab and stats. Not internal: the gateway needs the
+  # providers' APIs on the internet.
+  ai:
 
 volumes:
   jupyter_state:
@@ -227,3 +312,5 @@ volumes:
   custom_packages:
   # pip's download cache, written only by the deps runner.
   pip_cache:
+  # The AI gateway's usage ledger (token budget and answer times).
+  ai_usage:

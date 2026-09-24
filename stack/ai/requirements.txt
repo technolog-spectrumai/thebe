@@ -1,0 +1,5 @@
+# AI gateway (gateway.py). Top-level pins only; the image installs requirements.lock.txt, which is
+# `pip freeze` of these in python:3.13-slim-trixie. After changing a pin, regenerate the lock:
+#   docker run --rm -i python:3.13-slim-trixie sh -c 'pip install -q --root-user-action=ignore --only-binary=:all: -r /dev/stdin >&2 && pip freeze' < requirements.txt > requirements.lock.txt
+openai==3.19.2
+anthropic==1.8.0
