@@ -60,6 +60,8 @@ RUN python -m ipykernel install --prefix /usr/local --name python3 \
 COPY --chmod=u=rwX,go=rX jupyter/jupyter_server_config.py /srv/jupyter/jupyter_server_config.py
 COPY --chmod=u=rwX,go=rX jupyter/kernel_launcher.py jupyter/deps_runner.py jupyter/deps_healthcheck.py \
      jupyter/jupyter_healthcheck.py /srv/jupyter/
+# The %%ai magic, loaded into every kernel by kernel_launcher.py.
+COPY --chmod=u=rwX,go=rX jupyter/kernel/thebe_ai.py /srv/jupyter/kernel/
 
 # Mount points owned by the container user: Docker initialises an empty named volume
 # with the ownership of the image directory it is mounted over (custom_packages at
@@ -78,6 +80,7 @@ RUN test -r /srv/jupyter/jupyter_server_config.py \
  && test -r /srv/jupyter/deps_runner.py \
  && test -r /srv/jupyter/deps_healthcheck.py \
  && test -r /srv/jupyter/jupyter_healthcheck.py \
+ && test -r /srv/jupyter/kernel/thebe_ai.py \
  && test -w /opt/custom && test -w /var/cache/pip \
  && python -c 'import json; spec = json.load(open("/usr/local/share/jupyter/kernels/python3/kernel.json")); open(spec["argv"][2]).close(); assert "PYTHONPATH" not in spec["env"]'
 WORKDIR /workspace
