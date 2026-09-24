@@ -42,6 +42,8 @@ class CliTests(unittest.TestCase):
                            REPO / "stack" / "stats" / "static" / "orbitron-latin.woff2")
         self.environ = {k: v for k, v in os.environ.items() if not k.startswith("JLT_")}
         self.environ["JUPYTER_PASSWORD"] = "leaked-from-the-shell"
+        self.requirements = self.root / "requirements.txt"
+        self.environ["JLT_REQUIREMENTS_FILE"] = str(self.requirements)
         self.environ["JLT_GPU"] = "on"                  # config.yaml's nvidia decides, not this
 
     def run_cli(self, *argv, environ=None):
@@ -248,6 +250,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual((self.workspace / "imported" / "my tools" / "t.sh").read_text(), "t")
         self.assertEqual(self.calls(), [])
         self.assertFalse(self.settings.exists())
+
+    def test_requirements_txt_is_checked_before_a_deploy(self):
+        code, out, err = self.run_cli("check")
+        self.assertEqual(code, cli.EXIT_CONFIG)          # no config yet
+        self.run_cli("init")
+        code, out, err = self.run_cli("check")
+        self.assertIn(f"Packages:    none ({self.requirements} does not exist", out)
+        self.requirements.write_text("opencv-python\npytesseract\n--extra-index-url https://x/simple\n")
+        code, out, err = self.run_cli("check")
+        self.assertEqual(code, 0, err)
+        self.assertIn("2 package line(s), installed on install and update", out)
+        self.requirements.write_text("requests\n-e ./src\n--target /tmp/x\n")
+        for command in ("check", "install", "update"):
+            code, out, err = self.run_cli(command)
+            self.assertEqual(code, cli.EXIT_CONFIG, command)
+            self.assertIn("requirements.txt line 2: --editable is not allowed", err)
+            self.assertIn("requirements.txt line 3: --target is not allowed", err)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.settings.exists())
+        self.assertEqual(self.run_cli("start")[0], 0)    # start installs nothing, so it does not check
+        self.assertEqual(self.installer_env()["JLT_REQUIREMENTS_FILE"], str(self.requirements))
 
 
 class RunShTests(unittest.TestCase):

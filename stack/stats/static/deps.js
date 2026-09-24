@@ -320,6 +320,21 @@
     );
   }
 
+  // The project's requirements.txt as the last deploy handed it over (read-only here).
+  function renderBaseline(baseline) {
+    const info = baseline && typeof baseline === "object" ? baseline : {};
+    const text = typeof info.text === "string" ? info.text : "";
+    const packages = isNum(info.packages) ? info.packages : 0;
+    const pill = $("baseline-pill");
+    if (!packages) setPill(pill, "idle", "none");
+    else if (info.installed) setPill(pill, "ok", packages === 1 ? "1 package installed" : `${packages} packages installed`);
+    else setPill(pill, "caution", "not installed yet");
+    pill.hidden = false;
+    const pre = $("baseline-text");
+    pre.textContent = text;
+    pre.hidden = !text.trim();
+  }
+
   function renderState(data) {
     state = data;
     const summary = [data.python && `Python ${data.python}`];
@@ -335,6 +350,7 @@
     renderJob();
     renderSizes(data.sizes || {});
     renderInstalled(data.installed);
+    renderBaseline(data.baseline);
     updateControls();
   }
 

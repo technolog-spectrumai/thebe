@@ -111,6 +111,8 @@ ACCOUNT_HOME="$(account_home)"
 SETTINGS_FILE="$(absolute_path "${JLT_SETTINGS_FILE:-${SCRIPT_DIR}/.env}")"
 APP_DIR="$(absolute_path "${JLT_APP_DIR:-${ACCOUNT_HOME}/.local/share/${PROJECT}}")"
 WORKSPACE_DIR="$(absolute_path "${JLT_WORKSPACE_DIR:-${ACCOUNT_HOME}/jupyter-workspace}")"
+# Optional Jupyter packages for the custom packages environment (the Dependencies page's venv).
+REQUIREMENTS_FILE="$(absolute_path "${JLT_REQUIREMENTS_FILE:-${SCRIPT_DIR}/requirements.txt}")"
 # JLT_TLS_DIR is for tests only. The root helpers never take paths from the caller's
 # environment, so they always use the default.
 if [[ "$EUID" -eq 0 ]]; then
@@ -1240,6 +1242,42 @@ write_runtime_env() {
 
 # A throwaway container with the GPU request of compose.gpu.yaml. On failure it says why and,
 # for a known host problem, how to fix it.
+# The project's requirements.txt, checked with the package runner's own rules (the image's
+# deps_runner.py) right after the build, before any container is recreated.
+check_requirements() {
+  [[ -e "$REQUIREMENTS_FILE" ]] || return 0
+  [[ -f "$REQUIREMENTS_FILE" && -r "$REQUIREMENTS_FILE" ]] ||
+    die "$REQUIREMENTS_FILE is not a readable file."
+  docker run --rm -i --pull never --network none --entrypoint python "$JUPYTER_IMAGE" \
+    /srv/jupyter/deps_runner.py check <"$REQUIREMENTS_FILE" ||
+    die "$REQUIREMENTS_FILE is not accepted (see above); nothing was changed. Fix it and deploy again."
+}
+
+# Makes the custom packages environment (the one the Dependencies page shows) contain the
+# project's requirements.txt, through the package runner: the same pip job, constraints and
+# download cache as the page, skipped when the file and the environment are unchanged. With
+# statistics on, the running runner does it and the page shows the job; with them off, a
+# one-off runner container does. A missing file hands over an empty list: nothing extra is
+# installed, and packages it listed before are no longer part of later installs (they stay
+# until Reset & reinstall on the page).
+apply_requirements() {
+  local source=/dev/null runner=(python /srv/jupyter/deps_runner.py baseline)
+  if [[ -f "$REQUIREMENTS_FILE" ]]; then
+    source="$REQUIREMENTS_FILE"
+  fi
+  if [[ "$STATS_ENABLED" == 1 ]]; then
+    info "Packages from $REQUIREMENTS_FILE: checking the custom packages environment..."
+    compose exec -T deps "${runner[@]}" <"$source" || requirements_failed
+  elif [[ "$source" != /dev/null ]]; then
+    info "Packages from $REQUIREMENTS_FILE: checking the custom packages environment (one-off runner)..."
+    compose --profile stats run --rm --no-deps -T deps "${runner[@]}" --local <"$source" || requirements_failed
+  fi
+}
+
+requirements_failed() {
+  die "The packages from $REQUIREMENTS_FILE were not installed (see above). JupyterLab runs, with the custom packages installed before; fix the file and run: $(script_cmd) update"
+}
+
 gpu_probe() {
   local output spec
   if output="$(docker run --rm --pull never --network none --gpus all --entrypoint nvidia-smi \
@@ -1349,6 +1387,11 @@ print_summary() {
   printf '  Workspace:   %s\n' "$WORKSPACE_DIR"
   printf '  Settings:    %s\n' "$SETTINGS_FILE"
   printf '  Theme:       %s\n' "$THEME"
+  if [[ -f "$REQUIREMENTS_FILE" ]]; then
+    printf '  Packages:    %s (in the custom packages environment)\n' "$REQUIREMENTS_FILE"
+  else
+    printf '  Packages:    no %s; the Dependencies page adds packages\n' "$REQUIREMENTS_FILE"
+  fi
   printf '  GPU:         %s (NVIDIA %s)\n' "$([[ "$gpu" == 1 ]] && printf 'enabled' || printf 'not used')" "$GPU_MODE"
   printf '  Address:     %s\n' "$TS_IP"
   if [[ -n "$TS_NAME" ]]; then
@@ -1433,6 +1476,7 @@ deploy() {
     info 'Building images...'
   fi
   compose "${build_args[@]}" || die 'docker compose build failed; see the output above.'
+  check_requirements
 
   if [[ "$gpu" == 1 ]] && ! gpu_probe; then
     if [[ "$GPU_MODE" == 1 ]]; then
@@ -1473,6 +1517,7 @@ deploy() {
   if ((!ROOT_ATTEMPTED)); then
     maybe_root_step "$TS_IP" "${ports[@]}"
   fi
+  apply_requirements
 
   docker image prune -f --filter dangling=true \
     --filter "label=org.opencontainers.image.vendor=${PROJECT}" >/dev/null 2>&1 || true
@@ -2400,6 +2445,8 @@ cmd_status() {
     "$([[ "$DEPLOYED_STATS_ENABLED" == 1 ]] && printf 'on (port %s, user %s)' "$DEPLOYED_STATS_PORT" "$DEPLOYED_STATS_USER" || printf 'off')" \
     "$([[ "$DEPLOYED_GPU" == 1 ]] && printf 'on' || printf 'off')" "$DEPLOYED_NVIDIA"
   printf 'Workspace:         %s\n' "$DEPLOYED_WORKSPACE_DIR"
+  printf 'Packages file:     %s (%s)\n' "$REQUIREMENTS_FILE" \
+    "$([[ -f "$REQUIREMENTS_FILE" ]] && printf 'installed on install/update' || printf 'absent: nothing extra')"
   printf 'Theme:             %s\n' "$DEPLOYED_THEME"
 
   if probe_tailscale_ipv4; then
@@ -2661,6 +2708,8 @@ Environment overrides:
   JLT_SETTINGS_FILE   settings file              (default: <script dir>/.env)
   JLT_APP_DIR         deployed stack directory   (default: ~/.local/share/${PROJECT})
   JLT_WORKSPACE_DIR   notebook workspace         (default: ~/jupyter-workspace)
+  JLT_REQUIREMENTS_FILE  optional Jupyter packages, installed on install/update
+                      into the custom packages environment (default: <script dir>/requirements.txt)
   JLT_GPU             auto | on | off            (overrides NVIDIA for install/update)
   JLT_TLS_DIR         certificate directory, for tests only; host-setup always writes
                       ${DEFAULT_TLS_DIR}

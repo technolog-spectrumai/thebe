@@ -1590,6 +1590,68 @@ class WindowTests(unittest.TestCase):
         self.assertEqual((again.import_rows[1].path.text(), again.import_rows[1].name.text()), (str(other), "tools-2"))
         self.assertEqual([row.widget.isVisibleTo(again) for row in again.import_rows[:4]], [True, True, True, False])
 
+    def test_a_requirements_txt_the_runner_refuses_blocks_deploy(self):
+        requirements = self.state.parent / "requirements.txt"
+        requirements.write_text("numpy\n-r other.txt\n")
+        window = self.window(environ=dict(os.environ, JLT_REQUIREMENTS_FILE=str(requirements)))
+        window.deploy()
+        self.assertIn("requirements.txt line 2: --requirement is not allowed", self.wait_refused(window))
+        self.assertEqual(self.calls("installer"), [])
+        requirements.write_text("numpy\n")
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertEqual(self.installer_env()["JLT_REQUIREMENTS_FILE"], str(requirements))
+
+    def test_choosing_a_requirements_file_copies_it_for_deploy(self):
+        root = self.state.parent
+        dest, picked = root / "repo" / "requirements.txt", root / "picked"
+        picked.mkdir()
+        (picked / "packages.txt").write_text("opencv-python\npytesseract\n")
+        (picked / "other.txt").write_text("requests\n")
+        (picked / "bad.txt").write_text("numpy\n-e ./src\n")
+        window = self.window(environ=dict(os.environ, JLT_REQUIREMENTS_FILE=str(dest)))
+        self.assertIn("Deploy installs nothing extra", window.packages_label.text())
+
+        def choose(name):
+            path = str(picked / name) if name else ""
+            with mock.patch.object(builder.QFileDialog, "getOpenFileName", return_value=(path, "")) as dialog:
+                window.packages_choose.click()
+            return dialog
+
+        self.assertEqual(choose("packages.txt").call_args.args[2], str(dest.parent))
+        self.assertEqual(dest.read_text(), "opencv-python\npytesseract\n")
+        self.assertFalse(dest.is_symlink())
+        self.assertIn("2 package line(s), installed on every Deploy", window.packages_label.text())
+        self.assertEqual(window.banner.property("kind"), "success")
+        self.question.assert_not_called()                      # nothing to replace yet
+
+        self.question.return_value = QMessageBox.StandardButton.No
+        choose("other.txt")                                     # replacing asks first
+        self.assertIn("Replace", self.question.call_args.args[2])
+        self.assertEqual(dest.read_text(), "opencv-python\npytesseract\n")
+        self.question.return_value = QMessageBox.StandardButton.Yes
+        choose("other.txt")
+        self.assertEqual(dest.read_text(), "requests\n")
+
+        choose("bad.txt")                                       # refused: nothing copied
+        self.assertIn("line 2: --editable is not allowed", self.critical.call_args.args[2])
+        self.assertEqual(dest.read_text(), "requests\n")
+        self.assertEqual(window.banner.property("kind"), "error")
+        choose("")                                              # dialog cancelled
+        self.assertEqual(dest.read_text(), "requests\n")
+
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertEqual(self.installer_env()["JLT_REQUIREMENTS_FILE"], str(dest))
+        self.assertIn("Copied", window.log_view.toPlainText())
+
+    def test_a_refused_project_requirements_file_is_shown(self):
+        dest = self.state.parent / "repo" / "requirements.txt"
+        dest.write_text("torch --index-url https://download.pytorch.org/whl/cpu\n")
+        window = self.window(environ=dict(os.environ, JLT_REQUIREMENTS_FILE=str(dest)))
+        self.assertIn("is refused, so Deploy is too", window.packages_label.text())
+        self.assertIn("pip ignores --index-url next to a package", window.packages_error.text())
+
     def test_a_failed_import_stops_the_deploy(self):
         root = self.state.parent
         tools = root / "host" / "tools"

@@ -43,6 +43,7 @@ from thebe.config import (  # noqa: F401
 from thebe.imports import (  # noqa: F401
     IMPORT_DIR, MAX_IMPORT_DIRS, ImportDir, default_workspace, plan_imports,
 )
+from thebe.packages import CopyRefused, check_requirements, copy_requirements, requirements_file
 from thebe.settings import (  # noqa: F401
     APP_NAME, DEFAULTS, HTTPS_MODES, PAGES, PROJECT, REPO, SERVICES, TAILNET, BindProbe, Page, Paths,
     SettingsError, absolute_path, check_port, is_public_host, is_valid_hostname, load_settings_file,
@@ -418,6 +419,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._fill_form(self.settings_values)
         self._fill_imports(self.config.imports)
+        self._refresh_packages()
         self.apply_theme()
         QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
 
@@ -511,6 +513,7 @@ class MainWindow(QMainWindow):
         self.cards_layout.addWidget(self._build_services_card(), 1)
         body.addLayout(self.cards_layout)
         body.addWidget(self._build_imports_card())
+        body.addWidget(self._build_packages_card())
         body.addLayout(self._build_actions())
         body.addWidget(self._build_output_card(), 1)
         # A short screen scrolls the page instead of squeezing the inputs.
@@ -682,6 +685,23 @@ class MainWindow(QMainWindow):
         self.imports_error.hide()
         layout.addWidget(self.imports_plan)
         layout.addWidget(self.imports_error)
+        return card
+
+    def _build_packages_card(self) -> QFrame:
+        """The project's requirements.txt: packages preinstalled on Deploy (thebe.packages)."""
+        card, layout = self._card("Python packages")
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.packages_label = self._label(name="hint", wrap=True, selectable=True)
+        self.packages_choose = self._button(
+            "Choose requirements.txt…", "smallButton", self.choose_requirements,
+            "Copy a pip requirements file into the project; the next Deploy installs its packages")
+        row.addWidget(self.packages_label, 1)
+        row.addWidget(self.packages_choose, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(row)
+        self.packages_error = self._label(name="errorText", wrap=True)
+        self.packages_error.hide()
+        layout.addWidget(self.packages_error)
         return card
 
     def _build_actions(self) -> QHBoxLayout:
@@ -884,6 +904,64 @@ class MainWindow(QMainWindow):
                      "Empty rows are unused."]
         self.imports_plan.setText("\n".join(lines))
 
+    # -- python packages (the project's requirements.txt) -------------------------
+
+    def requirements_path(self) -> Path:
+        return requirements_file(self._environ)
+
+    def _refresh_packages(self) -> None:
+        check = check_requirements(self.requirements_path())
+        if not check.exists:
+            text = (f"No {check.path}: Deploy installs nothing extra. Choose a pip requirements file to have "
+                    "its packages (e.g. opencv-python, torch) installed into the custom packages environment "
+                    "on every Deploy.")
+        elif check.problems:
+            text = f"{check.path} is refused, so Deploy is too:"
+        elif not check.packages:
+            text = f"{check.path} lists no packages: Deploy installs nothing extra."
+        else:
+            text = (f"{check.path}: {check.packages} package line(s), installed on every Deploy into the custom "
+                    "packages environment (the Dependencies page shows them). Unchanged, they are skipped.")
+        self.packages_label.setText(text)
+        self.packages_error.setText("\n".join(check.problems))
+        self.packages_error.setVisible(bool(check.problems))
+
+    def choose_requirements(self, *_args: object) -> None:
+        """Pick a requirements file and copy it to the project's requirements.txt."""
+        if self._busy:
+            return
+        dest = self.requirements_path()
+        start = str(dest.parent if dest.parent.is_dir() else Path.home())
+        chosen, _filter = QFileDialog.getOpenFileName(self, "Requirements file to install on Deploy", start,
+                                                      "Requirements (*.txt);;All files (*)")
+        if not chosen:
+            return
+        source = Path(chosen)
+        try:
+            differs = dest.exists() and dest.read_bytes() != source.read_bytes()
+        except OSError:
+            differs = True
+        if differs:
+            answer = QMessageBox.question(
+                self, APP_NAME,
+                f"Replace {dest} with a copy of {source}?\n\nThe next Deploy installs the new list. Packages only "
+                "the old list had stay installed until Reset & reinstall on the Dependencies page.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            check = copy_requirements(source, dest)
+        except CopyRefused as exc:
+            self.log(f"# {exc}", *(f"#   {problem}" for problem in exc.problems))
+            self._banner("error", str(exc))
+            QMessageBox.critical(self, APP_NAME, "\n".join([str(exc), "", *(f"• {p}" for p in exc.problems)]).strip())
+        else:
+            message = (f"Copied {source} to {dest} ({check.packages} package line(s)). "
+                       "Deploy installs them into the custom packages environment.")
+            self.log(f"# {message}")
+            self._banner("success", message)
+        self._refresh_packages()
+
     # -- view -----------------------------------------------------------------
 
     def _refresh_view(self) -> None:
@@ -948,6 +1026,7 @@ class MainWindow(QMainWindow):
         for row in self.import_rows:
             for widget in (row.path, row.browse, row.name):
                 widget.setEnabled(idle)
+        self.packages_choose.setEnabled(idle)
         active = self._any_active()
         known = self.docker_problem == ""
         self.start_button.setText("Restart" if active else "Start")
@@ -1116,7 +1195,9 @@ class MainWindow(QMainWindow):
         """Validate, re-detect Tailscale, refresh `compose ps`, check ports, save .env, run `install`."""
         if self._busy:
             return
-        errors = validate_settings(self.form_values(commit=True), self.themes or None) + self.import_problems()
+        self._refresh_packages()
+        errors = (validate_settings(self.form_values(commit=True), self.themes or None) + self.import_problems()
+                  + check_requirements(self.requirements_path()).problems)
         if errors:
             self._refuse(errors)
             return

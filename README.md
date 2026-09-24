@@ -35,6 +35,7 @@ share one `config.yaml` and keep their own dependencies in a project-local `.ven
 - [Persistence](#persistence)
 - [Statistics dashboard](#statistics-dashboard)
 - [Dependencies page](#dependencies-page)
+- [Python packages: three layers](#python-packages-three-layers)
 - [Themes](#themes)
 - [GPU support](#gpu-support)
 - [Security model](#security-model)
@@ -131,7 +132,9 @@ It is safe to run again at any time. `install`:
 10. Hashes the password with argon2 **inside the image** — only when it changed — writes the secrets
     and creates the package-runner token once.
 11. Starts the containers and waits until all of them report healthy.
-12. Prints the URLs.
+12. Installs the packages of the project's `requirements.txt`, if there is one
+    ([three layers](#python-packages-three-layers)); unchanged, it is skipped.
+13. Prints the URLs.
 
 When the host step is needed and there is no terminal to ask for the `sudo` password, the script
 prints the command to run instead, for example:
@@ -291,6 +294,7 @@ The window follows the desktop's light or dark mode, using the same oya palette 
 | Services | A state dot and badge for JupyterLab and Statistics (Running, Starting, Unhealthy, Restarting, Stopped, Not deployed, Disabled), refreshed every 4 seconds, with the deployed URL and an **Open** button that starts the browser. |
 | Page links | Under Statistics: **Dependencies**, **Stats API** and **Health** open those pages directly, so no address has to be typed. Like Open, they are enabled while the container runs and always use the deployed address and port. |
 | Imported directories | Up to 7 host directories (path, **Browse…**, optional name) copied into the workspace on Deploy; see [Imported directories](#imported-directories). Only the filled rows and one empty row are shown; an empty row is an unused slot. The card lists what goes where and any problem (missing directory, same name twice, the workspace itself). |
+| Python packages | Shows the project's `requirements.txt` (packages preinstalled on Deploy; [three layers](#python-packages-three-layers)) and whether it is accepted. **Choose requirements.txt…** copies a pip requirements file you pick into its place: only a file the Dependencies page would accept, byte for byte (a real copy, no link), replacing an existing one only after asking. The next Deploy installs it. |
 | **Deploy / Update** | Validates, saves `config.yaml` and the installer's `.env`, copies the imported directories (`run.py import`, when any are set), then runs `install`: builds the images and starts the containers. Changed passwords or ports recreate only the affected containers. |
 | **Start / Restart** | `start` when nothing is running, otherwise `restart`. |
 | **Stop** | `stop` (`docker compose stop`). |
@@ -485,7 +489,7 @@ docker compose logs -f jupyterlab
 | Notebooks and files | `~/jupyter-workspace` (bind mount at `/workspace`) | yes | no (only with `--delete-workspace`) |
 | Copies of [imported directories](#imported-directories) | `~/jupyter-workspace/imported/<name>/` | yes (updated on Deploy) | no (only with `--delete-workspace`) |
 | JupyterLab settings, workspace layouts, IPython history, login cookie secret | Docker volume `jupyterlab-tailscale_jupyter_state` (`/state`) | yes | yes |
-| Packages from the Dependencies page (the venv, its requirements file and the last job log) | Docker volume `jupyterlab-tailscale_custom_packages` (`/opt/custom`, read-only in `jupyterlab`) | yes | yes |
+| Custom packages: the venv, the page's requirements, the deployed copy of `requirements.txt` with the record of its last install, and the last job log | Docker volume `jupyterlab-tailscale_custom_packages` (`/opt/custom`, read-only in `jupyterlab`) | yes | yes |
 | pip download cache of the package runner | Docker volume `jupyterlab-tailscale_pip_cache` | yes | yes |
 | Settings | `<repo>/.env` | yes | no |
 | Anything else inside a container (e.g. `%pip install` from a notebook) | container filesystem | **no** | yes |
@@ -577,6 +581,63 @@ them or when they would reach outside the package environment:
 
 The page and the runner exist only while statistics are enabled. Installed packages stay in their
 volume when statistics are switched off and notebooks keep using them.
+
+The page also shows the project's `requirements.txt` read-only (**Project requirements**, with whether
+it is installed); see [the next section](#python-packages-three-layers).
+
+## Python packages: three layers
+
+| Layer | Where it is declared | Installed | Changing it |
+| --- | --- | --- | --- |
+| **1. Base image** | `stack/jupyter/requirements.lock.txt` (JupyterLab, numpy, pandas, matplotlib, scipy, ipywidgets, …) | into the image, at build time | edit the lock and `update` (rebuilds the image) |
+| **2. Project `requirements.txt`** | `<repo>/requirements.txt` (optional; `JLT_REQUIREMENTS_FILE` elsewhere); in the builder, **Choose requirements.txt…** copies one in | into the custom packages environment on every `install` / `update`, Deploy in the builder and `./run.sh install` / `update` | edit the file and deploy again — no image rebuild |
+| **3. Dependencies page** | the page's editor (stored in the `custom_packages` volume) | into the same environment, when you press **Install / update** | on the page |
+
+Layers 2 and 3 are one environment — the virtualenv in the `custom_packages` volume that the
+Dependencies page manages — installed by one pip job in the `deps` runner, with the same rules:
+
+```text
+# <repo>/requirements.txt: a normal pip requirements file (validated like the page's editor)
+opencv-python
+pytesseract
+requests
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+```
+
+- **The file is the source of truth.** It is not copied into `config.yaml` or `.env`; each deploy hands
+  it to the runner, which keeps the last deployed copy next to the environment (shown on the page).
+  No file, or one without packages, installs nothing extra.
+- **Checked first.** `./run.sh` and the builder refuse a file the page would refuse (with line numbers),
+  and the script checks it again with the image's runner right after the build, before any container
+  is recreated. `-r`, `-c`, `-e`, `--target`, `--prefix`, `--root`, `--user`, `--src`, `${VARS}` and the
+  other refused lines are listed [above](#dependencies-page).
+- **Installed before "ready".** After the containers are healthy and before the script prints its
+  summary, the runner installs the file together with the page's list, in one `pip install`, so the two
+  can never disagree. With statistics on, the running runner does it and the page shows the job live;
+  with statistics off, a one-off runner container does.
+- **Option lines apply to both lists.** Because they are one `pip install`, an `--index-url`,
+  `--extra-index-url`, `--no-index` or `--find-links` line in either file applies to every package in
+  both; prefer `--extra-index-url` (as in the torch example) over replacing the index.
+- **Skipped when nothing changed.** The runner records what each job installed. A deploy with the same
+  file, the same image and a finished last install checks with pip (offline, dry run) that nothing is
+  missing and then skips the install. A changed file, a rebuilt image with other pins, a failed or
+  interrupted install, or packages missing from the volume install again.
+- **The image's packages stay.** pip runs with the image's `pip freeze` as constraints, so a line that
+  needs another version of JupyterLab, numpy, pandas or any other image package fails (the deploy
+  names the conflicting requirement) instead of replacing it.
+- **Failures keep the working environment.** pip resolves, downloads and builds everything before it
+  changes the environment, so an unknown package, a conflict or a build error leaves the packages
+  installed before, and the deploy stops with pip's error lines. Nothing is ever deleted
+  automatically. The full log stays on the Dependencies page.
+- **Downloads are reused.** Every job uses pip's cache in the `pip_cache` volume; large wheels such as
+  torch are downloaded once. The deploy prints the size of the environment, of the cache and the free
+  disk.
+- **Persistent.** The environment, the deployed copy of the file and the record of the last install live
+  in volumes and survive `update` and container recreation; `uninstall` removes them.
+- **Removing lines does not uninstall.** Packages dropped from the file (or the page) stay until **Reset &
+  reinstall** on the page, which rebuilds the environment from both lists.
+- Kernels see new packages after a restart (*Kernel → Restart Kernel*).
 
 ## Themes
 
@@ -804,6 +865,12 @@ script names the file it found). With `NVIDIA='auto'`, `start` notices this with
 and starts without the GPU meanwhile; to run without NVIDIA for good, untick **NVIDIA GPU** in the
 builder, set `nvidia: false` in `config.yaml` or `NVIDIA='0'` in `.env`, and deploy again.
 
+**A deploy stops with "The packages from …/requirements.txt were not installed".** pip's error lines
+above name the requirement: a package or version that does not exist, a conflict with a package the
+image pins (e.g. `numpy==1.26` while the image has 2.5.3), or a build that failed. JupyterLab keeps
+running with the packages installed before. Fix the file and run `update` (or Deploy) again; the
+Dependencies page shows the full log.
+
 **"No space left on device".** Use **Clear download cache** on the Dependencies page, or **Reset &
 reinstall** with fewer packages; `docker builder prune` removes Docker's build cache (for all
 projects).
@@ -837,7 +904,9 @@ run-builder.sh                     creates .venv with the pinned PyQt6 and start
 run.py, run.sh                     headless runner: deploy and run from config.yaml without the GUI
 thebe/                             Qt-free core shared by both: settings and validation, config.yaml,
                                    stack state (Tailscale, compose ps), theme tokens, the runner's CLI,
-                                   imports.py (copying host directories into the workspace)
+                                   imports.py (copying host directories into the workspace),
+                                   packages.py (checking requirements.txt with the package runner's rules)
+requirements.txt                   optional: your Jupyter packages, installed on install/update (not in the repository)
 lib/venv.sh                        the project-local .venv bootstrap used by run.sh and run-builder.sh
 requirements-run.txt               PyYAML pin (run.sh and the builder)
 requirements-builder.txt           PyQt6 pins for the builder venv (includes requirements-run.txt)

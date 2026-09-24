@@ -20,6 +20,7 @@ from thebe.config import (
     Config, ConfigError, config_from_settings, effective_workspace, load_config, make_private, save_config,
 )
 from thebe.imports import ImportFailed, PlannedImport, default_workspace, plan_imports, run_imports
+from thebe.packages import check_requirements, requirements_file
 from thebe.settings import DEFAULTS, Paths, SettingsError, absolute_path, save_settings, validate_settings
 from thebe.stack import child_environment
 from thebe.theme import available_themes
@@ -161,6 +162,15 @@ def copy_imports(paths: Paths, config: Config, plans: list[PlannedImport], envir
     return True
 
 
+def packages_ok(environ: Mapping[str, str], say: Output) -> bool:
+    """requirements.txt passes the package runner's rules (the installer checks it again)."""
+    check = check_requirements(requirements_file(environ))
+    if check.problems:
+        say.error("requirements.txt is not accepted (the Dependencies page's rules):\n"
+                  + "\n".join(f"  - {p}" for p in check.problems))
+    return not check.problems
+
+
 def show_config(paths: Paths, config: Config, environ: Mapping[str, str], say: Output) -> None:
     s = config.settings
     workspace = effective_workspace(config, paths.config_file, environ)
@@ -180,6 +190,7 @@ def show_config(paths: Paths, config: Config, environ: Mapping[str, str], say: O
     for item in config.imports:
         print(f"  {'Import:':<12} {item.path} -> imported/{item.name or Path(item.path).expanduser().name}/",
               file=say.out)
+    print(f"  {'Packages:':<12} {check_requirements(requirements_file(environ)).summary()}", file=say.out)
     if s["JUPYTER_PASSWORD"] == DEFAULTS["JUPYTER_PASSWORD"]:
         say.warn(f"The default password is in use. Change jupyter.password in {paths.config_file}.")
 
@@ -213,6 +224,8 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
         if config is None:
             return EXIT_CONFIG
         show_config(paths, config, environ, say)
+        if not packages_ok(environ, say):
+            return EXIT_CONFIG
         say.info("The configuration is valid.")
         return 0
     if command == "import":
@@ -245,7 +258,7 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
     deploying = command in ("install", "update")
     # Checked before anything is written; copied before the installer starts JupyterLab.
     plans = plan_config_imports(paths, config, environ, say) if deploying else []
-    if plans is None:
+    if plans is None or (deploying and not packages_ok(environ, say)):
         return EXIT_CONFIG
     try:
         save_settings(paths.settings, config.settings)
