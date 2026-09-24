@@ -1,0 +1,4 @@
+node_modules/
+lib/
+thebe_ai_cell/
+*.tsbuildinfo

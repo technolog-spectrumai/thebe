@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Mapping, Sequence, TextIO
 
+from thebe.ai import ai_file, describe, save_ai_file
 from thebe.config import (
     Config, ConfigError, config_from_settings, effective_workspace, load_config, make_private, save_config,
 )
@@ -112,7 +113,7 @@ def installer_environment(paths: Paths, config: Config | None, environ: Mapping[
         workspace = effective_workspace(config, paths.config_file, environ)
         if workspace is not None:
             overrides["JLT_WORKSPACE_DIR"] = str(workspace)
-        secrets = [config.settings["JUPYTER_PASSWORD"]]
+        secrets = [config.settings["JUPYTER_PASSWORD"], *(p.api_key for p in (config.ai.providers if config.ai else ()))]
     else:
         secrets = []
     env = child_environment(environ, secrets, overrides, plain=False)
@@ -171,6 +172,19 @@ def packages_ok(environ: Mapping[str, str], say: Output) -> bool:
     return not check.problems
 
 
+def write_ai_settings(paths: Paths, config: Config, say: Output) -> bool:
+    """The installer's AI settings (.ai.json, with the keys) from the ai: section, or none when off."""
+    path = ai_file(paths.settings)
+    try:
+        on = save_ai_file(path, config.ai)
+    except OSError as exc:
+        say.error(f"Could not write {path}: {exc.strerror or exc}")
+        return False
+    if on:
+        say.info(f"AI settings written to {path} (mode 600); install and update apply them")
+    return True
+
+
 def show_config(paths: Paths, config: Config, environ: Mapping[str, str], say: Output) -> None:
     s = config.settings
     workspace = effective_workspace(config, paths.config_file, environ)
@@ -184,6 +198,7 @@ def show_config(paths: Paths, config: Config, environ: Mapping[str, str], say: O
         ("HTTPS", s["HTTPS"]),
         ("NVIDIA GPU", {"1": "expected", "0": "off", "auto": "auto (used when it works)"}.get(s["NVIDIA"], s["NVIDIA"])),
         ("Workspace", str(workspace) if workspace else "~/jupyter-workspace (the installer's default)"),
+        ("AI", describe(config.ai)),
     )
     for label, value in rows:
         print(f"  {label + ':':<12} {value}", file=say.out)
@@ -266,6 +281,8 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
         say.error("\n".join([str(exc), *(f"  - {p}" for p in exc.problems)]))
         return EXIT_CONFIG
     say.info(f"Settings written to {paths.settings} (mode 600)")
+    if not write_ai_settings(paths, config, say):
+        return EXIT_CONFIG
     if plans and not copy_imports(paths, config, plans, environ, say):
         return 1
     return run_installer(paths, command, args, installer_environment(paths, config, environ))

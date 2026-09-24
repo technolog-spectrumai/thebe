@@ -15,6 +15,7 @@ from typing import Callable, Mapping
 
 import yaml
 
+from thebe.ai import AiConfig, parse_ai, render_ai
 from thebe.imports import ImportDir, parse_import_dirs, render_import_dirs
 from thebe.settings import (
     DEFAULTS, HTTPS_MODES, SPACE_CHARS, absolute_path, check_port, has_control, load_settings_file,
@@ -32,6 +33,10 @@ class Config:
     workspace: str = ""
     # Host directories copied into <workspace>/imported/ on install and Deploy (thebe.imports).
     imports: list[ImportDir] = field(default_factory=list)
+    # AI code generation (thebe.ai); None: no ai: section, or one with problems (ai_problems).
+    ai: AiConfig | None = None
+    # Problems of the ai: section. The file is then never rewritten: that would drop the section.
+    ai_problems: list[str] = field(default_factory=list)
 
 
 class ConfigError(Exception):
@@ -94,7 +99,7 @@ SETTING_FIELDS: tuple[tuple[tuple[str, ...], str, Converter], ...] = (
     (("nvidia",), "NVIDIA", _as_nvidia),
 )
 # Top-level keys that are not installer settings.
-OTHER_KEYS = ("workspace", "import_dirs")
+OTHER_KEYS = ("workspace", "import_dirs", "ai")
 
 
 def _known_keys() -> dict[str, set[str] | None]:
@@ -171,6 +176,8 @@ def parse_config(text: str, base_dir: Path) -> tuple[Config, list[str]]:
                 config.workspace = workspace
     config.imports, import_problems = parse_import_dirs(data.get("import_dirs"))
     problems += import_problems
+    config.ai, config.ai_problems = parse_ai(data.get("ai"))
+    problems += config.ai_problems
     return config, problems
 
 
@@ -250,11 +257,16 @@ def render_config(config: Config) -> str:
         "#   - path: \"/opt/lab/tools\"",
         "#     name: \"lab-tools\"",
         *render_import_dirs(config.imports, _scalar),
+        "",
+        *render_ai(config.ai, _scalar),
     ]
     return "\n".join(lines) + "\n"
 
 
 def save_config(path: Path, config: Config) -> None:
+    if config.ai_problems:
+        # Rendering would write the file without its ai: section, and so without the keys.
+        raise ValueError("config.yaml is not rewritten while its ai: section has problems")
     write_private_file(path, render_config(config))
 
 
