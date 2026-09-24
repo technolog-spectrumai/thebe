@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # One Dockerfile, three images: target `jupyterlab` (notebook server, also used by the `deps`
-# package runner), target `stats` (dashboard) and target `ai` (AI gateway). The build context is the app dir, i.e. a
+# package runner), target `stats` (dashboard) and target `ai` (AI gateway). The stages
+# `jupyterlab-core` and `labextension` only build the AI cell button for the jupyterlab image. The build context is the app dir, i.e. a
 # copy of stack/; compose.yaml picks the target for each service.
 
 ARG PYTHON_IMAGE=python:3.13-slim-trixie
@@ -26,6 +27,34 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN groupadd --gid "${JLT_GID}" --non-unique jupyter \
  && useradd --uid "${JLT_UID}" --gid "${JLT_GID}" --non-unique --no-log-init \
         --create-home --home-dir /home/jupyter --shell /bin/bash jupyter
+
+
+# JupyterLab's core package metadata (staging/package.json) from the pinned jupyterlab wheel:
+# which shared packages, at which versions, the prebuilt extension below must use.
+FROM base AS jupyterlab-core
+RUN --mount=type=bind,source=jupyter/requirements.lock.txt,target=/tmp/requirements.lock.txt \
+    grep -E '^jupyterlab==' /tmp/requirements.lock.txt > /tmp/jupyterlab.txt \
+ && pip download --no-cache-dir --no-deps --only-binary=:all: -d /tmp/wheel -r /tmp/jupyterlab.txt \
+ && python -c 'import glob, zipfile; zipfile.ZipFile(glob.glob("/tmp/wheel/*.whl")[0]).extract("jupyterlab/staging/package.json", "/tmp/core")' \
+ && cp /tmp/core/jupyterlab/staging/package.json /core-package.json
+
+
+# The AI button in the cell toolbar (jupyter/labextension, TypeScript) as a prebuilt JupyterLab
+# extension. Node and the npm packages stay in this stage: the jupyterlab image only gets the
+# built files (about 60 KB), which JupyterLab loads without Node or a rebuild.
+FROM node:22-trixie-slim AS labextension
+WORKDIR /build
+COPY jupyter/labextension/package.json jupyter/labextension/package-lock.json ./
+# Exactly the versions of package-lock.json; no install script of any npm package runs.
+RUN npm ci --no-audit --no-fund --ignore-scripts
+COPY jupyter/labextension/tsconfig.json ./
+COPY jupyter/labextension/src/ src/
+COPY jupyter/labextension/schema/ schema/
+COPY --from=jupyterlab-core /core-package.json /tmp/core-package.json
+# What `jupyter labextension build .` runs, without needing Python in this stage.
+RUN npx tsc \
+ && node node_modules/@jupyter/builder/lib/build-labextension.js --core-package-file /tmp/core-package.json /build \
+ && test -f thebe_ai_cell/labextension/package.json
 
 
 FROM base AS jupyterlab
@@ -62,6 +91,10 @@ COPY --chmod=u=rwX,go=rX jupyter/kernel_launcher.py jupyter/deps_runner.py jupyt
      jupyter/jupyter_healthcheck.py /srv/jupyter/
 # The %%ai magic, loaded into every kernel by kernel_launcher.py.
 COPY --chmod=u=rwX,go=rX jupyter/kernel/thebe_ai.py /srv/jupyter/kernel/
+# The AI button in the cell toolbar, built above. JupyterLab finds prebuilt extensions in
+# <prefix>/share/jupyter/labextensions.
+COPY --from=labextension --chmod=u=rwX,go=rX /build/thebe_ai_cell/labextension/ \
+     /usr/local/share/jupyter/labextensions/thebe-ai-cell/
 
 # Mount points owned by the container user: Docker initialises an empty named volume
 # with the ownership of the image directory it is mounted over (custom_packages at
@@ -81,6 +114,7 @@ RUN test -r /srv/jupyter/jupyter_server_config.py \
  && test -r /srv/jupyter/deps_healthcheck.py \
  && test -r /srv/jupyter/jupyter_healthcheck.py \
  && test -r /srv/jupyter/kernel/thebe_ai.py \
+ && jupyter labextension list 2>&1 | grep -Eq 'thebe-ai-cell v[0-9.]+ .*enabled.*OK' \
  && test -w /opt/custom && test -w /var/cache/pip \
  && python -c 'import json; spec = json.load(open("/usr/local/share/jupyter/kernels/python3/kernel.json")); open(spec["argv"][2]).close(); assert "PYTHONPATH" not in spec["env"]'
 WORKDIR /workspace

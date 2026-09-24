@@ -87,6 +87,18 @@ class InstallerAiTests(unittest.TestCase):
         self.assertEqual(self.runtime_env(1, 1)["AI_CONFIG_HASH"], f"'{'a' * 64}'")
         self.assertEqual((self.runtime_env(1, 1)["AI_ENABLED"], self.runtime_env(1, 0)["AI_ENABLED"]), ("'1'", "'0'"))
 
+    def test_a_local_node_modules_is_never_copied_into_the_app_dir(self):
+        src = self.root / "src"
+        (src / "labextension" / "node_modules" / "pkg").mkdir(parents=True)
+        (src / "labextension" / "node_modules" / "pkg" / "index.js").write_text("x")
+        (src / "labextension" / "package.json").write_text("{}")
+        dst = self.root / "dst"
+        dst.mkdir()
+        result = self.run_step(f"copy_tree {shlex.quote(str(src))} {shlex.quote(str(dst))}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((dst / "labextension" / "package.json").is_file())
+        self.assertFalse((dst / "labextension" / "node_modules").exists())
+
     def test_deploy_order_and_the_other_commands_know_the_ai_profile(self):
         text = INSTALLER.read_text()
         deploy = text[text.index("\ndeploy() {"):text.index("\nload_runtime_env() {")]

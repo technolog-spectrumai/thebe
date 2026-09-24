@@ -1133,7 +1133,7 @@ copy_tree() {
     else
       install -m 644 -- "$path" "$dst/$rel" || return 1
     fi
-  done < <(find "$src" -mindepth 1 \( -name __pycache__ -o -name '*.pyc' \) -prune -o \( -type d -o -type f \) -print0)
+  done < <(find "$src" -mindepth 1 \( -name __pycache__ -o -name '*.pyc' -o -name node_modules \) -prune -o \( -type d -o -type f \) -print0)
 }
 
 # The running stack is a snapshot of stack/: editing the repo changes nothing until update.
@@ -1161,7 +1161,7 @@ sync_stack() {
   if [[ -f "$STACK_DIR/.dockerignore" ]]; then
     ignore="$(<"$STACK_DIR/.dockerignore")"$'\n'
   fi
-  ignore+=$'# Added by setup-jupyterlab-tailscale.sh\nsecrets\n.env\n.sync-*\n**/__pycache__\n'
+  ignore+=$'# Added by setup-jupyterlab-tailscale.sh\nsecrets\n.env\n.sync-*\n**/__pycache__\n**/node_modules\n'
   write_file_atomic "$APP_DIR/.dockerignore" 644 "$ignore"
 }
 
