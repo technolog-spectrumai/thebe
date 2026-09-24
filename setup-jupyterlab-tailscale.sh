@@ -2788,6 +2788,10 @@ Environment overrides:
   JLT_GPU             auto | on | off            (overrides NVIDIA for install/update)
   JLT_TLS_DIR         certificate directory, for tests only; host-setup always writes
                       ${DEFAULT_TLS_DIR}
+
+AI (optional): .ai.json next to the settings file holds the AI settings with the API keys. run.sh
+and the builder write it from config.yaml's ai: section (and delete it when AI is off); install
+and update hand it to the ai container (the AI gateway) only.
 EOF
 }
 
