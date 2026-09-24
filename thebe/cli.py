@@ -13,11 +13,13 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Mapping, Sequence, TextIO
 
 from thebe.config import (
     Config, ConfigError, config_from_settings, effective_workspace, load_config, make_private, save_config,
 )
+from thebe.imports import ImportFailed, PlannedImport, default_workspace, plan_imports, run_imports
 from thebe.settings import DEFAULTS, Paths, SettingsError, absolute_path, save_settings, validate_settings
 from thebe.stack import child_environment
 from thebe.theme import available_themes
@@ -42,6 +44,7 @@ Commands:
   logs [...]   container logs (--no-follow, service names)
   uninstall [...]  remove the deployment (--yes, --delete-workspace)
   check        check config.yaml and show what would be deployed; changes nothing
+  import       copy the import_dirs into <workspace>/imported/ (install and update do it too)
   init         write config.yaml (from the current settings file, else the defaults) if it is missing
 
 config.yaml: JLT_CONFIG_FILE, else next to the settings file (<repo>/config.yaml).
@@ -131,6 +134,33 @@ def run_installer(paths: Paths, command: str, args: Sequence[str], env: Mapping[
     return 128 - code if code < 0 else code
 
 
+def import_workspace(paths: Paths, config: Config, environ: Mapping[str, str]) -> Path:
+    """The workspace the installer will mount, which the imports are copied into."""
+    return effective_workspace(config, paths.config_file, environ) or default_workspace()
+
+
+def plan_config_imports(paths: Paths, config: Config, environ: Mapping[str, str],
+                        say: Output) -> list[PlannedImport] | None:
+    """The checked import plan, or None after reporting why nothing can be copied."""
+    plans, problems = plan_imports(config.imports, paths.config_file.parent, import_workspace(paths, config, environ))
+    if problems:
+        say.error("Cannot copy the import_dirs of {}:\n{}".format(
+            paths.config_file, "\n".join(f"  - {p}" for p in problems)))
+        return None
+    return plans
+
+
+def copy_imports(paths: Paths, config: Config, plans: list[PlannedImport], environ: Mapping[str, str],
+                 say: Output) -> bool:
+    """Copy the planned directories into the workspace; False after reporting a failure."""
+    try:
+        run_imports(plans, import_workspace(paths, config, environ), say.info)
+    except ImportFailed as exc:
+        say.error(str(exc))
+        return False
+    return True
+
+
 def show_config(paths: Paths, config: Config, environ: Mapping[str, str], say: Output) -> None:
     s = config.settings
     workspace = effective_workspace(config, paths.config_file, environ)
@@ -147,6 +177,9 @@ def show_config(paths: Paths, config: Config, environ: Mapping[str, str], say: O
     )
     for label, value in rows:
         print(f"  {label + ':':<12} {value}", file=say.out)
+    for item in config.imports:
+        print(f"  {'Import:':<12} {item.path} -> imported/{item.name or Path(item.path).expanduser().name}/",
+              file=say.out)
     if s["JUPYTER_PASSWORD"] == DEFAULTS["JUPYTER_PASSWORD"]:
         say.warn(f"The default password is in use. Change jupyter.password in {paths.config_file}.")
 
@@ -182,6 +215,17 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
         show_config(paths, config, environ, say)
         say.info("The configuration is valid.")
         return 0
+    if command == "import":
+        config = read_config(paths, say)
+        if config is None:
+            return EXIT_CONFIG
+        plans = plan_config_imports(paths, config, environ, say)
+        if plans is None:
+            return EXIT_CONFIG
+        if not plans:
+            say.info(f"No import_dirs in {paths.config_file}; nothing to copy.")
+            return 0
+        return 0 if copy_imports(paths, config, plans, environ, say) else 1
     if command in PASSING:
         # The workspace still matters here (uninstall --delete-workspace), so a readable config counts.
         config = read_config(paths, say, strict=False) if paths.config_file.exists() else None
@@ -198,12 +242,19 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
     if config is None:
         return EXIT_CONFIG
     show_config(paths, config, environ, say)
+    deploying = command in ("install", "update")
+    # Checked before anything is written; copied before the installer starts JupyterLab.
+    plans = plan_config_imports(paths, config, environ, say) if deploying else []
+    if plans is None:
+        return EXIT_CONFIG
     try:
         save_settings(paths.settings, config.settings)
     except SettingsError as exc:
         say.error("\n".join([str(exc), *(f"  - {p}" for p in exc.problems)]))
         return EXIT_CONFIG
     say.info(f"Settings written to {paths.settings} (mode 600)")
+    if plans and not copy_imports(paths, config, plans, environ, say):
+        return 1
     return run_installer(paths, command, args, installer_environment(paths, config, environ))
 
 

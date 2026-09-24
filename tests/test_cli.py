@@ -179,6 +179,76 @@ class CliTests(unittest.TestCase):
         self.assertEqual(parse_settings(self.settings.read_text())["THEME"], "spectre")
         self.assertFalse(self.config.exists())
 
+    def import_config(self, *entries):
+        self.workspace = self.root / "ws"
+        lines = [f'workspace: "{self.workspace}"', "import_dirs:"] + [f"  - {entry}" for entry in entries]
+        self.config.write_text("\n".join(lines) + "\n")
+
+    def test_install_copies_the_imports_before_the_installer(self):
+        tools = self.root / "host" / "tools"
+        (tools / "sub").mkdir(parents=True)
+        (tools / "sub" / "a.py").write_text("a")
+        (tools / "link").symlink_to(tools / "sub")
+        self.import_config(f'"{tools}"')
+        (self.state / "rc").write_text("0")
+        self.installer.write_text(self.installer.read_text().replace(
+            "env -0", f"ls {self.root}/ws/imported/tools/sub > {self.state}/seen; env -0"))
+        code, out, err = self.run_cli("install")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.state / "seen").read_text(), "a.py\n")       # copied before install ran
+        self.assertIn(f"Import:      {tools} -> imported/tools/", out)
+        self.assertIn(f"{tools} -> imported/tools/", out)
+        self.assertIn(f"link: symbolic link to {tools / 'sub'}", out)
+        self.assertFalse((self.workspace / "imported" / "tools" / "link").exists())
+        self.assertEqual(self.installer_env()["JLT_WORKSPACE_DIR"], str(self.workspace))
+        # start does not copy; update does.
+        (tools / "sub" / "b.py").write_text("b")
+        self.run_cli("start")
+        self.assertFalse((self.workspace / "imported" / "tools" / "sub" / "b.py").exists())
+        self.run_cli("update")
+        self.assertTrue((self.workspace / "imported" / "tools" / "sub" / "b.py").exists())
+        self.assertEqual(self.calls(), ["install", "start", "update"])
+
+    def test_invalid_imports_change_nothing(self):
+        (self.root / "host" / "a" / "tools").mkdir(parents=True)
+        (self.root / "host" / "b" / "tools").mkdir(parents=True)
+        self.import_config(f'"{self.root}/host/a/tools"', f'"{self.root}/host/b/tools"', f'"{self.root}/missing"')
+        code, out, err = self.run_cli("install")
+        self.assertEqual(code, cli.EXIT_CONFIG)
+        self.assertIn("would both be copied to imported/tools", err)
+        self.assertIn("does not exist", err)
+        self.assertFalse(self.settings.exists())
+        self.assertFalse(self.workspace.exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_a_failed_copy_stops_before_the_installer(self):
+        tools = self.root / "host" / "tools"
+        tools.mkdir(parents=True)
+        self.import_config(f'"{tools}"')
+        (self.workspace / "imported" / "tools").mkdir(parents=True)            # not made by Thebe
+        code, out, err = self.run_cli("install")
+        self.assertEqual(code, 1)
+        self.assertIn("already exists and was not made by Thebe", err)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_import_command(self):
+        code, out, err = self.run_cli("import")
+        self.assertEqual(code, cli.EXIT_CONFIG)                               # no config.yaml yet
+        tools = self.root / "host" / "tools"
+        tools.mkdir(parents=True)
+        (tools / "t.sh").write_text("t")
+        self.import_config()
+        self.config.write_text(self.config.read_text().replace("import_dirs:", "import_dirs: []"))
+        code, out, err = self.run_cli("import")
+        self.assertEqual(code, 0, err)
+        self.assertIn("nothing to copy", out)
+        self.import_config(f'{{path: "{tools}", name: "my tools"}}')
+        code, out, err = self.run_cli("import")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.workspace / "imported" / "my tools" / "t.sh").read_text(), "t")
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.settings.exists())
+
 
 class RunShTests(unittest.TestCase):
     PYTHON = "/usr/bin/python3"
