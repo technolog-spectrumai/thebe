@@ -1247,6 +1247,37 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), raw)
         self.assertEqual(self.calls("installer"), [])
 
+    def test_the_nvidia_checkbox(self):
+        # auto stays auto while the checkbox is untouched; the checkbox shows whether a driver exists.
+        window = self.window()
+        self.assertFalse(window.nvidia_check.isChecked())          # no nvidia-smi on the stub PATH
+        self.assertIn("Auto", window.nvidia_hint.text())
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertEqual(builder.parse_settings(self.settings.read_text())["NVIDIA"], "auto")
+        self.assertEqual(builder.load_config(self.config)[0].settings["NVIDIA"], "auto")
+
+        self.config.unlink()
+        self._script(self.bin / "nvidia-smi", "echo GPU 0")
+        window = self.window(environ=dict(os.environ, JLT_GPU="off"))
+        self.assertTrue(window.nvidia_check.isChecked())
+        window.nvidia_check.click()                                 # unticked: never use a GPU
+        self.assertIn("Off", window.nvidia_hint.text())
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertEqual(builder.parse_settings(self.settings.read_text())["NVIDIA"], "0")
+        self.assertNotIn("JLT_GPU", self.installer_env())
+
+        self.config.write_text("nvidia: true\n")
+        window = self.window()
+        self.assertTrue(window.nvidia_check.isChecked())
+        self.assertIn("Expected", window.nvidia_hint.text())
+        window.nvidia_check.click()
+        window.nvidia_check.click()
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertEqual(builder.load_config(self.config)[0].settings["NVIDIA"], "1")
+
     def test_statistics_disabled_is_saved(self):
         window = self.window()
         window.stats_check.setChecked(False)

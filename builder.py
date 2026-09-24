@@ -379,6 +379,7 @@ class MainWindow(QMainWindow):
         self._root_step: list[str] | None = None
         self._after_certificate = False    # this install follows a host step that issued a certificate
         self._success_note = ""
+        self._nvidia_auto = True     # NVIDIA='auto' until the checkbox is clicked (_fill_form)
         self._tail: list[str] = []   # last output lines, for failure messages
         self._after_tailscale: Callable[[], None] | None = None
         self._after_status: Callable[[], None] | None = None
@@ -545,6 +546,12 @@ class MainWindow(QMainWindow):
         self.stats_port = PortSpinBox()
         self.stats_user_label = self._label(name="hint")
         self.stats_user_label.setToolTip("The dashboard asks for this username and the password above (HTTP Basic).")
+        self.nvidia_check = QCheckBox("Expect an NVIDIA GPU")
+        self.nvidia_check.setToolTip("Ticked: the notebooks get the NVIDIA GPU, and Deploy and Start stop with the reason "
+                                     "when Docker cannot hand it over. Unticked: never use a GPU (machines without "
+                                     "NVIDIA, or a broken driver or container toolkit).")
+        self.nvidia_check.clicked.connect(self._on_nvidia_clicked)    # the user's clicks only
+        self.nvidia_hint = self._label(name="hint", wrap=True)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
@@ -553,7 +560,8 @@ class MainWindow(QMainWindow):
         rows = (("Password", (self.password_edit, 1), self.password_toggle),
                 ("JupyterLab port", self.jupyter_port, 1),
                 ("Statistics", self.stats_check, 1),
-                ("Statistics port", self.stats_port, self.stats_user_label, 1))
+                ("Statistics port", self.stats_port, self.stats_user_label, 1),
+                ("NVIDIA GPU", self.nvidia_check, (self.nvidia_hint, 1)))
         for index, (caption, *items) in enumerate(rows):
             grid.addWidget(self._label(caption, "fieldLabel"), index, 0)
             row = QHBoxLayout()
@@ -688,6 +696,12 @@ class MainWindow(QMainWindow):
     # -- form -----------------------------------------------------------------
 
     def _fill_form(self, values: Mapping[str, str]) -> None:
+        # auto stays auto until the checkbox is clicked; it shows whether a driver is installed.
+        nvidia = values.get("NVIDIA", "auto")
+        self._nvidia_auto = nvidia == "auto"
+        detected = shutil.which("nvidia-smi", path=self._environ.get("PATH", os.defpath)) is not None
+        self.nvidia_check.setChecked(nvidia == "1" or (self._nvidia_auto and detected))
+        self._refresh_nvidia_hint()
         self.password_edit.setText(values["JUPYTER_PASSWORD"])
         self.password_edit.setCursorPosition(0)     # show the start, not a scrolled-off first dot
         self.jupyter_port.setValue(int(values["JUPYTER_PORT"]))
@@ -695,6 +709,20 @@ class MainWindow(QMainWindow):
         self.stats_check.setChecked(normalize_bool(values.get("STATS_ENABLED", "1")) == "1")
         user = values.get("STATS_USER") or "jupyter"
         self.stats_user_label.setText(f"Username: {user}")
+
+    def _refresh_nvidia_hint(self) -> None:
+        if self._nvidia_auto:
+            text = "Auto: used when Docker can hand it to the containers."
+        elif self.nvidia_check.isChecked():
+            text = "Expected: Deploy and Start stop when it is not usable."
+        else:
+            text = "Off: the containers run without a GPU."
+        self.nvidia_hint.setText(text)
+
+    def _on_nvidia_clicked(self, _checked: bool) -> None:
+        self._nvidia_auto = False
+        self._refresh_nvidia_hint()
+        self._on_form_changed()
 
     def form_values(self, *, commit: bool = False) -> dict[str, str]:
         """The settings the form shows. Only Deploy commits digits typed without Enter.
@@ -711,6 +739,7 @@ class MainWindow(QMainWindow):
             JUPYTER_PORT=str(self.jupyter_port.value()),
             STATS_ENABLED="1" if self.stats_check.isChecked() else "0",
             STATS_PORT=str(self.stats_port.value()),
+            NVIDIA="auto" if self._nvidia_auto else "1" if self.nvidia_check.isChecked() else "0",
         )
         return values
 
@@ -804,7 +833,7 @@ class MainWindow(QMainWindow):
     def _refresh_controls(self) -> None:
         idle = not self._busy
         for widget in (self.password_edit, self.password_toggle, self.jupyter_port, self.stats_check,
-                       self.deploy_button):
+                       self.nvidia_check, self.deploy_button):
             widget.setEnabled(idle)
         self.stats_port.setEnabled(idle and self.stats_check.isChecked())
         active = self._any_active()
@@ -873,7 +902,9 @@ class MainWindow(QMainWindow):
             overrides["JLT_WORKSPACE_DIR"] = str(absolute_path(self._environ["JLT_WORKSPACE_DIR"]))
         elif workspace_dir(self.config, self.paths.config_file) is not None:
             overrides["JLT_WORKSPACE_DIR"] = str(workspace_dir(self.config, self.paths.config_file))
-        return child_environment(self._environ, {self.password_edit.text(), *self._secrets}, overrides)
+        env = child_environment(self._environ, {self.password_edit.text(), *self._secrets}, overrides)
+        env.pop("JLT_GPU", None)      # the NVIDIA checkbox decides, not a stray export
+        return env
 
     # -- status polling -------------------------------------------------------
 
