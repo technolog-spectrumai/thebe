@@ -673,6 +673,9 @@ class Server(http.server.ThreadingHTTPServer):
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s", stream=sys.stderr)
+    # One line per answer comes from the gateway itself; the SDKs' HTTP client would add one per request.
+    for name in ("httpx", "httpx2", "httpcore", "httpcore2"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     config_file = Path(os.environ.get("AI_CONFIG_FILE") or "/run/secrets/ai_config")
     try:
         settings = load_settings(config_file)
