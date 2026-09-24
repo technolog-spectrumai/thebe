@@ -29,7 +29,7 @@ from typing import Callable, Iterable, Mapping
 from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QPalette
 from PyQt6.QtWidgets import (
-    QAbstractSpinBox, QApplication, QBoxLayout, QCheckBox, QFrame, QGridLayout, QHBoxLayout,
+    QAbstractSpinBox, QApplication, QBoxLayout, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
     QSpinBox, QVBoxLayout, QWidget,
 )
@@ -37,7 +37,11 @@ from PyQt6.QtWidgets import (
 # The Qt-free core, shared with run.py. Names the GUI does not use itself are imported too, so
 # builder.<name> keeps working for tests and older callers.
 from thebe.config import (  # noqa: F401
-    Config, ConfigError, config_from_settings, load_config, make_private, save_config, workspace_dir,
+    Config, ConfigError, config_from_settings, effective_workspace, load_config, make_private, save_config,
+    workspace_dir,
+)
+from thebe.imports import (  # noqa: F401
+    IMPORT_DIR, MAX_IMPORT_DIRS, ImportDir, default_workspace, plan_imports,
 )
 from thebe.settings import (  # noqa: F401
     APP_NAME, DEFAULTS, HTTPS_MODES, PAGES, PROJECT, REPO, SERVICES, TAILNET, BindProbe, Page, Paths,
@@ -322,6 +326,14 @@ class PortSpinBox(QSpinBox):
 
 
 @dataclass
+class ImportRow:
+    widget: QWidget
+    path: QLineEdit
+    browse: QPushButton
+    name: QLineEdit
+
+
+@dataclass
 class ServiceRow:
     dot: QLabel
     badge: QLabel
@@ -338,12 +350,13 @@ def _repolish(widget: QWidget, **properties: str) -> None:
 
 
 BUSY_TEXT = {
+    "import": "Deploying: copying the imported directories into the workspace…",
     "install": "Deploying: building images and starting containers…",
     "start": "Starting containers…",
     "restart": "Restarting containers…",
     "stop": "Stopping containers…",
 }
-JOB_TITLES = {"install": "Deploy", "start": "Start", "restart": "Restart", "stop": "Stop"}
+JOB_TITLES = {"import": "Deploy", "install": "Deploy", "start": "Start", "restart": "Restart", "stop": "Stop"}
 BUSY_TEXT_HTTPS = "Switching to HTTPS: deploying again with the new certificate…"
 # Part of the installer's host-setup error when sysctl/firewall were applied and only the
 # certificate could not be issued.
@@ -404,6 +417,7 @@ class MainWindow(QMainWindow):
         self._display_family = load_display_family(self.paths.display_font)
         self._build_ui()
         self._fill_form(self.settings_values)
+        self._fill_imports(self.config.imports)
         self.apply_theme()
         QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
 
@@ -496,6 +510,7 @@ class MainWindow(QMainWindow):
         self.cards_layout.addWidget(self._build_settings_card(), 1)
         self.cards_layout.addWidget(self._build_services_card(), 1)
         body.addLayout(self.cards_layout)
+        body.addWidget(self._build_imports_card())
         body.addLayout(self._build_actions())
         body.addWidget(self._build_output_card(), 1)
         # A short screen scrolls the page instead of squeezing the inputs.
@@ -631,6 +646,42 @@ class MainWindow(QMainWindow):
             "State refreshes every 4 seconds. Open uses the deployed address: the Tailscale name over HTTPS "
             "when a certificate is in use, otherwise HTTP.", "hint", wrap=True)
         layout.addWidget(self.services_hint)
+        return card
+
+    def _build_imports_card(self) -> QFrame:
+        """Up to MAX_IMPORT_DIRS host directories copied into <workspace>/imported/ on Deploy.
+
+        Compact: the filled rows plus one empty row are shown; an empty row is an unused slot.
+        """
+        card, layout = self._card("Imported directories")
+        layout.setSpacing(8)
+        self.import_rows: list[ImportRow] = []
+        for index in range(MAX_IMPORT_DIRS):
+            widget = QWidget()
+            line = QHBoxLayout(widget)
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(8)
+            path = QLineEdit()
+            path.setPlaceholderText("Host directory to copy (scripts, tools)…")
+            browse = self._button("Browse…", "smallButton", partial(self._browse_import, index),
+                                  "Choose a directory to copy into the workspace")
+            name = QLineEdit()
+            name.setFixedWidth(150)
+            name.setToolTip(f"Name under {IMPORT_DIR}/ (default: the directory's own name). Needed when two "
+                            "directories have the same name.")
+            line.addWidget(path, 1)
+            line.addWidget(browse)
+            line.addWidget(self._label("as", "hint"))
+            line.addWidget(name)
+            for edit in (path, name):
+                edit.textChanged.connect(self._on_imports_changed)
+            layout.addWidget(widget)
+            self.import_rows.append(ImportRow(widget, path, browse, name))
+        self.imports_plan = self._label(name="hint", wrap=True, selectable=True)
+        self.imports_error = self._label(name="errorText", wrap=True)
+        self.imports_error.hide()
+        layout.addWidget(self.imports_plan)
+        layout.addWidget(self.imports_error)
         return card
 
     def _build_actions(self) -> QHBoxLayout:
@@ -771,9 +822,67 @@ class MainWindow(QMainWindow):
 
     def _validate_live(self) -> list[str]:
         errors = self.current_errors()
+        imports = self.import_problems()
         self.error_label.setText("\n".join(errors))
         self.error_label.setVisible(bool(errors))
-        return errors
+        self.imports_error.setText("\n".join(imports))
+        self.imports_error.setVisible(bool(imports))
+        return errors + imports
+
+    # -- imported directories -------------------------------------------------
+
+    def _fill_imports(self, dirs: Iterable[ImportDir]) -> None:
+        dirs = list(dirs)
+        for index, row in enumerate(self.import_rows):
+            item = dirs[index] if index < len(dirs) else ImportDir("")
+            row.path.setText(item.path)
+            row.name.setText(item.name)
+        self._refresh_imports()
+
+    def import_values(self) -> list[ImportDir]:
+        """The filled import rows, in order; empty rows are unused slots."""
+        return [ImportDir(row.path.text().strip(), row.name.text().strip())
+                for row in self.import_rows if row.path.text().strip()]
+
+    def import_workspace(self) -> Path:
+        """The workspace the imports go to: the one the installer will mount."""
+        return effective_workspace(self.config, self.paths.config_file, self._environ) or default_workspace()
+
+    def import_problems(self) -> list[str]:
+        return plan_imports(self.import_values(), self.paths.config_file.parent, self.import_workspace())[1]
+
+    def _browse_import(self, index: int, *_args: object) -> None:
+        row = self.import_rows[index]
+        start = row.path.text().strip() or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Directory to copy into the workspace", start,
+                                                  QFileDialog.Option.ShowDirsOnly)
+        if chosen:
+            row.path.setText(chosen)
+
+    def _on_imports_changed(self, *_args: object) -> None:
+        self._refresh_imports()
+        self._validate_live()
+
+    def _refresh_imports(self) -> None:
+        """Show the filled rows and the first empty one; say what will be copied where."""
+        shown_empty = False
+        for row in self.import_rows:
+            filled = bool(row.path.text().strip() or row.name.text().strip())
+            row.widget.setVisible(filled or not shown_empty)
+            shown_empty = shown_empty or not filled
+            default = Path(row.path.text().strip()).expanduser().name if row.path.text().strip() else "name"
+            row.name.setPlaceholderText(default)
+        dirs = self.import_values()
+        target = self.import_workspace() / IMPORT_DIR
+        if dirs:
+            lines = [f"Copied on Deploy, before JupyterLab starts, into {target}/ — a plain copy: "
+                     "symbolic links are skipped, nothing is deleted:"]
+            lines += [f"  {item.path}  →  {IMPORT_DIR}/{item.name or Path(item.path).expanduser().name}/"
+                      for item in dirs]
+        else:
+            lines = [f"Up to {MAX_IMPORT_DIRS} host directories can be copied into {target}/ on Deploy. "
+                     "Empty rows are unused."]
+        self.imports_plan.setText("\n".join(lines))
 
     # -- view -----------------------------------------------------------------
 
@@ -836,6 +945,9 @@ class MainWindow(QMainWindow):
                        self.nvidia_check, self.deploy_button):
             widget.setEnabled(idle)
         self.stats_port.setEnabled(idle and self.stats_check.isChecked())
+        for row in self.import_rows:
+            for widget in (row.path, row.browse, row.name):
+                widget.setEnabled(idle)
         active = self._any_active()
         known = self.docker_problem == ""
         self.start_button.setText("Restart" if active else "Start")
@@ -1004,7 +1116,7 @@ class MainWindow(QMainWindow):
         """Validate, re-detect Tailscale, refresh `compose ps`, check ports, save .env, run `install`."""
         if self._busy:
             return
-        errors = validate_settings(self.form_values(commit=True), self.themes or None)
+        errors = validate_settings(self.form_values(commit=True), self.themes or None) + self.import_problems()
         if errors:
             self._refuse(errors)
             return
@@ -1030,7 +1142,7 @@ class MainWindow(QMainWindow):
             self._set_busy(False)
             self._refuse([f"Docker is not usable: {self.docker_problem}."])
             return
-        errors = self.current_errors()
+        errors = self.current_errors() + self.import_problems()
         if errors:
             self._set_busy(False)
             self._refuse(errors)
@@ -1040,7 +1152,8 @@ class MainWindow(QMainWindow):
             self._fail(self.config_problem)
             return
         values = self.form_values()
-        config = dataclasses.replace(self.config, settings={k: values[k] for k in DEFAULTS})
+        config = dataclasses.replace(self.config, settings={k: values[k] for k in DEFAULTS},
+                                     imports=self.import_values())
         # The installer's settings first: they carry its own checks (lines it would refuse).
         try:
             save_settings(self.paths.settings, config.settings)
@@ -1062,7 +1175,21 @@ class MainWindow(QMainWindow):
         self._secrets.add(values["JUPYTER_PASSWORD"])
         self.log(f"# Configuration saved to {self.paths.config_file} (mode 0600)",
                  f"# Settings saved to {self.paths.settings} (mode 0600)")
-        self._run_installer("install")
+        if config.imports:
+            self._run_import()      # then install (_on_job_done)
+        else:
+            self._run_installer("install")
+
+    def _run_import(self) -> None:
+        """`run.py import`: the one copy implementation, in its own process so the window stays live."""
+        self._job = self._command = "import"
+        self._root_step = None
+        self._after_certificate = False
+        self._success_note = ""
+        self._tail = []
+        self._set_busy(True, BUSY_TEXT["import"])
+        self.job_runner.start([sys.executable, str(REPO / "run.py"), "--config", str(self.paths.config_file),
+                               "import"], cwd=str(REPO), env=self._child_env())
 
     def stop(self, *_args: object) -> None:
         if not self._busy and self._installer_present():
@@ -1129,7 +1256,9 @@ class MainWindow(QMainWindow):
             self._on_root_step_done(result)
             return
         command = self._job
-        if result.outcome != "ok":
+        if command == "import" and result.outcome == "ok":
+            self._run_installer("install")
+        elif result.outcome != "ok":
             self._job_failed(command, result)
         elif self._root_step is not None and self._after_certificate:
             # Asking again right after the step was applied could go round in circles.
@@ -1226,6 +1355,9 @@ class MainWindow(QMainWindow):
             detail = "Cancelled. Containers that already started keep running."
         elif result.outcome == "crashed":
             detail = "The installer was killed before it finished."
+        elif command == "import":
+            detail = (f"Copying the imported directories failed (exit code {result.code}); nothing was "
+                      "deployed. The Output panel names the directory and the reason.")
         else:
             detail = f"The installer exited with code {result.code}."
         self.log(f"# FAILED: {title}: {detail}")

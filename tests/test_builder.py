@@ -1548,6 +1548,61 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(window.mode, mode)
             self.assertIn(window.tokens["card_bg"], window.styleSheet())
 
+    def test_imported_directories_are_chosen_checked_and_copied_before_install(self):
+        root = self.state.parent
+        workspace, tools, other = root / "ws", root / "host" / "tools", root / "host" / "other" / "tools"
+        (tools / "lib").mkdir(parents=True)
+        (tools / "lib" / "x.py").write_text("x")
+        (tools / "link").symlink_to(tools / "lib")
+        other.mkdir(parents=True)
+        environ = dict(os.environ, JLT_WORKSPACE_DIR=str(workspace))
+        window = self.window(environ=environ)
+        rows = window.import_rows
+        self.assertEqual([row.widget.isVisibleTo(window) for row in rows], [True] + [False] * 6)
+        with mock.patch.object(builder.QFileDialog, "getExistingDirectory", return_value=str(tools)):
+            rows[0].browse.click()
+        self.assertEqual(rows[0].path.text(), str(tools))
+        self.assertEqual(rows[0].name.placeholderText(), "tools")
+        self.assertEqual([row.widget.isVisibleTo(window) for row in rows[:3]], [True, True, False])
+        self.assertIn(f"{tools}  →  imported/tools/", window.imports_plan.text())
+        self.assertIn(str(workspace / "imported"), window.imports_plan.text())
+
+        rows[1].path.setText(str(other))                  # the same name: refused until renamed
+        self.assertIn("give one of them another name", window.imports_error.text())
+        window.deploy()
+        self.assertIn("another name", self.wait_refused(window))
+        self.assertEqual(self.calls("installer"), [])
+        rows[1].name.setText("tools-2")
+        self.assertEqual(window.imports_error.text(), "")
+
+        window.deploy()
+        self.wait_idle(window, 2)                         # run.py import, then install
+        self.assertEqual((workspace / "imported" / "tools" / "lib" / "x.py").read_text(), "x")
+        self.assertTrue((workspace / "imported" / "tools-2").is_dir())
+        self.assertFalse(os.path.lexists(workspace / "imported" / "tools" / "link"))
+        log = window.log_view.toPlainText()
+        self.assertIn("symbolic link to", log)
+        self.assertLess(log.index("imported/tools/"), log.index("stub installer: install"))
+        self.assertEqual(len(self.calls("installer")), 1)
+        self.assertEqual(builder.load_config(self.config)[0].imports,
+                         [builder.ImportDir(str(tools)), builder.ImportDir(str(other), "tools-2")])
+        again = self.window(environ=environ)
+        self.assertEqual((again.import_rows[1].path.text(), again.import_rows[1].name.text()), (str(other), "tools-2"))
+        self.assertEqual([row.widget.isVisibleTo(again) for row in again.import_rows[:4]], [True, True, True, False])
+
+    def test_a_failed_import_stops_the_deploy(self):
+        root = self.state.parent
+        tools = root / "host" / "tools"
+        tools.mkdir(parents=True)
+        (root / "ws" / "imported" / "tools").mkdir(parents=True)          # not made by Thebe
+        self.config.write_text(f'workspace: "{root / "ws"}"\nimport_dirs:\n  - "{tools}"\n')
+        window = self.window()
+        window.deploy()
+        self.wait_idle(window, 1)
+        self.assertIn("Copying the imported directories failed", self.critical.call_args.args[2])
+        self.assertIn("not made by Thebe", window.log_view.toPlainText())
+        self.assertEqual(self.calls("installer"), [])
+
 
 if __name__ == "__main__":
     unittest.main()
