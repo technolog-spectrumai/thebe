@@ -15,6 +15,7 @@ from typing import Callable, Mapping
 
 import yaml
 
+from thebe.imports import ImportDir, parse_import_dirs, render_import_dirs
 from thebe.settings import (
     DEFAULTS, HTTPS_MODES, SPACE_CHARS, absolute_path, check_port, has_control, load_settings_file,
     normalize_bool, normalize_nvidia, write_private_file,
@@ -29,6 +30,8 @@ class Config:
     settings: dict[str, str] = field(default_factory=lambda: dict(DEFAULTS))
     # The notebook workspace as written in the file ('' = the installer's ~/jupyter-workspace).
     workspace: str = ""
+    # Host directories copied into <workspace>/imported/ on install and Deploy (thebe.imports).
+    imports: list[ImportDir] = field(default_factory=list)
 
 
 class ConfigError(Exception):
@@ -91,7 +94,7 @@ SETTING_FIELDS: tuple[tuple[tuple[str, ...], str, Converter], ...] = (
     (("nvidia",), "NVIDIA", _as_nvidia),
 )
 # Top-level keys that are not installer settings.
-OTHER_KEYS = ("workspace",)
+OTHER_KEYS = ("workspace", "import_dirs")
 
 
 def _known_keys() -> dict[str, set[str] | None]:
@@ -166,6 +169,8 @@ def parse_config(text: str, base_dir: Path) -> tuple[Config, list[str]]:
                 problems.append(problem)
             else:
                 config.workspace = workspace
+    config.imports, import_problems = parse_import_dirs(data.get("import_dirs"))
+    problems += import_problems
     return config, problems
 
 
@@ -237,6 +242,14 @@ def render_config(config: Config) -> str:
         "",
         "# The notebook workspace on this machine (/workspace in JupyterLab). Default: ~/jupyter-workspace.",
         workspace,
+        "",
+        "# Up to 7 host directories (scripts, tools) COPIED into <workspace>/imported/<name>/ on install",
+        "# and Deploy, before JupyterLab starts. A plain copy: no link to the source, symbolic links are",
+        "# skipped, nothing is deleted. <name> is the directory's own name; set it when two share one:",
+        "#   - \"~/tools\"",
+        "#   - path: \"/opt/lab/tools\"",
+        "#     name: \"lab-tools\"",
+        *render_import_dirs(config.imports, _scalar),
     ]
     return "\n".join(lines) + "\n"
 

@@ -25,3 +25,11 @@ nvidia: auto
 
 # The notebook workspace on this machine (/workspace in JupyterLab). Default: ~/jupyter-workspace.
 # workspace: "~/jupyter-workspace"
+
+# Up to 7 host directories (scripts, tools) COPIED into <workspace>/imported/<name>/ on install
+# and Deploy, before JupyterLab starts. A plain copy: no link to the source, symbolic links are
+# skipped, nothing is deleted. <name> is the directory's own name; set it when two share one:
+#   - "~/tools"
+#   - path: "/opt/lab/tools"
+#     name: "lab-tools"
+import_dirs: []
