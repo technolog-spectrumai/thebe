@@ -48,6 +48,24 @@ class Stub(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if not body.get("stream"):
+            # Non-streaming replies, as jupyter-ai's magic (through litellm) asks for them.
+            if self.path.endswith("/messages"):
+                reply = {"id": "msg_1", "type": "message", "role": "assistant", "model": body.get("model", "stub"),
+                         "content": [{"type": "text", "text": ANSWER}], "stop_reason": "end_turn",
+                         "stop_sequence": None, "usage": {"input_tokens": 3, "output_tokens": 9}}
+            else:
+                reply = {"id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": body.get("model", "stub"),
+                         "choices": [{"index": 0, "finish_reason": "stop",
+                                      "message": {"role": "assistant", "content": ANSWER}}],
+                         "usage": {"prompt_tokens": 3, "completion_tokens": 9, "total_tokens": 12}}
+            payload = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
